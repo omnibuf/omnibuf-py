@@ -1,0 +1,185 @@
+{
+  "language": "python",
+  "runtime": "Python 3.14.5",
+  "platform": "darwin",
+  "arch": "arm64",
+  "cpu": "Apple M1 Pro",
+  "workload": "PeerUpdate",
+  "categories": [
+    {
+      "id": "encode",
+      "title": "Full Message Encode Speed (PeerUpdate)",
+      "unit": "ns",
+      "results": [
+        {
+          "name": "OmniBuf (Generated)",
+          "nsPerOp": 10135,
+          "opsPerSec": 98670,
+          "wireBytes": 366,
+          "highlight": true,
+          "baseline": true
+        },
+        {
+          "name": "OmniBuf (@dataclass)",
+          "nsPerOp": 18095,
+          "opsPerSec": 55265,
+          "wireBytes": 366,
+          "highlight": true
+        },
+        {
+          "name": "protobuf-py",
+          "nsPerOp": 1277,
+          "opsPerSec": 783224,
+          "wireBytes": 341
+        },
+        {
+          "name": "google.protobuf (upb)",
+          "nsPerOp": 573,
+          "opsPerSec": 1745025,
+          "wireBytes": 341
+        },
+        {
+          "name": "msgspec",
+          "nsPerOp": 809,
+          "opsPerSec": 1236439,
+          "wireBytes": 634
+        },
+        {
+          "name": "msgpack",
+          "nsPerOp": 2669,
+          "opsPerSec": 374648,
+          "wireBytes": 634
+        },
+        {
+          "name": "json (stdlib)",
+          "nsPerOp": 6297,
+          "opsPerSec": 158811,
+          "wireBytes": 874
+        }
+      ]
+    },
+    {
+      "id": "decode",
+      "title": "Full Message Decode Speed (PeerUpdate)",
+      "unit": "ns",
+      "results": [
+        {
+          "name": "OmniBuf (Generated)",
+          "nsPerOp": 18618,
+          "opsPerSec": 53710,
+          "highlight": true,
+          "baseline": true
+        },
+        {
+          "name": "OmniBuf (@dataclass)",
+          "nsPerOp": 36038,
+          "opsPerSec": 27749,
+          "highlight": true
+        },
+        {
+          "name": "protobuf-py",
+          "nsPerOp": 2815,
+          "opsPerSec": 355205
+        },
+        {
+          "name": "google.protobuf (upb)",
+          "nsPerOp": 817,
+          "opsPerSec": 1223707
+        },
+        {
+          "name": "msgspec",
+          "nsPerOp": 1567,
+          "opsPerSec": 638274
+        },
+        {
+          "name": "msgpack",
+          "nsPerOp": 3544,
+          "opsPerSec": 282205
+        },
+        {
+          "name": "json (stdlib)",
+          "nsPerOp": 5925,
+          "opsPerSec": 168790
+        }
+      ]
+    },
+    {
+      "id": "lookup_city",
+      "title": "Read a Single Nested Field (peer.location.city)",
+      "unit": "ns",
+      "results": [
+        {
+          "name": "OmniBuf (Generated)",
+          "nsPerOp": 8923,
+          "opsPerSec": 112064,
+          "highlight": true,
+          "baseline": true
+        },
+        {
+          "name": "protobuf-py",
+          "nsPerOp": 2883,
+          "opsPerSec": 346825
+        },
+        {
+          "name": "google.protobuf (upb)",
+          "nsPerOp": 1030,
+          "opsPerSec": 970685
+        },
+        {
+          "name": "msgspec",
+          "nsPerOp": 1592,
+          "opsPerSec": 628108
+        },
+        {
+          "name": "msgpack",
+          "nsPerOp": 4036,
+          "opsPerSec": 247765
+        },
+        {
+          "name": "json (stdlib)",
+          "nsPerOp": 6065,
+          "opsPerSec": 164887
+        }
+      ]
+    },
+    {
+      "id": "mutate_sequence",
+      "title": "Selective Single-Field Mutation (peer.sequence)",
+      "unit": "ns",
+      "results": [
+        {
+          "name": "OmniBuf (Generated)",
+          "nsPerOp": 7205,
+          "opsPerSec": 138789,
+          "highlight": true,
+          "baseline": true
+        },
+        {
+          "name": "protobuf-py",
+          "nsPerOp": 4201,
+          "opsPerSec": 238066
+        },
+        {
+          "name": "google.protobuf (upb)",
+          "nsPerOp": 1467,
+          "opsPerSec": 681619
+        },
+        {
+          "name": "msgspec",
+          "nsPerOp": 2749,
+          "opsPerSec": 363761
+        },
+        {
+          "name": "msgpack",
+          "nsPerOp": 6725,
+          "opsPerSec": 148699
+        },
+        {
+          "name": "json (stdlib)",
+          "nsPerOp": 14738,
+          "opsPerSec": 67852
+        }
+      ]
+    }
+  ]
+}

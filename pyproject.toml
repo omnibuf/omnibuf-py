@@ -1,0 +1,81 @@
+[build-system]
+requires = ["uv_build>=0.9.0,<0.13.0"]
+build-backend = "uv_build"
+
+[project]
+name = "omnibuf"
+version = "0.1.0"
+description = "Explicit-typed, header-hop binary wire codec for Python"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [
+    { name = "OmniBuf Contributors" },
+]
+keywords = ["omnibuf", "protobuf", "serialization", "binary", "codec", "varint"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Typing :: Typed",
+]
+dependencies = [
+    "protobuf>=6.30.0",
+    "protobuf-py>=0.7.0",
+    "protobuf-py-ext>=0.7.0",
+]
+
+[project.optional-dependencies]
+protobuf = [
+    "protobuf>=6.30.0",
+]
+
+[project.scripts]
+protoc-gen-omnibuf-py = "omnibuf.plugin:main"
+conformance-py = "omnibuf.conformance:main"
+
+[dependency-groups]
+dev = [
+    "msgpack>=1.1.0",
+    "msgspec>=0.19.0",
+    "mypy>=1.15.0",
+    "protoc-gen-py>=0.7.0",
+    "pytest>=8.3.0",
+    "ruff>=0.11.0",
+    "types-protobuf>=6.30.0",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests", "benchmarks"]
+extend-exclude = ["src/omnibuf/gen", "*_pb.py", "*_pb2.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+exclude = ['^src/omnibuf/gen/', '_pb\.py$', '_pb2\.py$']
+
+[[tool.mypy.overrides]]
+module = [
+    "omnibuf.gen.*",
+    "omnibuf.gen.omnibuf.bench.*",
+    "omnibuf.gen.omnibuf.conformance.*",
+    "msgpack",
+]
+ignore_missing_imports = true
+ignore_errors = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

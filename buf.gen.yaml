@@ -1,0 +1,8 @@
+version: v2
+plugins:
+  - local: ["uv", "run", "--no-sync", "protoc-gen-py"]
+    out: src/omnibuf/gen
+  - local: ["uv", "run", "--no-sync", "protoc-gen-omnibuf-py"]
+    out: src/omnibuf/gen
+  - protoc_builtin: python
+    out: src/omnibuf/gen

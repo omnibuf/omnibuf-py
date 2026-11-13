@@ -1,0 +1,50 @@
+============================================================================
+OmniBuf-Py Benchmark Suite (Python 3.14.5 / darwin-arm64 / Apple M1 Pro)
+Workload: Canonical PeerUpdate (nested submessage, 4 neighbors, arrays, scalars)
+============================================================================
+
+### 1. Full Message Encode Speed (PeerUpdate)
+
+| Codec / Operation | Latency (ns/op) | Throughput (ops/sec) | Wire Size (B) | vs Baseline |
+|---|---:|---:|---:|---:|
+| OmniBuf (Generated) | 10,135 ns | 98,670 | 366 | 1.00x (baseline) |
+| OmniBuf (@dataclass) | 18,095 ns | 55,265 | 366 | 1.79x slower |
+| protobuf-py | 1,277 ns | 783,224 | 341 | 7.94x faster |
+| google.protobuf (upb) | 573 ns | 1,745,025 | 341 | 17.69x faster |
+| msgspec | 809 ns | 1,236,439 | 634 | 12.53x faster |
+| msgpack | 2,669 ns | 374,648 | 634 | 3.80x faster |
+| json (stdlib) | 6,297 ns | 158,811 | 874 | 1.61x faster |
+
+### 2. Full Message Decode Speed (PeerUpdate)
+
+| Codec / Operation | Latency (ns/op) | Throughput (ops/sec) | vs Baseline |
+|---|---:|---:|---:|
+| OmniBuf (Generated) | 18,618 ns | 53,710 | 1.00x (baseline) |
+| OmniBuf (@dataclass) | 36,038 ns | 27,749 | 1.94x slower |
+| protobuf-py | 2,815 ns | 355,205 | 6.61x faster |
+| google.protobuf (upb) | 817 ns | 1,223,707 | 22.78x faster |
+| msgspec | 1,567 ns | 638,274 | 11.88x faster |
+| msgpack | 3,544 ns | 282,205 | 5.25x faster |
+| json (stdlib) | 5,925 ns | 168,790 | 3.14x faster |
+
+### 3. Read a Single Nested Field (peer.location.city)
+
+| Codec / Operation | Latency (ns/op) | Throughput (ops/sec) | vs Baseline |
+|---|---:|---:|---:|
+| OmniBuf (Generated) | 8,923 ns | 112,064 | 1.00x (baseline) |
+| protobuf-py | 2,883 ns | 346,825 | 3.09x faster |
+| google.protobuf (upb) | 1,030 ns | 970,685 | 8.66x faster |
+| msgspec | 1,592 ns | 628,108 | 5.60x faster |
+| msgpack | 4,036 ns | 247,765 | 2.21x faster |
+| json (stdlib) | 6,065 ns | 164,887 | 1.47x faster |
+
+### 4. Selective Single-Field Mutation (peer.sequence)
+
+| Codec / Operation | Latency (ns/op) | Throughput (ops/sec) | vs Baseline |
+|---|---:|---:|---:|
+| OmniBuf (Generated) | 7,205 ns | 138,789 | 1.00x (baseline) |
+| protobuf-py | 4,201 ns | 238,066 | 1.72x faster |
+| google.protobuf (upb) | 1,467 ns | 681,619 | 4.91x faster |
+| msgspec | 2,749 ns | 363,761 | 2.62x faster |
+| msgpack | 6,725 ns | 148,699 | 1.07x faster |
+| json (stdlib) | 14,738 ns | 67,852 | 2.05x slower |
