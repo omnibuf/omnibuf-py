@@ -16,17 +16,20 @@ proto:
 # Alias for proto code generation
 generate: proto
 
-# Format all source, test, and benchmark files
+# Format all Rust, Python, test, and benchmark files
 fmt:
+    cargo fmt
     uv run ruff format .
 
 # Check formatting without modifying files
 fmt-check:
+    cargo fmt --check
     uv run ruff format --check .
 
-# Run buf lint, ruff linter, and strict mypy type checking
+# Run buf lint, cargo clippy, ruff linter, and strict mypy type checking
 lint:
     buf lint
+    cargo clippy --all-targets -- -D warnings
     uv run ruff check .
     uv run mypy src tests benchmarks
 

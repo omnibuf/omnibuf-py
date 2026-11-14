@@ -12,4 +12,5 @@ dist/
 .ruff_cache/
 .coverage
 htmlcov/
+target/
 .DS_Store

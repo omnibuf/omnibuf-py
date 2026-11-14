@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from . import _omnibuf_ext
 from .encoder import Encoder
 from .wire import (
     FIELD0_TAG,
@@ -201,6 +202,8 @@ def decode_schema_meta(
 
 def read_field0_schema_meta(packet: Buffer) -> SchemaMeta | None:
     """Scans top-level fields of packet and returns merged Field #0 SchemaMeta, if present."""
+    if not _omnibuf_ext.has_field0_py(packet):
+        return None
     mv = memoryview(packet)
     n = len(mv)
     pos = 0

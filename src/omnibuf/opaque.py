@@ -6,25 +6,15 @@ import struct
 from collections.abc import Callable
 from typing import Any
 
+from . import _omnibuf_ext
+from ._omnibuf_ext import OpaqueView
 from .wire import (
     MAX_FIELD_NUMBER,
     MAX_NESTING_DEPTH,
     TZCNT_WIDTH_TABLE,
     WIRE_ARRAY,
-    WIRE_BOOL_FALSE,
-    WIRE_BOOL_TRUE,
-    WIRE_BYTES,
-    WIRE_FIXED32,
-    WIRE_FIXED64,
-    WIRE_FLOAT32,
-    WIRE_FLOAT64,
     WIRE_MAP,
-    WIRE_SFIXED32,
-    WIRE_SFIXED64,
-    WIRE_SINT,
-    WIRE_STRING,
     WIRE_SUB_MSG,
-    WIRE_UINT,
     Buffer,
     OmniBufDecodeError,
     SpliceField,
@@ -32,7 +22,6 @@ from .wire import (
     decode_varint,
     decode_zigzag,
     decode_zigzag32,
-    locate_field_offset,
     next_container_span,
     parse_array_header,
     parse_map_header,
@@ -52,192 +41,27 @@ _I64_UNPACK = struct.Struct("<q").unpack_from
 _F32_UNPACK = struct.Struct("<f").unpack_from
 _F64_UNPACK = struct.Struct("<d").unpack_from
 
-_MASK_UINT = 1 << WIRE_UINT
-_MASK_SINT = 1 << WIRE_SINT
-_MASK_BOOL = (1 << WIRE_BOOL_FALSE) | (1 << WIRE_BOOL_TRUE)
-_MASK_FIXED32 = 1 << WIRE_FIXED32
-_MASK_SFIXED32 = 1 << WIRE_SFIXED32
-_MASK_FIXED64 = 1 << WIRE_FIXED64
-_MASK_SFIXED64 = 1 << WIRE_SFIXED64
-_MASK_FLOAT32 = 1 << WIRE_FLOAT32
-_MASK_FLOAT64 = 1 << WIRE_FLOAT64
-_MASK_STRING = 1 << WIRE_STRING
-_MASK_BYTES = 1 << WIRE_BYTES
-_MASK_SUBMSG = 1 << WIRE_SUB_MSG
-
-
-def opaque_get_uint32(raw: Buffer, field_num: int, default: int = 0) -> int:
-    val_pos, _ = locate_field_offset(raw, field_num, _MASK_UINT)
-    if val_pos < 0:
-        return default
-    b0 = raw[val_pos]
-    if b0 & 1:
-        return b0 >> 1
-    v, w = decode_varint(raw, val_pos)
-    return to_uint32(v) if w > 0 else default
-
-
-def opaque_get_uint64(raw: Buffer, field_num: int, default: int = 0) -> int:
-    val_pos, _ = locate_field_offset(raw, field_num, _MASK_UINT)
-    if val_pos < 0:
-        return default
-    b0 = raw[val_pos]
-    if b0 & 1:
-        return b0 >> 1
-    v, w = decode_varint(raw, val_pos)
-    return v if w > 0 else default
-
-
-def opaque_get_sint32(raw: Buffer, field_num: int, default: int = 0) -> int:
-    val_pos, _ = locate_field_offset(raw, field_num, _MASK_SINT)
-    if val_pos < 0:
-        return default
-    b0 = raw[val_pos]
-    if b0 & 1:
-        u = b0 >> 1
-        return (u >> 1) ^ -(u & 1)
-    v, w = decode_varint(raw, val_pos)
-    return decode_zigzag32(v) if w > 0 else default
-
-
-def opaque_get_sint64(raw: Buffer, field_num: int, default: int = 0) -> int:
-    val_pos, _ = locate_field_offset(raw, field_num, _MASK_SINT)
-    if val_pos < 0:
-        return default
-    b0 = raw[val_pos]
-    if b0 & 1:
-        u = b0 >> 1
-        return (u >> 1) ^ -(u & 1)
-    v, w = decode_varint(raw, val_pos)
-    return decode_zigzag(v) if w > 0 else default
-
-
-def opaque_get_bool(raw: Buffer, field_num: int, default: bool = False) -> bool:
-    val_pos, wt = locate_field_offset(raw, field_num, _MASK_BOOL)
-    if val_pos < 0:
-        return default
-    return wt == WIRE_BOOL_TRUE
-
-
-def opaque_get_fixed32(raw: Buffer, field_num: int, default: int = 0) -> int:
-    val_pos, _ = locate_field_offset(raw, field_num, _MASK_FIXED32)
-    if val_pos < 0 or len(raw) - val_pos < 4:
-        return default
-    (u32,) = _U32_UNPACK(raw, val_pos)
-    return int(u32)
-
-
-def opaque_get_sfixed32(raw: Buffer, field_num: int, default: int = 0) -> int:
-    val_pos, _ = locate_field_offset(raw, field_num, _MASK_SFIXED32)
-    if val_pos < 0 or len(raw) - val_pos < 4:
-        return default
-    (i32,) = _I32_UNPACK(raw, val_pos)
-    return int(i32)
-
-
-def opaque_get_fixed64(raw: Buffer, field_num: int, default: int = 0) -> int:
-    val_pos, _ = locate_field_offset(raw, field_num, _MASK_FIXED64)
-    if val_pos < 0 or len(raw) - val_pos < 8:
-        return default
-    (u64,) = _U64_UNPACK(raw, val_pos)
-    return int(u64)
-
-
-def opaque_get_sfixed64(raw: Buffer, field_num: int, default: int = 0) -> int:
-    val_pos, _ = locate_field_offset(raw, field_num, _MASK_SFIXED64)
-    if val_pos < 0 or len(raw) - val_pos < 8:
-        return default
-    (i64,) = _I64_UNPACK(raw, val_pos)
-    return int(i64)
-
-
-def opaque_get_float32(raw: Buffer, field_num: int, default: float = 0.0) -> float:
-    val_pos, _ = locate_field_offset(raw, field_num, _MASK_FLOAT32)
-    if val_pos < 0 or len(raw) - val_pos < 4:
-        return default
-    (f32,) = _F32_UNPACK(raw, val_pos)
-    return float(f32)
-
-
-def opaque_get_float64(raw: Buffer, field_num: int, default: float = 0.0) -> float:
-    val_pos, _ = locate_field_offset(raw, field_num, _MASK_FLOAT64)
-    if val_pos < 0 or len(raw) - val_pos < 8:
-        return default
-    (f64,) = _F64_UNPACK(raw, val_pos)
-    return float(f64)
-
-
-def opaque_get_string(raw: Buffer, field_num: int, default: str = "") -> str:
-    val_pos, _ = locate_field_offset(raw, field_num, _MASK_STRING)
-    if val_pos < 0:
-        return default
-    n = len(raw)
-    if val_pos >= n:
-        return default
-    b0 = raw[val_pos]
-    if b0 & 1:
-        s_len = b0 >> 1
-        s_start = val_pos + 1
-    else:
-        s_len, sn = decode_varint(raw, val_pos, n)
-        if sn == 0:
-            return default
-        s_start = val_pos + sn
-    s_end = s_start + s_len
-    if s_end > n:
-        return default
-    chunk = raw[s_start:s_end]
-    try:
-        if isinstance(chunk, (bytes, bytearray)):
-            return chunk.decode("utf-8")
-        return bytes(chunk).decode("utf-8")
-    except UnicodeDecodeError:
-        return default
+opaque_get_uint32 = _omnibuf_ext.opaque_get_uint32_py
+opaque_get_uint64 = _omnibuf_ext.opaque_get_uint64_py
+opaque_get_sint32 = _omnibuf_ext.opaque_get_sint32_py
+opaque_get_sint64 = _omnibuf_ext.opaque_get_sint64_py
+opaque_get_bool = _omnibuf_ext.opaque_get_bool_py
+opaque_get_fixed32 = _omnibuf_ext.opaque_get_fixed32_py
+opaque_get_sfixed32 = _omnibuf_ext.opaque_get_sfixed32_py
+opaque_get_fixed64 = _omnibuf_ext.opaque_get_fixed64_py
+opaque_get_sfixed64 = _omnibuf_ext.opaque_get_sfixed64_py
+opaque_get_float32 = _omnibuf_ext.opaque_get_float32_py
+opaque_get_float64 = _omnibuf_ext.opaque_get_float64_py
+opaque_get_string = _omnibuf_ext.opaque_get_string_py
 
 
 def opaque_get_bytes(raw: Buffer, field_num: int, default: bytes = b"") -> bytes:
-    val_pos, _ = locate_field_offset(raw, field_num, _MASK_BYTES)
-    if val_pos < 0:
-        return default
-    n = len(raw)
-    if val_pos >= n:
-        return default
-    b0 = raw[val_pos]
-    if b0 & 1:
-        b_len = b0 >> 1
-        b_start = val_pos + 1
-    else:
-        b_len, bn = decode_varint(raw, val_pos, n)
-        if bn == 0:
-            return default
-        b_start = val_pos + bn
-    b_end = b_start + b_len
-    if b_end > n:
-        return default
-    return bytes(raw[b_start:b_end])
+    return _omnibuf_ext.opaque_get_bytes_py(raw, field_num, default)
 
 
 def opaque_get_submsg_slice(raw: Buffer, field_num: int) -> Buffer | None:
     """Returns the sub-message payload slice (concatenating if multiple occurrences exist)."""
-    b1_start, b1_end, next_pos = next_container_span(raw, 0, field_num, WIRE_SUB_MSG, 0)
-    if b1_start < 0:
-        return None
-    b2_start, b2_end, pos = next_container_span(raw, next_pos, field_num, WIRE_SUB_MSG, 0)
-    if b2_start == -2:
-        return None
-    if b2_start == -1:
-        return raw[b1_start:b1_end]
-    merged = bytearray(raw[b1_start:b1_end])
-    merged.extend(raw[b2_start:b2_end])
-    n = len(raw)
-    while pos < n:
-        bn_start, bn_end, pos = next_container_span(raw, pos, field_num, WIRE_SUB_MSG, 0)
-        if bn_start == -2:
-            return None
-        if bn_start == -1:
-            break
-        merged.extend(raw[bn_start:bn_end])
-    return merged
+    return _omnibuf_ext.opaque_get_submsg_slice_py(raw, field_num)
 
 
 def opaque_get_submsg[T](
@@ -610,6 +434,7 @@ def splice_dirty_fields(
 
 
 __all__ = [
+    "OpaqueView",
     "SpliceField",
     "opaque_get_bool",
     "opaque_get_bytes",

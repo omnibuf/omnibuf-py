@@ -7,44 +7,44 @@ Workload: Canonical PeerUpdate (nested submessage, 4 neighbors, arrays, scalars)
 
 | Codec / Operation | Latency (ns/op) | Throughput (ops/sec) | Wire Size (B) | vs Baseline |
 |---|---:|---:|---:|---:|
-| OmniBuf (Generated) | 10,287 ns | 97,208 | 366 | 1.00x (baseline) |
-| OmniBuf (@dataclass) | 17,858 ns | 55,998 | 366 | 1.74x slower |
-| protobuf-py | 1,226 ns | 815,916 | 341 | 8.39x faster |
-| google.protobuf (upb) | 562 ns | 1,780,638 | 341 | 18.32x faster |
-| msgspec | 822 ns | 1,216,075 | 634 | 12.51x faster |
-| msgpack | 2,646 ns | 377,864 | 634 | 3.89x faster |
-| json (stdlib) | 6,214 ns | 160,933 | 874 | 1.66x faster |
+| OmniBuf (Generated) | 743 ns | 1,345,797 | 366 | 1.00x (baseline) |
+| OmniBuf (@dataclass) | 847 ns | 1,180,135 | 366 | 1.14x slower |
+| protobuf-py | 1,219 ns | 820,035 | 341 | 1.64x slower |
+| google.protobuf (upb) | 563 ns | 1,775,972 | 341 | 1.32x faster |
+| msgspec | 818 ns | 1,221,850 | 634 | 1.10x slower |
+| msgpack | 2,584 ns | 387,062 | 634 | 3.48x slower |
+| json (stdlib) | 6,335 ns | 157,848 | 874 | 8.53x slower |
 
 ### 2. Full Message Decode Speed (PeerUpdate)
 
 | Codec / Operation | Latency (ns/op) | Throughput (ops/sec) | vs Baseline |
 |---|---:|---:|---:|
-| OmniBuf (Generated) | 18,646 ns | 53,629 | 1.00x (baseline) |
-| OmniBuf (@dataclass) | 36,377 ns | 27,490 | 1.95x slower |
-| protobuf-py | 2,853 ns | 350,545 | 6.54x faster |
-| google.protobuf (upb) | 814 ns | 1,228,140 | 22.90x faster |
-| msgspec | 1,560 ns | 641,092 | 11.95x faster |
-| msgpack | 3,553 ns | 281,431 | 5.25x faster |
-| json (stdlib) | 5,901 ns | 169,456 | 3.16x faster |
+| OmniBuf (Generated) | 1,414 ns | 706,976 | 1.00x (baseline) |
+| OmniBuf (@dataclass) | 1,481 ns | 675,344 | 1.05x slower |
+| protobuf-py | 2,797 ns | 357,565 | 1.98x slower |
+| google.protobuf (upb) | 818 ns | 1,222,735 | 1.73x faster |
+| msgspec | 1,510 ns | 662,148 | 1.07x slower |
+| msgpack | 3,525 ns | 283,707 | 2.49x slower |
+| json (stdlib) | 5,853 ns | 170,863 | 4.14x slower |
 
 ### 3. Read a Single Nested Field (peer.location.city)
 
 | Codec / Operation | Latency (ns/op) | Throughput (ops/sec) | vs Baseline |
 |---|---:|---:|---:|
-| OmniBuf (Generated) | 5,562 ns | 179,777 | 1.00x (baseline) |
-| protobuf-py | 2,851 ns | 350,784 | 1.95x faster |
-| google.protobuf (upb) | 1,020 ns | 980,108 | 5.45x faster |
-| msgspec | 1,593 ns | 627,723 | 3.49x faster |
-| msgpack | 3,737 ns | 267,572 | 1.49x faster |
-| json (stdlib) | 5,920 ns | 168,912 | 1.06x slower |
+| OmniBuf (Generated) | 530 ns | 1,887,696 | 1.00x (baseline) |
+| protobuf-py | 2,838 ns | 352,322 | 5.36x slower |
+| google.protobuf (upb) | 1,019 ns | 981,806 | 1.92x slower |
+| msgspec | 1,527 ns | 654,712 | 2.88x slower |
+| msgpack | 3,560 ns | 280,911 | 6.72x slower |
+| json (stdlib) | 5,844 ns | 171,108 | 11.03x slower |
 
 ### 4. Selective Single-Field Mutation (peer.sequence)
 
 | Codec / Operation | Latency (ns/op) | Throughput (ops/sec) | vs Baseline |
 |---|---:|---:|---:|
-| OmniBuf (Generated) | 4,690 ns | 213,237 | 1.00x (baseline) |
-| protobuf-py | 4,182 ns | 239,144 | 1.12x faster |
-| google.protobuf (upb) | 1,450 ns | 689,688 | 3.23x faster |
-| msgspec | 2,375 ns | 420,984 | 1.97x faster |
-| msgpack | 6,428 ns | 155,558 | 1.37x slower |
-| json (stdlib) | 12,559 ns | 79,627 | 2.68x slower |
+| OmniBuf (Generated) | 448 ns | 2,232,669 | 1.00x (baseline) |
+| protobuf-py | 4,134 ns | 241,885 | 9.23x slower |
+| google.protobuf (upb) | 1,462 ns | 683,882 | 3.26x slower |
+| msgspec | 2,348 ns | 425,820 | 5.24x slower |
+| msgpack | 6,306 ns | 158,579 | 14.08x slower |
+| json (stdlib) | 12,384 ns | 80,749 | 27.65x slower |

@@ -7,6 +7,8 @@ import struct
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from . import _omnibuf_ext
+
 type Buffer = bytes | bytearray | memoryview
 
 
@@ -20,6 +22,9 @@ class OmniBufDecodeError(OmniBufError):
 
 class OmniBufEncodeError(OmniBufError):
     """Raised when a value cannot be serialized to the OmniBuf wire format."""
+
+
+_omnibuf_ext.init_exceptions(OmniBufEncodeError, OmniBufDecodeError)
 
 
 WIRE_UINT = 0
@@ -786,6 +791,9 @@ def validate_message(
     limit_depth: int = MAX_NESTING_DEPTH,
 ) -> None:
     """Validates an entire OmniBuf message buffer without allocating decoded objects."""
+    if depth == 0 and limit_depth == MAX_NESTING_DEPTH:
+        _omnibuf_ext.validate_message_py(data)
+        return
     if depth > limit_depth:
         raise OmniBufDecodeError(f"omnibuf: nesting depth {depth} exceeds limit {limit_depth}")
     pos = 0
@@ -1067,69 +1075,4 @@ def splice_fields(
     Preserves dst_prefix bytes at the front of the returned buffer without mutating
     dst_prefix or src_packet in place, even when dst_prefix aliases src_packet.
     """
-    out = bytearray(dst_prefix) if dst_prefix is not None else bytearray()
-    if not replacements:
-        validate_message(src_packet)
-        out.extend(src_packet)
-        return bytes(out)
-
-    # Deduplicate replacements (last replacement for a field_num wins) while keeping order.
-    rep_by_num: dict[int, bytes] = {}
-    ordered_nums: list[int] = []
-    for item in replacements:
-        if item.field_num <= 0 or item.field_num > MAX_FIELD_NUMBER:
-            raise OmniBufEncodeError(f"omnibuf: invalid splice field number {item.field_num}")
-        if item.field_num not in rep_by_num:
-            ordered_nums.append(item.field_num)
-        rep_by_num[item.field_num] = bytes(item.encoded_field)
-
-    mv = memoryview(src_packet)
-    n = len(mv)
-
-    # Pre-scan to find the last occurrence of each replaced field so earlier duplicate
-    # occurrences of that field are dropped and replacement happens in-place at the last position.
-    spans: list[tuple[int, int, int]] = []
-    last_occurrence_idx: dict[int, int] = {}
-    pos = 0
-    while pos < n:
-        field_start = pos
-        tag, tn = decode_varint(mv, pos, n)
-        if tn == 0 or (tag >> 4) > MAX_FIELD_NUMBER:
-            raise OmniBufDecodeError(f"omnibuf: invalid tag during splice at byte {pos}")
-        pos += tn
-        fnum = tag >> 4
-        wt = tag & 0x0F
-        if fnum == 0:
-            next_pos = validate_field0_at(mv, pos, wt, 0, MAX_NESTING_DEPTH, n)
-        else:
-            next_pos = skip_value(mv, pos, wt, n)
-        idx = len(spans)
-        spans.append((fnum, field_start, next_pos))
-        if fnum in rep_by_num:
-            last_occurrence_idx[fnum] = idx
-        pos = next_pos
-
-    emitted: set[int] = set()
-    copy_start = 0
-    for idx, (fnum, f_start, f_end) in enumerate(spans):
-        if fnum not in rep_by_num:
-            continue
-        if copy_start < f_start:
-            out.extend(mv[copy_start:f_start])
-        if last_occurrence_idx.get(fnum) == idx:
-            encoded = rep_by_num[fnum]
-            if encoded:
-                out.extend(encoded)
-            emitted.add(fnum)
-        copy_start = f_end
-
-    if copy_start < n:
-        out.extend(mv[copy_start:n])
-
-    for fnum in ordered_nums:
-        if fnum not in emitted:
-            encoded = rep_by_num[fnum]
-            if encoded:
-                out.extend(encoded)
-
-    return bytes(out)
+    return _omnibuf_ext.splice_fields_py(dst_prefix, src_packet, replacements)

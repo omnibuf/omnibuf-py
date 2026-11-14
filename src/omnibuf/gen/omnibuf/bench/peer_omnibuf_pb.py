@@ -3,77 +3,17 @@
 
 from __future__ import annotations
 
-import struct
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 
-from omnibuf.field0 import read_field0_schema_meta
-from omnibuf.opaque import (
-    opaque_get_bool,
-    opaque_get_bytes,
-    opaque_get_fixed32,
-    opaque_get_fixed64,
-    opaque_get_float32,
-    opaque_get_float64,
-    opaque_get_map,
-    opaque_get_scalar_array,
-    opaque_get_sfixed32,
-    opaque_get_sfixed64,
-    opaque_get_sint32,
-    opaque_get_sint64,
-    opaque_get_string,
-    opaque_get_submsg,
-    opaque_get_submsg_array,
-    opaque_get_submsg_slice,
-    opaque_get_uint32,
-    opaque_get_uint64,
-    splice_dirty_fields,
-)
-from omnibuf.wire import (
-    MAX_FIELD_NUMBER,
-    MAX_NESTING_DEPTH,
-    WIRE_ARRAY,
-    WIRE_BOOL_FALSE,
-    WIRE_BOOL_TRUE,
-    WIRE_MAP,
-    WIRE_SUB_MSG,
-    Buffer,
-    OmniBufDecodeError,
-    OmniBufEncodeError,
-    append_varint,
-    backpatch_container_len,
-    decode_utf8_strict,
-    decode_varint,
-    decode_zigzag,
-    decode_zigzag32,
-    encode_utf8_strict,
-    encode_zigzag,
-    encode_zigzag32,
-    parse_array_header,
-    parse_map_header,
-    read_len_bytes,
-    validate_field0_at,
-    validate_message,
-    validate_value,
-)
-
-_U32_PACK = struct.Struct('<I').pack
-_I32_PACK = struct.Struct('<i').pack
-_U64_PACK = struct.Struct('<Q').pack
-_I64_PACK = struct.Struct('<q').pack
-_F32_PACK = struct.Struct('<f').pack
-_F64_PACK = struct.Struct('<d').pack
-_U32_UNPACK = struct.Struct('<I').unpack_from
-_I32_UNPACK = struct.Struct('<i').unpack_from
-_U64_UNPACK = struct.Struct('<Q').unpack_from
-_I64_UNPACK = struct.Struct('<q').unpack_from
-_F32_UNPACK = struct.Struct('<f').unpack_from
-_F64_UNPACK = struct.Struct('<d').unpack_from
+from omnibuf._omnibuf_ext import CompiledCodec, OpaqueView
+from omnibuf.wire import Buffer
 
 _FIELD0_LOCATION: bytes = b'\x19\x16\x015\x11Location]\xe2\x00\x00\n\r\x03\rregion\x05\x15datacenter\x07\tcity\t\track\x0b\x11latitude\r\x13longitude'
 
 @dataclass(slots=True)
 class Location:
+    __omnibuf_codec__: ClassVar[CompiledCodec[Location]]
     region: str = ""
     datacenter: str = ""
     city: str = ""
@@ -87,341 +27,56 @@ class Location:
         deterministic: bool = False,
         self_describing: bool = False,
     ) -> bytes:
-        return marshal_location(self, deterministic=deterministic, self_describing=self_describing)
+        return _CODEC_LOCATION.marshal(self, deterministic=deterministic, self_describing=self_describing)
 
     @classmethod
     def unmarshal_omnibuf(cls, data: Buffer, out: Location | None = None) -> Location:
-        return unmarshal_location(data, out)
+        return _CODEC_LOCATION.unmarshal(data, out)
 
-def _encode_location_field(dst: bytearray, fnum: int, val: Any, deterministic: bool) -> None:
-    if fnum == 1:
-        dst.append(53)
-        _raw = val.encode('utf-8')
-        _slen = len(_raw)
-        if _slen <= 127:
-            dst.append((_slen << 1) | 1)
-        else:
-            append_varint(dst, _slen)
-        dst.extend(_raw)
-    elif fnum == 2:
-        dst.append(85)
-        _raw = val.encode('utf-8')
-        _slen = len(_raw)
-        if _slen <= 127:
-            dst.append((_slen << 1) | 1)
-        else:
-            append_varint(dst, _slen)
-        dst.extend(_raw)
-    elif fnum == 3:
-        dst.append(117)
-        _raw = val.encode('utf-8')
-        _slen = len(_raw)
-        if _slen <= 127:
-            dst.append((_slen << 1) | 1)
-        else:
-            append_varint(dst, _slen)
-        dst.extend(_raw)
-    elif fnum == 4:
-        dst.append(129)
-        _v = int(val)
-        if 0 <= _v <= 127:
-            dst.append((_v << 1) | 1)
-        elif 0 <= _v <= 0xFFFFFFFF:
-            append_varint(dst, _v)
-        else:
-            raise OmniBufEncodeError("omnibuf: uint32 out of range")
-    elif fnum == 5:
-        dst.append(177)
-        dst.extend(_F32_PACK(float(val)))
-    elif fnum == 6:
-        dst.append(209)
-        dst.extend(_F32_PACK(float(val)))
+_CODEC_LOCATION: CompiledCodec[Location] = CompiledCodec(Location, 'Location')
+Location.__omnibuf_codec__ = _CODEC_LOCATION
+marshal_location = _CODEC_LOCATION.marshal
+unmarshal_location = _CODEC_LOCATION.unmarshal
+_decode_location = _CODEC_LOCATION.decode_at
 
-def _encode_location(dst: bytearray, msg: Any, deterministic: bool) -> None:
-    _v_1 = msg.region
-    dst.append(53)
-    _raw = _v_1.encode('utf-8')
-    _slen = len(_raw)
-    if _slen <= 127:
-        dst.append((_slen << 1) | 1)
-    else:
-        append_varint(dst, _slen)
-    dst.extend(_raw)
-    _v_2 = msg.datacenter
-    dst.append(85)
-    _raw = _v_2.encode('utf-8')
-    _slen = len(_raw)
-    if _slen <= 127:
-        dst.append((_slen << 1) | 1)
-    else:
-        append_varint(dst, _slen)
-    dst.extend(_raw)
-    _v_3 = msg.city
-    dst.append(117)
-    _raw = _v_3.encode('utf-8')
-    _slen = len(_raw)
-    if _slen <= 127:
-        dst.append((_slen << 1) | 1)
-    else:
-        append_varint(dst, _slen)
-    dst.extend(_raw)
-    _v_4 = msg.rack
-    dst.append(129)
-    _v = int(_v_4)
-    if 0 <= _v <= 127:
-        dst.append((_v << 1) | 1)
-    elif 0 <= _v <= 0xFFFFFFFF:
-        append_varint(dst, _v)
-    else:
-        raise OmniBufEncodeError("omnibuf: uint32 out of range")
-    _v_5 = msg.latitude
-    dst.append(177)
-    dst.extend(_F32_PACK(float(_v_5)))
-    _v_6 = msg.longitude
-    dst.append(209)
-    dst.extend(_F32_PACK(float(_v_6)))
-
-def marshal_location(
-    msg: Any,
-    *,
-    deterministic: bool = False,
-    self_describing: bool = False,
-) -> bytes:
-    dst = bytearray()
-    if self_describing:
-        dst.extend(_FIELD0_LOCATION)
-    try:
-        _encode_location(dst, msg, deterministic)
-    except UnicodeEncodeError as exc:
-        raise OmniBufEncodeError(str(exc)) from exc
-    return bytes(dst)
-
-def _decode_location(
-    data: Buffer,
-    out: Location | None = None,
-    depth: int = 0,
-    merge: bool = False,
-) -> Location:
-    if depth > MAX_NESTING_DEPTH:
-        raise OmniBufDecodeError("omnibuf: nesting depth exceeds limit")
-    if out is None:
-        out = Location()
-    elif not merge:
-        out.region = ""
-        out.datacenter = ""
-        out.city = ""
-        out.rack = 0
-        out.latitude = 0.0
-        out.longitude = 0.0
-    mv = data if isinstance(data, (bytes, bytearray)) else bytes(data)
-    n = len(mv)
-    pos = 0
-    seen_mask = 0
-    try:
-        while pos < n:
-            b0 = mv[pos]
-            if b0 & 1:
-                fnum = b0 >> 5
-                wt = (b0 >> 1) & 0x0F
-                pos += 1
-            elif b0 & 2:
-                if pos + 2 > n:
-                    raise OmniBufDecodeError("omnibuf: truncated tag")
-                u16 = (b0 | (mv[pos + 1] << 8)) >> 2
-                fnum = u16 >> 4
-                wt = u16 & 0x0F
-                pos += 2
-            else:
-                tag, tn = decode_varint(mv, pos, n)
-                if tn == 0 or (tag >> 4) > MAX_FIELD_NUMBER:
-                    raise OmniBufDecodeError("omnibuf: invalid tag")
-                fnum = tag >> 4
-                wt = tag & 0x0F
-                pos += tn
-            if fnum == 0:
-                pos = validate_field0_at(mv, pos, wt, depth, MAX_NESTING_DEPTH, n)
-                continue
-            if fnum == 1:
-                if wt != 10:
-                    pos = validate_value(mv, pos, wt, depth, MAX_NESTING_DEPTH, n)
-                    continue
-                seen_mask |= 1
-                if pos >= n:
-                    raise OmniBufDecodeError("omnibuf: truncated string")
-                _sb = mv[pos]
-                if _sb & 1:
-                    _slen = _sb >> 1
-                    pos += 1
-                    if pos + _slen > n:
-                        raise OmniBufDecodeError("omnibuf: truncated string")
-                    out.region = mv[pos : pos + _slen].decode('utf-8')
-                    pos += _slen
-                else:
-                    _s_mv, pos = read_len_bytes(mv, pos, 0, n)
-                    out.region = _s_mv.decode('utf-8')
-            elif fnum == 2:
-                if wt != 10:
-                    pos = validate_value(mv, pos, wt, depth, MAX_NESTING_DEPTH, n)
-                    continue
-                seen_mask |= 2
-                if pos >= n:
-                    raise OmniBufDecodeError("omnibuf: truncated string")
-                _sb = mv[pos]
-                if _sb & 1:
-                    _slen = _sb >> 1
-                    pos += 1
-                    if pos + _slen > n:
-                        raise OmniBufDecodeError("omnibuf: truncated string")
-                    out.datacenter = mv[pos : pos + _slen].decode('utf-8')
-                    pos += _slen
-                else:
-                    _s_mv, pos = read_len_bytes(mv, pos, 0, n)
-                    out.datacenter = _s_mv.decode('utf-8')
-            elif fnum == 3:
-                if wt != 10:
-                    pos = validate_value(mv, pos, wt, depth, MAX_NESTING_DEPTH, n)
-                    continue
-                seen_mask |= 4
-                if pos >= n:
-                    raise OmniBufDecodeError("omnibuf: truncated string")
-                _sb = mv[pos]
-                if _sb & 1:
-                    _slen = _sb >> 1
-                    pos += 1
-                    if pos + _slen > n:
-                        raise OmniBufDecodeError("omnibuf: truncated string")
-                    out.city = mv[pos : pos + _slen].decode('utf-8')
-                    pos += _slen
-                else:
-                    _s_mv, pos = read_len_bytes(mv, pos, 0, n)
-                    out.city = _s_mv.decode('utf-8')
-            elif fnum == 4:
-                if wt != 0:
-                    pos = validate_value(mv, pos, wt, depth, MAX_NESTING_DEPTH, n)
-                    continue
-                seen_mask |= 8
-                if pos >= n:
-                    raise OmniBufDecodeError("omnibuf: truncated uint32")
-                _vb = mv[pos]
-                if _vb & 1:
-                    out.rack = _vb >> 1
-                    pos += 1
-                else:
-                    _v, _w = decode_varint(mv, pos, n)
-                    if _w == 0:
-                        raise OmniBufDecodeError("omnibuf: invalid uint32")
-                    out.rack = _v & 0xFFFFFFFF
-                    pos += _w
-            elif fnum == 5:
-                if wt != 8:
-                    pos = validate_value(mv, pos, wt, depth, MAX_NESTING_DEPTH, n)
-                    continue
-                seen_mask |= 16
-                if pos + 4 > n:
-                    raise OmniBufDecodeError("omnibuf: truncated float32")
-                (out.latitude,) = _F32_UNPACK(mv, pos)
-                pos += 4
-            elif fnum == 6:
-                if wt != 8:
-                    pos = validate_value(mv, pos, wt, depth, MAX_NESTING_DEPTH, n)
-                    continue
-                seen_mask |= 32
-                if pos + 4 > n:
-                    raise OmniBufDecodeError("omnibuf: truncated float32")
-                (out.longitude,) = _F32_UNPACK(mv, pos)
-                pos += 4
-            else:
-                pos = validate_value(mv, pos, wt, depth, MAX_NESTING_DEPTH, n)
-    except UnicodeDecodeError as exc:
-        raise OmniBufDecodeError(str(exc)) from exc
-    return out
-
-def unmarshal_location(data: Buffer, out: Location | None = None) -> Location:
-    return _decode_location(data, out, 0, False)
-
-class OpaqueLocation:
-    __slots__ = ('_raw', '_dirty_mask', '_d_region', '_d_datacenter', '_d_city', '_d_rack', '_d_latitude', '_d_longitude',)
-
-    def __init__(self, raw: Buffer) -> None:
-        self._raw: Buffer = raw
-        self._dirty_mask: int = 0
-
-    def raw(self) -> Buffer:
-        return self._raw
+class OpaqueLocation(OpaqueView):
+    __slots__ = ()
 
     def get_region(self) -> str:
-        if self._dirty_mask & 2:
-            return self._d_region  # type: ignore[no-any-return, attr-defined]
-        return opaque_get_string(self._raw, 1)
+        return self._get_string(1)
 
     def set_region(self, val: str) -> None:
-        self._d_region: Any = val
-        self._dirty_mask |= 2
+        self._set_dirty(1, val)
 
     def get_datacenter(self) -> str:
-        if self._dirty_mask & 4:
-            return self._d_datacenter  # type: ignore[no-any-return, attr-defined]
-        return opaque_get_string(self._raw, 2)
+        return self._get_string(2)
 
     def set_datacenter(self, val: str) -> None:
-        self._d_datacenter: Any = val
-        self._dirty_mask |= 4
+        self._set_dirty(2, val)
 
     def get_city(self) -> str:
-        if self._dirty_mask & 8:
-            return self._d_city  # type: ignore[no-any-return, attr-defined]
-        return opaque_get_string(self._raw, 3)
+        return self._get_string(3)
 
     def set_city(self, val: str) -> None:
-        self._d_city: Any = val
-        self._dirty_mask |= 8
+        self._set_dirty(3, val)
 
     def get_rack(self) -> int:
-        if self._dirty_mask & 16:
-            return self._d_rack  # type: ignore[no-any-return, attr-defined]
-        return opaque_get_uint32(self._raw, 4)
+        return self._get_uint32(4)
 
     def set_rack(self, val: int) -> None:
-        self._d_rack: Any = val
-        self._dirty_mask |= 16
+        self._set_dirty(4, val)
 
     def get_latitude(self) -> float:
-        if self._dirty_mask & 32:
-            return self._d_latitude  # type: ignore[no-any-return, attr-defined]
-        return opaque_get_float32(self._raw, 5)
+        return self._get_float32(5)
 
     def set_latitude(self, val: float) -> None:
-        self._d_latitude: Any = val
-        self._dirty_mask |= 32
+        self._set_dirty(5, val)
 
     def get_longitude(self) -> float:
-        if self._dirty_mask & 64:
-            return self._d_longitude  # type: ignore[no-any-return, attr-defined]
-        return opaque_get_float32(self._raw, 6)
+        return self._get_float32(6)
 
     def set_longitude(self, val: float) -> None:
-        self._d_longitude: Any = val
-        self._dirty_mask |= 64
-
-    def _encode_dirty(self, dst: bytearray, fnum: int) -> None:
-        if fnum == 1:
-            _v = self._d_region
-            _encode_location_field(dst, 1, _v, True)
-        elif fnum == 2:
-            _v = self._d_datacenter
-            _encode_location_field(dst, 2, _v, True)
-        elif fnum == 3:
-            _v = self._d_city
-            _encode_location_field(dst, 3, _v, True)
-        elif fnum == 4:
-            _v = self._d_rack
-            _encode_location_field(dst, 4, _v, True)
-        elif fnum == 5:
-            _v = self._d_latitude
-            _encode_location_field(dst, 5, _v, True)
-        elif fnum == 6:
-            _v = self._d_longitude
-            _encode_location_field(dst, 6, _v, True)
+        self._set_dirty(6, val)
 
     def marshal(
         self,
@@ -429,30 +84,13 @@ class OpaqueLocation:
         dst_prefix: Buffer | None = None,
         self_describing: bool = False,
     ) -> bytes:
-        if self._dirty_mask:
-            try:
-                spliced = splice_dirty_fields(None, self._raw, self._dirty_mask, self._encode_dirty)
-            except UnicodeEncodeError as exc:
-                raise OmniBufEncodeError(str(exc)) from exc
-            self._raw = spliced
-            self._dirty_mask = 0
-        else:
-            validate_message(self._raw)
-            spliced = bytes(self._raw)
-        if dst_prefix is None and not self_describing:
-            return spliced
-        prefix = bytearray(dst_prefix) if dst_prefix is not None else bytearray()
-        if self_describing and read_field0_schema_meta(spliced) is None:
-            prefix.extend(_FIELD0_LOCATION)
-        if prefix:
-            prefix.extend(spliced)
-            return bytes(prefix)
-        return spliced
+        return self._marshal_with_codec(_CODEC_LOCATION, dst_prefix=dst_prefix, self_describing=self_describing)
 
 _FIELD0_NEIGHBOR: bytes = b'\x19\xee\x005\x11Neighbor]\xba\x00\x00\n\t\x03\x11peer_asn\x05\rrouter\x07\x15latency_us\t\x17established'
 
 @dataclass(slots=True)
 class Neighbor:
+    __omnibuf_codec__: ClassVar[CompiledCodec[Neighbor]]
     peer_asn: int = 0
     router: str = ""
     latency_us: int = 0
@@ -464,258 +102,44 @@ class Neighbor:
         deterministic: bool = False,
         self_describing: bool = False,
     ) -> bytes:
-        return marshal_neighbor(self, deterministic=deterministic, self_describing=self_describing)
+        return _CODEC_NEIGHBOR.marshal(self, deterministic=deterministic, self_describing=self_describing)
 
     @classmethod
     def unmarshal_omnibuf(cls, data: Buffer, out: Neighbor | None = None) -> Neighbor:
-        return unmarshal_neighbor(data, out)
+        return _CODEC_NEIGHBOR.unmarshal(data, out)
 
-def _encode_neighbor_field(dst: bytearray, fnum: int, val: Any, deterministic: bool) -> None:
-    if fnum == 1:
-        dst.append(33)
-        _v = int(val)
-        if 0 <= _v <= 127:
-            dst.append((_v << 1) | 1)
-        elif 0 <= _v <= 0xFFFFFFFF:
-            append_varint(dst, _v)
-        else:
-            raise OmniBufEncodeError("omnibuf: uint32 out of range")
-    elif fnum == 2:
-        dst.append(85)
-        _raw = val.encode('utf-8')
-        _slen = len(_raw)
-        if _slen <= 127:
-            dst.append((_slen << 1) | 1)
-        else:
-            append_varint(dst, _slen)
-        dst.extend(_raw)
-    elif fnum == 3:
-        dst.append(97)
-        _v = int(val)
-        if 0 <= _v <= 127:
-            dst.append((_v << 1) | 1)
-        elif 0 <= _v <= 0xFFFFFFFF:
-            append_varint(dst, _v)
-        else:
-            raise OmniBufEncodeError("omnibuf: uint32 out of range")
-    elif fnum == 4:
-        dst.append(135 if val else 133)
+_CODEC_NEIGHBOR: CompiledCodec[Neighbor] = CompiledCodec(Neighbor, 'Neighbor')
+Neighbor.__omnibuf_codec__ = _CODEC_NEIGHBOR
+marshal_neighbor = _CODEC_NEIGHBOR.marshal
+unmarshal_neighbor = _CODEC_NEIGHBOR.unmarshal
+_decode_neighbor = _CODEC_NEIGHBOR.decode_at
 
-def _encode_neighbor(dst: bytearray, msg: Any, deterministic: bool) -> None:
-    _v_1 = msg.peer_asn
-    dst.append(33)
-    _v = int(_v_1)
-    if 0 <= _v <= 127:
-        dst.append((_v << 1) | 1)
-    elif 0 <= _v <= 0xFFFFFFFF:
-        append_varint(dst, _v)
-    else:
-        raise OmniBufEncodeError("omnibuf: uint32 out of range")
-    _v_2 = msg.router
-    dst.append(85)
-    _raw = _v_2.encode('utf-8')
-    _slen = len(_raw)
-    if _slen <= 127:
-        dst.append((_slen << 1) | 1)
-    else:
-        append_varint(dst, _slen)
-    dst.extend(_raw)
-    _v_3 = msg.latency_us
-    dst.append(97)
-    _v = int(_v_3)
-    if 0 <= _v <= 127:
-        dst.append((_v << 1) | 1)
-    elif 0 <= _v <= 0xFFFFFFFF:
-        append_varint(dst, _v)
-    else:
-        raise OmniBufEncodeError("omnibuf: uint32 out of range")
-    _v_4 = msg.established
-    dst.append(135 if _v_4 else 133)
-
-def marshal_neighbor(
-    msg: Any,
-    *,
-    deterministic: bool = False,
-    self_describing: bool = False,
-) -> bytes:
-    dst = bytearray()
-    if self_describing:
-        dst.extend(_FIELD0_NEIGHBOR)
-    try:
-        _encode_neighbor(dst, msg, deterministic)
-    except UnicodeEncodeError as exc:
-        raise OmniBufEncodeError(str(exc)) from exc
-    return bytes(dst)
-
-def _decode_neighbor(
-    data: Buffer,
-    out: Neighbor | None = None,
-    depth: int = 0,
-    merge: bool = False,
-) -> Neighbor:
-    if depth > MAX_NESTING_DEPTH:
-        raise OmniBufDecodeError("omnibuf: nesting depth exceeds limit")
-    if out is None:
-        out = Neighbor()
-    elif not merge:
-        out.peer_asn = 0
-        out.router = ""
-        out.latency_us = 0
-        out.established = False
-    mv = data if isinstance(data, (bytes, bytearray)) else bytes(data)
-    n = len(mv)
-    pos = 0
-    seen_mask = 0
-    try:
-        while pos < n:
-            b0 = mv[pos]
-            if b0 & 1:
-                fnum = b0 >> 5
-                wt = (b0 >> 1) & 0x0F
-                pos += 1
-            elif b0 & 2:
-                if pos + 2 > n:
-                    raise OmniBufDecodeError("omnibuf: truncated tag")
-                u16 = (b0 | (mv[pos + 1] << 8)) >> 2
-                fnum = u16 >> 4
-                wt = u16 & 0x0F
-                pos += 2
-            else:
-                tag, tn = decode_varint(mv, pos, n)
-                if tn == 0 or (tag >> 4) > MAX_FIELD_NUMBER:
-                    raise OmniBufDecodeError("omnibuf: invalid tag")
-                fnum = tag >> 4
-                wt = tag & 0x0F
-                pos += tn
-            if fnum == 0:
-                pos = validate_field0_at(mv, pos, wt, depth, MAX_NESTING_DEPTH, n)
-                continue
-            if fnum == 1:
-                if wt != 0:
-                    pos = validate_value(mv, pos, wt, depth, MAX_NESTING_DEPTH, n)
-                    continue
-                seen_mask |= 1
-                if pos >= n:
-                    raise OmniBufDecodeError("omnibuf: truncated uint32")
-                _vb = mv[pos]
-                if _vb & 1:
-                    out.peer_asn = _vb >> 1
-                    pos += 1
-                else:
-                    _v, _w = decode_varint(mv, pos, n)
-                    if _w == 0:
-                        raise OmniBufDecodeError("omnibuf: invalid uint32")
-                    out.peer_asn = _v & 0xFFFFFFFF
-                    pos += _w
-            elif fnum == 2:
-                if wt != 10:
-                    pos = validate_value(mv, pos, wt, depth, MAX_NESTING_DEPTH, n)
-                    continue
-                seen_mask |= 2
-                if pos >= n:
-                    raise OmniBufDecodeError("omnibuf: truncated string")
-                _sb = mv[pos]
-                if _sb & 1:
-                    _slen = _sb >> 1
-                    pos += 1
-                    if pos + _slen > n:
-                        raise OmniBufDecodeError("omnibuf: truncated string")
-                    out.router = mv[pos : pos + _slen].decode('utf-8')
-                    pos += _slen
-                else:
-                    _s_mv, pos = read_len_bytes(mv, pos, 0, n)
-                    out.router = _s_mv.decode('utf-8')
-            elif fnum == 3:
-                if wt != 0:
-                    pos = validate_value(mv, pos, wt, depth, MAX_NESTING_DEPTH, n)
-                    continue
-                seen_mask |= 4
-                if pos >= n:
-                    raise OmniBufDecodeError("omnibuf: truncated uint32")
-                _vb = mv[pos]
-                if _vb & 1:
-                    out.latency_us = _vb >> 1
-                    pos += 1
-                else:
-                    _v, _w = decode_varint(mv, pos, n)
-                    if _w == 0:
-                        raise OmniBufDecodeError("omnibuf: invalid uint32")
-                    out.latency_us = _v & 0xFFFFFFFF
-                    pos += _w
-            elif fnum == 4:
-                if wt != WIRE_BOOL_FALSE and wt != WIRE_BOOL_TRUE:
-                    pos = validate_value(mv, pos, wt, depth, MAX_NESTING_DEPTH, n)
-                    continue
-                seen_mask |= 8
-                out.established = (wt == WIRE_BOOL_TRUE)
-            else:
-                pos = validate_value(mv, pos, wt, depth, MAX_NESTING_DEPTH, n)
-    except UnicodeDecodeError as exc:
-        raise OmniBufDecodeError(str(exc)) from exc
-    return out
-
-def unmarshal_neighbor(data: Buffer, out: Neighbor | None = None) -> Neighbor:
-    return _decode_neighbor(data, out, 0, False)
-
-class OpaqueNeighbor:
-    __slots__ = ('_raw', '_dirty_mask', '_d_peer_asn', '_d_router', '_d_latency_us', '_d_established',)
-
-    def __init__(self, raw: Buffer) -> None:
-        self._raw: Buffer = raw
-        self._dirty_mask: int = 0
-
-    def raw(self) -> Buffer:
-        return self._raw
+class OpaqueNeighbor(OpaqueView):
+    __slots__ = ()
 
     def get_peer_asn(self) -> int:
-        if self._dirty_mask & 2:
-            return self._d_peer_asn  # type: ignore[no-any-return, attr-defined]
-        return opaque_get_uint32(self._raw, 1)
+        return self._get_uint32(1)
 
     def set_peer_asn(self, val: int) -> None:
-        self._d_peer_asn: Any = val
-        self._dirty_mask |= 2
+        self._set_dirty(1, val)
 
     def get_router(self) -> str:
-        if self._dirty_mask & 4:
-            return self._d_router  # type: ignore[no-any-return, attr-defined]
-        return opaque_get_string(self._raw, 2)
+        return self._get_string(2)
 
     def set_router(self, val: str) -> None:
-        self._d_router: Any = val
-        self._dirty_mask |= 4
+        self._set_dirty(2, val)
 
     def get_latency_us(self) -> int:
-        if self._dirty_mask & 8:
-            return self._d_latency_us  # type: ignore[no-any-return, attr-defined]
-        return opaque_get_uint32(self._raw, 3)
+        return self._get_uint32(3)
 
     def set_latency_us(self, val: int) -> None:
-        self._d_latency_us: Any = val
-        self._dirty_mask |= 8
+        self._set_dirty(3, val)
 
     def get_established(self) -> bool:
-        if self._dirty_mask & 16:
-            return self._d_established  # type: ignore[no-any-return, attr-defined]
-        return opaque_get_bool(self._raw, 4)
+        return self._get_bool(4)
 
     def set_established(self, val: bool) -> None:
-        self._d_established: Any = val
-        self._dirty_mask |= 16
-
-    def _encode_dirty(self, dst: bytearray, fnum: int) -> None:
-        if fnum == 1:
-            _v = self._d_peer_asn
-            _encode_neighbor_field(dst, 1, _v, True)
-        elif fnum == 2:
-            _v = self._d_router
-            _encode_neighbor_field(dst, 2, _v, True)
-        elif fnum == 3:
-            _v = self._d_latency_us
-            _encode_neighbor_field(dst, 3, _v, True)
-        elif fnum == 4:
-            _v = self._d_established
-            _encode_neighbor_field(dst, 4, _v, True)
+        self._set_dirty(4, val)
 
     def marshal(
         self,
@@ -723,30 +147,13 @@ class OpaqueNeighbor:
         dst_prefix: Buffer | None = None,
         self_describing: bool = False,
     ) -> bytes:
-        if self._dirty_mask:
-            try:
-                spliced = splice_dirty_fields(None, self._raw, self._dirty_mask, self._encode_dirty)
-            except UnicodeEncodeError as exc:
-                raise OmniBufEncodeError(str(exc)) from exc
-            self._raw = spliced
-            self._dirty_mask = 0
-        else:
-            validate_message(self._raw)
-            spliced = bytes(self._raw)
-        if dst_prefix is None and not self_describing:
-            return spliced
-        prefix = bytearray(dst_prefix) if dst_prefix is not None else bytearray()
-        if self_describing and read_field0_schema_meta(spliced) is None:
-            prefix.extend(_FIELD0_NEIGHBOR)
-        if prefix:
-            prefix.extend(spliced)
-            return bytes(prefix)
-        return spliced
+        return self._marshal_with_codec(_CODEC_NEIGHBOR, dst_prefix=dst_prefix, self_describing=self_describing)
 
 _FIELD0_PEER_UPDATE: bytes = b'\x19\x16\x045\x15PeerUpdate]\xaa\x01\x00\n\x17\x03\x07asn\x05\x13router_id\x07\ractive\t\x15uptime_sec\x0b\x11rssi_dbm\r\x11cpu_load\x0f\ttags\x11\x11prefixes\x13\x11location\x15\x13neighbors\x17\x11sequence}&\x02\x00\x0c\x05\x13\x16\x015\x11Location]\xe2\x00\x00\n\r\x03\rregion\x05\x15datacenter\x07\tcity\t\track\x0b\x11latitude\r\x13longitude\x15\xee\x005\x11Neighbor]\xba\x00\x00\n\t\x03\x11peer_asn\x05\rrouter\x07\x15latency_us\t\x17established'
 
 @dataclass(slots=True)
 class PeerUpdate:
+    __omnibuf_codec__: ClassVar[CompiledCodec[PeerUpdate]]
     asn: int = 0
     router_id: str = ""
     active: bool = False
@@ -765,642 +172,89 @@ class PeerUpdate:
         deterministic: bool = False,
         self_describing: bool = False,
     ) -> bytes:
-        return marshal_peer_update(self, deterministic=deterministic, self_describing=self_describing)
+        return _CODEC_PEER_UPDATE.marshal(self, deterministic=deterministic, self_describing=self_describing)
 
     @classmethod
     def unmarshal_omnibuf(cls, data: Buffer, out: PeerUpdate | None = None) -> PeerUpdate:
-        return unmarshal_peer_update(data, out)
+        return _CODEC_PEER_UPDATE.unmarshal(data, out)
 
-def _encode_peer_update_field(dst: bytearray, fnum: int, val: Any, deterministic: bool) -> None:
-    if fnum == 1:
-        dst.append(33)
-        _v = int(val)
-        if 0 <= _v <= 127:
-            dst.append((_v << 1) | 1)
-        elif 0 <= _v <= 0xFFFFFFFF:
-            append_varint(dst, _v)
-        else:
-            raise OmniBufEncodeError("omnibuf: uint32 out of range")
-    elif fnum == 2:
-        dst.append(85)
-        _raw = val.encode('utf-8')
-        _slen = len(_raw)
-        if _slen <= 127:
-            dst.append((_slen << 1) | 1)
-        else:
-            append_varint(dst, _slen)
-        dst.extend(_raw)
-    elif fnum == 3:
-        dst.append(103 if val else 101)
-    elif fnum == 4:
-        dst.append(129)
-        _v = int(val)
-        if 0 <= _v <= 127:
-            dst.append((_v << 1) | 1)
-        elif 0 <= _v <= 0xFFFFFFFFFFFFFFFF:
-            append_varint(dst, _v)
-        else:
-            raise OmniBufEncodeError("omnibuf: uint64 out of range")
-    elif fnum == 5:
-        dst.append(163)
-        _vi = int(val)
-        if -64 <= _vi <= 63:
-            dst.append(((((_vi << 1) ^ (_vi >> 31)) & 0xFF) << 1) | 1)
-        else:
-            append_varint(dst, encode_zigzag32(_vi))
-    elif fnum == 6:
-        dst.append(211)
-        dst.extend(_F64_PACK(float(val)))
-    elif fnum == 7:
-        dst.extend(b'\xfb')
-        _lp = len(dst)
-        dst.extend(b'\x00\x00')
-        dst.append(10)
-        _arr = val
-        append_varint(dst, len(_arr))
-        for _item in _arr:
-            _raw = _item.encode('utf-8')
-            _slen = len(_raw)
-            if _slen <= 127:
-                dst.append((_slen << 1) | 1)
-            else:
-                append_varint(dst, _slen)
-            dst.extend(_raw)
-        backpatch_container_len(dst, _lp)
-    elif fnum == 8:
-        dst.extend(b'6\x02')
-        _lp = len(dst)
-        dst.extend(b'\x00\x00')
-        dst.append(0)
-        _arr = val
-        append_varint(dst, len(_arr))
-        for _item in _arr:
-            _v = int(_item)
-            if 0 <= _v <= 127:
-                dst.append((_v << 1) | 1)
-            elif 0 <= _v <= 0xFFFFFFFF:
-                append_varint(dst, _v)
-            else:
-                raise OmniBufEncodeError("omnibuf: uint32 out of range")
-        backpatch_container_len(dst, _lp)
-    elif fnum == 9:
-        dst.extend(b'r\x02')
-        _lp = len(dst)
-        dst.extend(b'\x00\x00')
-        _encode_location(dst, val, deterministic)
-        backpatch_container_len(dst, _lp)
-    elif fnum == 10:
-        dst.extend(b'\xb6\x02')
-        _lp = len(dst)
-        dst.extend(b'\x00\x00')
-        dst.append(12)
-        _arr = val
-        append_varint(dst, len(_arr))
-        for _item in _arr:
-            _ep = len(dst)
-            dst.extend(b'\x00\x00')
-            if _item is not None:
-                _encode_neighbor(dst, _item, deterministic)
-            backpatch_container_len(dst, _ep)
-        backpatch_container_len(dst, _lp)
-    elif fnum == 11:
-        dst.extend(b'\xc2\x02')
-        _v = int(val)
-        if 0 <= _v <= 127:
-            dst.append((_v << 1) | 1)
-        elif 0 <= _v <= 0xFFFFFFFFFFFFFFFF:
-            append_varint(dst, _v)
-        else:
-            raise OmniBufEncodeError("omnibuf: uint64 out of range")
+_CODEC_PEER_UPDATE: CompiledCodec[PeerUpdate] = CompiledCodec(PeerUpdate, 'PeerUpdate')
+PeerUpdate.__omnibuf_codec__ = _CODEC_PEER_UPDATE
+marshal_peer_update = _CODEC_PEER_UPDATE.marshal
+unmarshal_peer_update = _CODEC_PEER_UPDATE.unmarshal
+_decode_peer_update = _CODEC_PEER_UPDATE.decode_at
 
-def _encode_peer_update(dst: bytearray, msg: Any, deterministic: bool) -> None:
-    _v_1 = msg.asn
-    dst.append(33)
-    _v = int(_v_1)
-    if 0 <= _v <= 127:
-        dst.append((_v << 1) | 1)
-    elif 0 <= _v <= 0xFFFFFFFF:
-        append_varint(dst, _v)
-    else:
-        raise OmniBufEncodeError("omnibuf: uint32 out of range")
-    _v_2 = msg.router_id
-    dst.append(85)
-    _raw = _v_2.encode('utf-8')
-    _slen = len(_raw)
-    if _slen <= 127:
-        dst.append((_slen << 1) | 1)
-    else:
-        append_varint(dst, _slen)
-    dst.extend(_raw)
-    _v_3 = msg.active
-    dst.append(103 if _v_3 else 101)
-    _v_4 = msg.uptime_sec
-    dst.append(129)
-    _v = int(_v_4)
-    if 0 <= _v <= 127:
-        dst.append((_v << 1) | 1)
-    elif 0 <= _v <= 0xFFFFFFFFFFFFFFFF:
-        append_varint(dst, _v)
-    else:
-        raise OmniBufEncodeError("omnibuf: uint64 out of range")
-    _v_5 = msg.rssi_dbm
-    dst.append(163)
-    _vi = int(_v_5)
-    if -64 <= _vi <= 63:
-        dst.append(((((_vi << 1) ^ (_vi >> 31)) & 0xFF) << 1) | 1)
-    else:
-        append_varint(dst, encode_zigzag32(_vi))
-    _v_6 = msg.cpu_load
-    dst.append(211)
-    dst.extend(_F64_PACK(float(_v_6)))
-    _v_7 = msg.tags
-    dst.extend(b'\xfb')
-    _lp = len(dst)
-    dst.extend(b'\x00\x00')
-    dst.append(10)
-    _arr = _v_7
-    append_varint(dst, len(_arr))
-    for _item in _arr:
-        _raw = _item.encode('utf-8')
-        _slen = len(_raw)
-        if _slen <= 127:
-            dst.append((_slen << 1) | 1)
-        else:
-            append_varint(dst, _slen)
-        dst.extend(_raw)
-    backpatch_container_len(dst, _lp)
-    _v_8 = msg.prefixes
-    dst.extend(b'6\x02')
-    _lp = len(dst)
-    dst.extend(b'\x00\x00')
-    dst.append(0)
-    _arr = _v_8
-    append_varint(dst, len(_arr))
-    for _item in _arr:
-        _v = int(_item)
-        if 0 <= _v <= 127:
-            dst.append((_v << 1) | 1)
-        elif 0 <= _v <= 0xFFFFFFFF:
-            append_varint(dst, _v)
-        else:
-            raise OmniBufEncodeError("omnibuf: uint32 out of range")
-    backpatch_container_len(dst, _lp)
-    _v_9 = msg.location
-    if _v_9 is not None:
-        dst.extend(b'r\x02')
-        _lp = len(dst)
-        dst.extend(b'\x00\x00')
-        _encode_location(dst, _v_9, deterministic)
-        backpatch_container_len(dst, _lp)
-    _v_10 = msg.neighbors
-    dst.extend(b'\xb6\x02')
-    _lp = len(dst)
-    dst.extend(b'\x00\x00')
-    dst.append(12)
-    _arr = _v_10
-    append_varint(dst, len(_arr))
-    for _item in _arr:
-        _ep = len(dst)
-        dst.extend(b'\x00\x00')
-        if _item is not None:
-            _encode_neighbor(dst, _item, deterministic)
-        backpatch_container_len(dst, _ep)
-    backpatch_container_len(dst, _lp)
-    _v_11 = msg.sequence
-    dst.extend(b'\xc2\x02')
-    _v = int(_v_11)
-    if 0 <= _v <= 127:
-        dst.append((_v << 1) | 1)
-    elif 0 <= _v <= 0xFFFFFFFFFFFFFFFF:
-        append_varint(dst, _v)
-    else:
-        raise OmniBufEncodeError("omnibuf: uint64 out of range")
-
-def marshal_peer_update(
-    msg: Any,
-    *,
-    deterministic: bool = False,
-    self_describing: bool = False,
-) -> bytes:
-    dst = bytearray()
-    if self_describing:
-        dst.extend(_FIELD0_PEER_UPDATE)
-    try:
-        _encode_peer_update(dst, msg, deterministic)
-    except UnicodeEncodeError as exc:
-        raise OmniBufEncodeError(str(exc)) from exc
-    return bytes(dst)
-
-def _decode_peer_update(
-    data: Buffer,
-    out: PeerUpdate | None = None,
-    depth: int = 0,
-    merge: bool = False,
-) -> PeerUpdate:
-    if depth > MAX_NESTING_DEPTH:
-        raise OmniBufDecodeError("omnibuf: nesting depth exceeds limit")
-    if out is None:
-        out = PeerUpdate()
-    elif not merge:
-        out.asn = 0
-        out.router_id = ""
-        out.active = False
-        out.uptime_sec = 0
-        out.rssi_dbm = 0
-        out.cpu_load = 0.0
-        out.tags.clear()
-        out.prefixes.clear()
-        out.location = None
-        out.neighbors.clear()
-        out.sequence = 0
-    mv = data if isinstance(data, (bytes, bytearray)) else bytes(data)
-    n = len(mv)
-    pos = 0
-    seen_mask = 0
-    try:
-        while pos < n:
-            b0 = mv[pos]
-            if b0 & 1:
-                fnum = b0 >> 5
-                wt = (b0 >> 1) & 0x0F
-                pos += 1
-            elif b0 & 2:
-                if pos + 2 > n:
-                    raise OmniBufDecodeError("omnibuf: truncated tag")
-                u16 = (b0 | (mv[pos + 1] << 8)) >> 2
-                fnum = u16 >> 4
-                wt = u16 & 0x0F
-                pos += 2
-            else:
-                tag, tn = decode_varint(mv, pos, n)
-                if tn == 0 or (tag >> 4) > MAX_FIELD_NUMBER:
-                    raise OmniBufDecodeError("omnibuf: invalid tag")
-                fnum = tag >> 4
-                wt = tag & 0x0F
-                pos += tn
-            if fnum == 0:
-                pos = validate_field0_at(mv, pos, wt, depth, MAX_NESTING_DEPTH, n)
-                continue
-            if fnum == 1:
-                if wt != 0:
-                    pos = validate_value(mv, pos, wt, depth, MAX_NESTING_DEPTH, n)
-                    continue
-                seen_mask |= 1
-                if pos >= n:
-                    raise OmniBufDecodeError("omnibuf: truncated uint32")
-                _vb = mv[pos]
-                if _vb & 1:
-                    out.asn = _vb >> 1
-                    pos += 1
-                else:
-                    _v, _w = decode_varint(mv, pos, n)
-                    if _w == 0:
-                        raise OmniBufDecodeError("omnibuf: invalid uint32")
-                    out.asn = _v & 0xFFFFFFFF
-                    pos += _w
-            elif fnum == 2:
-                if wt != 10:
-                    pos = validate_value(mv, pos, wt, depth, MAX_NESTING_DEPTH, n)
-                    continue
-                seen_mask |= 2
-                if pos >= n:
-                    raise OmniBufDecodeError("omnibuf: truncated string")
-                _sb = mv[pos]
-                if _sb & 1:
-                    _slen = _sb >> 1
-                    pos += 1
-                    if pos + _slen > n:
-                        raise OmniBufDecodeError("omnibuf: truncated string")
-                    out.router_id = mv[pos : pos + _slen].decode('utf-8')
-                    pos += _slen
-                else:
-                    _s_mv, pos = read_len_bytes(mv, pos, 0, n)
-                    out.router_id = _s_mv.decode('utf-8')
-            elif fnum == 3:
-                if wt != WIRE_BOOL_FALSE and wt != WIRE_BOOL_TRUE:
-                    pos = validate_value(mv, pos, wt, depth, MAX_NESTING_DEPTH, n)
-                    continue
-                seen_mask |= 4
-                out.active = (wt == WIRE_BOOL_TRUE)
-            elif fnum == 4:
-                if wt != 0:
-                    pos = validate_value(mv, pos, wt, depth, MAX_NESTING_DEPTH, n)
-                    continue
-                seen_mask |= 8
-                if pos >= n:
-                    raise OmniBufDecodeError("omnibuf: truncated uint64")
-                _vb = mv[pos]
-                if _vb & 1:
-                    out.uptime_sec = _vb >> 1
-                    pos += 1
-                else:
-                    _v, _w = decode_varint(mv, pos, n)
-                    if _w == 0:
-                        raise OmniBufDecodeError("omnibuf: invalid uint64")
-                    out.uptime_sec = _v
-                    pos += _w
-            elif fnum == 5:
-                if wt != 1:
-                    pos = validate_value(mv, pos, wt, depth, MAX_NESTING_DEPTH, n)
-                    continue
-                seen_mask |= 16
-                if pos >= n:
-                    raise OmniBufDecodeError("omnibuf: truncated sint32")
-                _vb = mv[pos]
-                if _vb & 1:
-                    _u = _vb >> 1
-                    out.rssi_dbm = (_u >> 1) ^ -(_u & 1)
-                    pos += 1
-                else:
-                    _v, _w = decode_varint(mv, pos, n)
-                    if _w == 0:
-                        raise OmniBufDecodeError("omnibuf: invalid sint32")
-                    out.rssi_dbm = decode_zigzag32(_v)
-                    pos += _w
-            elif fnum == 6:
-                if wt != 9:
-                    pos = validate_value(mv, pos, wt, depth, MAX_NESTING_DEPTH, n)
-                    continue
-                seen_mask |= 32
-                if pos + 8 > n:
-                    raise OmniBufDecodeError("omnibuf: truncated float64")
-                (out.cpu_load,) = _F64_UNPACK(mv, pos)
-                pos += 8
-            elif fnum == 7:
-                if wt != WIRE_ARRAY:
-                    pos = validate_value(mv, pos, wt, depth, MAX_NESTING_DEPTH, n)
-                    continue
-                if depth + 1 > MAX_NESTING_DEPTH:
-                    raise OmniBufDecodeError("omnibuf: array depth exceeds limit")
-                _already = ((seen_mask & 64) != 0) or merge
-                seen_mask |= 64
-                _a_mv, pos = read_len_bytes(mv, pos, 2, n)
-                _ewt, _cnt, _p, _ok = parse_array_header(_a_mv)
-                if not _ok or _ewt != 10:
-                    raise OmniBufDecodeError("omnibuf: invalid array header")
-                _lst = out.tags
-                if not _already and _lst:
-                    _lst.clear()
-                _aend = len(_a_mv)
-                for _ in range(_cnt):
-                    if _p >= _aend:
-                        raise OmniBufDecodeError("omnibuf: truncated string")
-                    _sb = _a_mv[_p]
-                    if _sb & 1:
-                        _slen = _sb >> 1
-                        _p += 1
-                        if _p + _slen > _aend:
-                            raise OmniBufDecodeError("omnibuf: truncated string")
-                        _item = _a_mv[_p : _p + _slen].decode('utf-8')
-                        _p += _slen
-                    else:
-                        _s_mv, _p = read_len_bytes(_a_mv, _p, 0, _aend)
-                        _item = _s_mv.decode('utf-8')
-                    _lst.append(_item)
-                if _p != _aend:
-                    raise OmniBufDecodeError("omnibuf: trailing array bytes")
-            elif fnum == 8:
-                if wt != WIRE_ARRAY:
-                    pos = validate_value(mv, pos, wt, depth, MAX_NESTING_DEPTH, n)
-                    continue
-                if depth + 1 > MAX_NESTING_DEPTH:
-                    raise OmniBufDecodeError("omnibuf: array depth exceeds limit")
-                _already = ((seen_mask & 128) != 0) or merge
-                seen_mask |= 128
-                _a_mv, pos = read_len_bytes(mv, pos, 2, n)
-                _ewt, _cnt, _p, _ok = parse_array_header(_a_mv)
-                if not _ok or _ewt != 0:
-                    raise OmniBufDecodeError("omnibuf: invalid array header")
-                _lst = out.prefixes
-                if not _already and _lst:
-                    _lst.clear()
-                _aend = len(_a_mv)
-                for _ in range(_cnt):
-                    if _p >= _aend:
-                        raise OmniBufDecodeError("omnibuf: truncated uint32")
-                    _vb = _a_mv[_p]
-                    if _vb & 1:
-                        _item = _vb >> 1
-                        _p += 1
-                    else:
-                        _v, _w = decode_varint(_a_mv, _p, _aend)
-                        if _w == 0:
-                            raise OmniBufDecodeError("omnibuf: invalid uint32")
-                        _item = _v & 0xFFFFFFFF
-                        _p += _w
-                    _lst.append(_item)
-                if _p != _aend:
-                    raise OmniBufDecodeError("omnibuf: trailing array bytes")
-            elif fnum == 9:
-                if wt != WIRE_SUB_MSG:
-                    pos = validate_value(mv, pos, wt, depth, MAX_NESTING_DEPTH, n)
-                    continue
-                _already = ((seen_mask & 256) != 0) or merge
-                seen_mask |= 256
-                _sub_mv, pos = read_len_bytes(mv, pos, 0, n)
-                out.location = _decode_location(_sub_mv, out.location, depth + 1, _already)
-            elif fnum == 10:
-                if wt != WIRE_ARRAY:
-                    pos = validate_value(mv, pos, wt, depth, MAX_NESTING_DEPTH, n)
-                    continue
-                if depth + 1 > MAX_NESTING_DEPTH:
-                    raise OmniBufDecodeError("omnibuf: array depth exceeds limit")
-                _already = ((seen_mask & 512) != 0) or merge
-                seen_mask |= 512
-                _a_mv, pos = read_len_bytes(mv, pos, 2, n)
-                _ewt, _cnt, _p, _ok = parse_array_header(_a_mv)
-                if not _ok or _ewt != WIRE_SUB_MSG:
-                    raise OmniBufDecodeError("omnibuf: invalid submsg array header")
-                _lst = out.neighbors
-                if not _already and _lst:
-                    _lst.clear()
-                _aend = len(_a_mv)
-                for _ in range(_cnt):
-                    _emv, _p = read_len_bytes(_a_mv, _p, 0, _aend)
-                    _lst.append(_decode_neighbor(_emv, None, depth + 2, False))
-                if _p != _aend:
-                    raise OmniBufDecodeError("omnibuf: trailing submsg array bytes")
-            elif fnum == 11:
-                if wt != 0:
-                    pos = validate_value(mv, pos, wt, depth, MAX_NESTING_DEPTH, n)
-                    continue
-                seen_mask |= 1024
-                if pos >= n:
-                    raise OmniBufDecodeError("omnibuf: truncated uint64")
-                _vb = mv[pos]
-                if _vb & 1:
-                    out.sequence = _vb >> 1
-                    pos += 1
-                else:
-                    _v, _w = decode_varint(mv, pos, n)
-                    if _w == 0:
-                        raise OmniBufDecodeError("omnibuf: invalid uint64")
-                    out.sequence = _v
-                    pos += _w
-            else:
-                pos = validate_value(mv, pos, wt, depth, MAX_NESTING_DEPTH, n)
-    except UnicodeDecodeError as exc:
-        raise OmniBufDecodeError(str(exc)) from exc
-    return out
-
-def unmarshal_peer_update(data: Buffer, out: PeerUpdate | None = None) -> PeerUpdate:
-    return _decode_peer_update(data, out, 0, False)
-
-class OpaquePeerUpdate:
-    __slots__ = ('_raw', '_dirty_mask', '_d_asn', '_d_router_id', '_d_active', '_d_uptime_sec', '_d_rssi_dbm', '_d_cpu_load', '_d_tags', '_d_prefixes', '_d_location', '_d_neighbors', '_d_sequence',)
-
-    def __init__(self, raw: Buffer) -> None:
-        self._raw: Buffer = raw
-        self._dirty_mask: int = 0
-
-    def raw(self) -> Buffer:
-        return self._raw
+class OpaquePeerUpdate(OpaqueView):
+    __slots__ = ()
 
     def get_asn(self) -> int:
-        if self._dirty_mask & 2:
-            return self._d_asn  # type: ignore[no-any-return, attr-defined]
-        return opaque_get_uint32(self._raw, 1)
+        return self._get_uint32(1)
 
     def set_asn(self, val: int) -> None:
-        self._d_asn: Any = val
-        self._dirty_mask |= 2
+        self._set_dirty(1, val)
 
     def get_router_id(self) -> str:
-        if self._dirty_mask & 4:
-            return self._d_router_id  # type: ignore[no-any-return, attr-defined]
-        return opaque_get_string(self._raw, 2)
+        return self._get_string(2)
 
     def set_router_id(self, val: str) -> None:
-        self._d_router_id: Any = val
-        self._dirty_mask |= 4
+        self._set_dirty(2, val)
 
     def get_active(self) -> bool:
-        if self._dirty_mask & 8:
-            return self._d_active  # type: ignore[no-any-return, attr-defined]
-        return opaque_get_bool(self._raw, 3)
+        return self._get_bool(3)
 
     def set_active(self, val: bool) -> None:
-        self._d_active: Any = val
-        self._dirty_mask |= 8
+        self._set_dirty(3, val)
 
     def get_uptime_sec(self) -> int:
-        if self._dirty_mask & 16:
-            return self._d_uptime_sec  # type: ignore[no-any-return, attr-defined]
-        return opaque_get_uint64(self._raw, 4)
+        return self._get_uint64(4)
 
     def set_uptime_sec(self, val: int) -> None:
-        self._d_uptime_sec: Any = val
-        self._dirty_mask |= 16
+        self._set_uint64(4, val)
 
     def get_rssi_dbm(self) -> int:
-        if self._dirty_mask & 32:
-            return self._d_rssi_dbm  # type: ignore[no-any-return, attr-defined]
-        return opaque_get_sint32(self._raw, 5)
+        return self._get_sint32(5)
 
     def set_rssi_dbm(self, val: int) -> None:
-        self._d_rssi_dbm: Any = val
-        self._dirty_mask |= 32
+        self._set_dirty(5, val)
 
     def get_cpu_load(self) -> float:
-        if self._dirty_mask & 64:
-            return self._d_cpu_load  # type: ignore[no-any-return, attr-defined]
-        return opaque_get_float64(self._raw, 6)
+        return self._get_float64(6)
 
     def set_cpu_load(self, val: float) -> None:
-        self._d_cpu_load: Any = val
-        self._dirty_mask |= 64
+        self._set_dirty(6, val)
 
     def get_tags(self) -> list[str]:
-        if self._dirty_mask & 128:
-            return self._d_tags  # type: ignore[no-any-return, attr-defined]
-        return opaque_get_scalar_array(self._raw, 7, 10, 'string')
+        return self._get_scalar_array(7, 10, 12)
 
     def set_tags(self, val: list[str]) -> None:
-        self._d_tags: Any = val
-        self._dirty_mask |= 128
+        self._set_dirty(7, val)
 
     def get_prefixes(self) -> list[int]:
-        if self._dirty_mask & 256:
-            return self._d_prefixes  # type: ignore[no-any-return, attr-defined]
-        return opaque_get_scalar_array(self._raw, 8, 0, 'uint32')
+        return self._get_scalar_array(8, 0, 1)
 
     def set_prefixes(self, val: list[int]) -> None:
-        self._d_prefixes: Any = val
-        self._dirty_mask |= 256
+        self._set_dirty(8, val)
 
     def get_location(self) -> Location | None:
-        if self._dirty_mask & 512:
-            return self._d_location  # type: ignore[no-any-return, attr-defined]
-        return opaque_get_submsg(self._raw, 9, _decode_location)
+        return self._get_submsg(9, _CODEC_LOCATION)
 
     def opaque_location(self) -> OpaqueLocation | None:
-        if self._dirty_mask & 512:
-            _cur = self._d_location  # type: ignore[attr-defined]
-            if _cur is None:
-                return None
-            return OpaqueLocation(_cur.marshal_omnibuf())
-        _sub = opaque_get_submsg_slice(self._raw, 9)
-        if _sub is None:
-            return None
-        return OpaqueLocation(_sub)
+        return self._opaque_sub(9, OpaqueLocation, _CODEC_LOCATION)
 
     def set_location(self, val: Any) -> None:
-        self._d_location: Any = val
-        self._dirty_mask |= 512
+        self._set_dirty(9, val)
 
     def get_neighbors(self) -> list[Neighbor]:
-        if self._dirty_mask & 1024:
-            return self._d_neighbors  # type: ignore[no-any-return, attr-defined]
-        return opaque_get_submsg_array(self._raw, 10, _decode_neighbor)
+        return self._get_submsg_array(10, _CODEC_NEIGHBOR)
 
     def set_neighbors(self, val: list[Neighbor]) -> None:
-        self._d_neighbors: Any = val
-        self._dirty_mask |= 1024
+        self._set_dirty(10, val)
 
     def get_sequence(self) -> int:
-        if self._dirty_mask & 2048:
-            return self._d_sequence  # type: ignore[no-any-return, attr-defined]
-        return opaque_get_uint64(self._raw, 11)
+        return self._get_uint64(11)
 
     def set_sequence(self, val: int) -> None:
-        self._d_sequence: Any = val
-        self._dirty_mask |= 2048
-
-    def _encode_dirty(self, dst: bytearray, fnum: int) -> None:
-        if fnum == 1:
-            _v = self._d_asn
-            _encode_peer_update_field(dst, 1, _v, True)
-        elif fnum == 2:
-            _v = self._d_router_id
-            _encode_peer_update_field(dst, 2, _v, True)
-        elif fnum == 3:
-            _v = self._d_active
-            _encode_peer_update_field(dst, 3, _v, True)
-        elif fnum == 4:
-            _v = self._d_uptime_sec
-            _encode_peer_update_field(dst, 4, _v, True)
-        elif fnum == 5:
-            _v = self._d_rssi_dbm
-            _encode_peer_update_field(dst, 5, _v, True)
-        elif fnum == 6:
-            _v = self._d_cpu_load
-            _encode_peer_update_field(dst, 6, _v, True)
-        elif fnum == 7:
-            _v = self._d_tags
-            _encode_peer_update_field(dst, 7, _v, True)
-        elif fnum == 8:
-            _v = self._d_prefixes
-            _encode_peer_update_field(dst, 8, _v, True)
-        elif fnum == 9:
-            _v = self._d_location
-            if _v is not None:
-                _encode_peer_update_field(dst, 9, _v, True)
-        elif fnum == 10:
-            _v = self._d_neighbors
-            _encode_peer_update_field(dst, 10, _v, True)
-        elif fnum == 11:
-            _v = self._d_sequence
-            _encode_peer_update_field(dst, 11, _v, True)
+        self._set_uint64(11, val)
 
     def marshal(
         self,
@@ -1408,22 +262,43 @@ class OpaquePeerUpdate:
         dst_prefix: Buffer | None = None,
         self_describing: bool = False,
     ) -> bytes:
-        if self._dirty_mask:
-            try:
-                spliced = splice_dirty_fields(None, self._raw, self._dirty_mask, self._encode_dirty)
-            except UnicodeEncodeError as exc:
-                raise OmniBufEncodeError(str(exc)) from exc
-            self._raw = spliced
-            self._dirty_mask = 0
-        else:
-            validate_message(self._raw)
-            spliced = bytes(self._raw)
-        if dst_prefix is None and not self_describing:
-            return spliced
-        prefix = bytearray(dst_prefix) if dst_prefix is not None else bytearray()
-        if self_describing and read_field0_schema_meta(spliced) is None:
-            prefix.extend(_FIELD0_PEER_UPDATE)
-        if prefix:
-            prefix.extend(spliced)
-            return bytes(prefix)
-        return spliced
+        return self._marshal_with_codec(_CODEC_PEER_UPDATE, dst_prefix=dst_prefix, self_describing=self_describing)
+
+_CODEC_LOCATION.set_fields(
+    [
+        {"number": 1, "attr": 'region', "wire_name": 'region', "kind": 'string', "wire_type": 10, "skip_if_none": False, "default_mode": "const", "default_val": ""},
+        {"number": 2, "attr": 'datacenter', "wire_name": 'datacenter', "kind": 'string', "wire_type": 10, "skip_if_none": False, "default_mode": "const", "default_val": ""},
+        {"number": 3, "attr": 'city', "wire_name": 'city', "kind": 'string', "wire_type": 10, "skip_if_none": False, "default_mode": "const", "default_val": ""},
+        {"number": 4, "attr": 'rack', "wire_name": 'rack', "kind": 'uint32', "wire_type": 0, "skip_if_none": False, "default_mode": "const", "default_val": 0},
+        {"number": 5, "attr": 'latitude', "wire_name": 'latitude', "kind": 'float32', "wire_type": 8, "skip_if_none": False, "default_mode": "const", "default_val": 0.0},
+        {"number": 6, "attr": 'longitude', "wire_name": 'longitude', "kind": 'float32', "wire_type": 8, "skip_if_none": False, "default_mode": "const", "default_val": 0.0},
+    ],
+    _FIELD0_LOCATION,
+)
+
+_CODEC_NEIGHBOR.set_fields(
+    [
+        {"number": 1, "attr": 'peer_asn', "wire_name": 'peer_asn', "kind": 'uint32', "wire_type": 0, "skip_if_none": False, "default_mode": "const", "default_val": 0},
+        {"number": 2, "attr": 'router', "wire_name": 'router', "kind": 'string', "wire_type": 10, "skip_if_none": False, "default_mode": "const", "default_val": ""},
+        {"number": 3, "attr": 'latency_us', "wire_name": 'latency_us', "kind": 'uint32', "wire_type": 0, "skip_if_none": False, "default_mode": "const", "default_val": 0},
+        {"number": 4, "attr": 'established', "wire_name": 'established', "kind": 'bool', "wire_type": 2, "skip_if_none": False, "default_mode": "const", "default_val": False},
+    ],
+    _FIELD0_NEIGHBOR,
+)
+
+_CODEC_PEER_UPDATE.set_fields(
+    [
+        {"number": 1, "attr": 'asn', "wire_name": 'asn', "kind": 'uint32', "wire_type": 0, "skip_if_none": False, "default_mode": "const", "default_val": 0},
+        {"number": 2, "attr": 'router_id', "wire_name": 'router_id', "kind": 'string', "wire_type": 10, "skip_if_none": False, "default_mode": "const", "default_val": ""},
+        {"number": 3, "attr": 'active', "wire_name": 'active', "kind": 'bool', "wire_type": 2, "skip_if_none": False, "default_mode": "const", "default_val": False},
+        {"number": 4, "attr": 'uptime_sec', "wire_name": 'uptime_sec', "kind": 'uint64', "wire_type": 0, "skip_if_none": False, "default_mode": "const", "default_val": 0},
+        {"number": 5, "attr": 'rssi_dbm', "wire_name": 'rssi_dbm', "kind": 'sint32', "wire_type": 1, "skip_if_none": False, "default_mode": "const", "default_val": 0},
+        {"number": 6, "attr": 'cpu_load', "wire_name": 'cpu_load', "kind": 'float64', "wire_type": 9, "skip_if_none": False, "default_mode": "const", "default_val": 0.0},
+        {"number": 7, "attr": 'tags', "wire_name": 'tags', "kind": "array_scalar", "wire_type": 13, "elem_kind": 'string', "elem_wt": 10, "default_mode": "list"},
+        {"number": 8, "attr": 'prefixes', "wire_name": 'prefixes', "kind": "array_scalar", "wire_type": 13, "elem_kind": 'uint32', "elem_wt": 0, "default_mode": "list"},
+        {"number": 9, "attr": 'location', "wire_name": 'location', "kind": "submsg", "wire_type": 12, "skip_if_none": True, "sub_codec": _CODEC_LOCATION, "default_mode": "const", "default_val": None},
+        {"number": 10, "attr": 'neighbors', "wire_name": 'neighbors', "kind": "array_submsg", "wire_type": 13, "sub_codec": _CODEC_NEIGHBOR, "default_mode": "list"},
+        {"number": 11, "attr": 'sequence', "wire_name": 'sequence', "kind": 'uint64', "wire_type": 0, "skip_if_none": False, "default_mode": "const", "default_val": 0},
+    ],
+    _FIELD0_PEER_UPDATE,
+)

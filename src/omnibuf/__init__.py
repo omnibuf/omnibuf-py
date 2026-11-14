@@ -7,6 +7,7 @@ from typing import Any, overload
 import protobuf as pbpy
 from google.protobuf.message import Message as GpbMessage
 
+from ._omnibuf_ext import CompiledCodec, OpaqueView
 from .blind import decode_blind, decode_blind_json
 from .dataclass_codec import (
     FieldInfo,
@@ -115,6 +116,13 @@ def marshal(
     self_describing: bool = False,
 ) -> bytes:
     """Serializes a protobuf-py message, @omnibuf_message dataclass, or generated message."""
+    gen_codec: CompiledCodec[Any] | None = getattr(type(msg), "__omnibuf_codec__", None)
+    if gen_codec is not None:
+        return gen_codec.marshal(
+            msg,
+            deterministic=deterministic,
+            self_describing=self_describing,
+        )
     if is_proto_message_or_type(msg):
         return marshal_proto(
             msg,
@@ -165,13 +173,21 @@ def unmarshal[T](packet: Buffer, target: T) -> T: ...
 
 def unmarshal(packet: Buffer, target: Any) -> Any:
     """Decodes OmniBuf wire bytes into a protobuf-py message, dataclass, or generated message."""
-    if is_proto_message_or_type(target):
-        return unmarshal_proto(packet, target)
     if isinstance(target, type):
+        gen_codec: CompiledCodec[Any] | None = getattr(target, "__omnibuf_codec__", None)
+        if gen_codec is not None:
+            return gen_codec.unmarshal(packet)
+        if is_proto_message_or_type(target):
+            return unmarshal_proto(packet, target)
         unmarshal_cls_fn = getattr(target, "unmarshal_omnibuf", None)
         if callable(unmarshal_cls_fn):
             return unmarshal_cls_fn(packet)
         return unmarshal_dataclass(packet, target)
+    gen_inst_codec: CompiledCodec[Any] | None = getattr(type(target), "__omnibuf_codec__", None)
+    if gen_inst_codec is not None:
+        return gen_inst_codec.unmarshal(packet, target)
+    if is_proto_message_or_type(target):
+        return unmarshal_proto(packet, target)
     unmarshal_inst_fn = getattr(type(target), "unmarshal_omnibuf", None)
     if callable(unmarshal_inst_fn):
         return unmarshal_inst_fn(packet, target)
@@ -200,6 +216,7 @@ __all__ = [
     "WIRE_SUB_MSG",
     "WIRE_UINT",
     "Buffer",
+    "CompiledCodec",
     "Decoder",
     "Encoder",
     "FieldInfo",
@@ -210,6 +227,7 @@ __all__ = [
     "OmniBufDecodeError",
     "OmniBufEncodeError",
     "OmniBufError",
+    "OpaqueView",
     "SchemaMeta",
     "Sfixed32",
     "Sfixed64",

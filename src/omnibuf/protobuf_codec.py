@@ -10,6 +10,7 @@ import protobuf as pbpy
 from google.protobuf.descriptor import FieldDescriptor as GpbFieldDescriptor
 from google.protobuf.message import Message as GpbMessage
 
+from ._omnibuf_ext import CompiledCodec
 from .field0 import SchemaMeta, encode_field0_schema_meta
 from .wire import (
     INT32_MAX,
@@ -277,7 +278,15 @@ class _PbpyFieldPlan:
 
 
 class _PbpyMsgPlan:
-    __slots__ = ("desc", "msg_cls", "fields", "by_num", "_schema_meta", "_field0_wire")
+    __slots__ = (
+        "desc",
+        "msg_cls",
+        "fields",
+        "by_num",
+        "_schema_meta",
+        "_field0_wire",
+        "rust_codec",
+    )
 
     def __init__(self, desc: pbpy.DescMessage) -> None:
         self.desc = desc
@@ -286,6 +295,12 @@ class _PbpyMsgPlan:
         self.by_num: dict[int, _PbpyFieldPlan] = {}
         self._schema_meta: SchemaMeta | None = None
         self._field0_wire: bytes | None = None
+        self.rust_codec: CompiledCodec[Any] = CompiledCodec(
+            desc.type,
+            desc.name,
+            fast_alloc=False,
+            pbpy_mode=True,
+        )
 
     def get_schema_meta(self, visiting: frozenset[str] = frozenset()) -> SchemaMeta:
         if self._schema_meta is not None and not visiting:
@@ -305,9 +320,46 @@ class _PbpyMsgPlan:
             self._field0_wire = encode_field0_schema_meta(self.get_schema_meta())
         return self._field0_wire
 
+    def finalize_rust_codec(self) -> None:
+        specs: list[dict[str, Any]] = []
+        for fp in self.fields:
+            spec: dict[str, Any] = {
+                "number": fp.field_num,
+                "attr": fp.local_name,
+                "wire_name": fp.proto_name,
+                "kind": fp.kind,
+                "wire_type": fp.wire_type,
+                "pbpy_presence": fp.has_presence,
+                "skip_if_none": fp.kind == "submsg",
+                "default_mode": "pbpy",
+            }
+            if fp.enum_cls is not None:
+                spec["enum_cls"] = fp.enum_cls
+            if fp.kind == "submsg":
+                assert fp.sub_plan is not None
+                spec["sub_codec"] = fp.sub_plan.rust_codec
+            elif fp.kind == "list_scalar":
+                spec["elem_kind"] = fp.elem_kind
+                spec["elem_wt"] = fp.elem_wt
+            elif fp.kind == "list_submsg":
+                assert fp.sub_plan is not None
+                spec["sub_codec"] = fp.sub_plan.rust_codec
+            elif fp.kind == "map":
+                spec["key_kind"] = fp.key_kind
+                spec["key_wt"] = fp.key_wt
+                spec["val_kind"] = fp.val_kind
+                spec["val_wt"] = fp.val_wt
+                if fp.val_kind == "submsg":
+                    assert fp.sub_plan is not None
+                    spec["sub_codec"] = fp.sub_plan.rust_codec
+            specs.append(spec)
+        self.rust_codec.set_fields(specs, self.get_field0_wire())
+
 
 _PBPY_PLAN_CACHE: dict[str, _PbpyMsgPlan] = {}
+_PBPY_RUST_BY_CLS: dict[type[Any], CompiledCodec[Any]] = {}
 _PBPY_BUILDING: dict[str, _PbpyMsgPlan] = {}
+_PBPY_PENDING_FINALIZE: list[_PbpyMsgPlan] = []
 
 
 def _get_pbpy_plan(desc: pbpy.DescMessage) -> _PbpyMsgPlan:
@@ -319,6 +371,7 @@ def _get_pbpy_plan(desc: pbpy.DescMessage) -> _PbpyMsgPlan:
     if in_prog is not None:
         return in_prog
 
+    is_root = not _PBPY_BUILDING
     plan = _PbpyMsgPlan(desc)
     _PBPY_BUILDING[key] = plan
     try:
@@ -490,7 +543,18 @@ def _get_pbpy_plan(desc: pbpy.DescMessage) -> _PbpyMsgPlan:
             fp.index = idx
             plan.by_num[fp.field_num] = fp
         plan.fields = compiled
-        _PBPY_PLAN_CACHE[key] = plan
+        _PBPY_PENDING_FINALIZE.append(plan)
+        if is_root:
+            pending = list(_PBPY_PENDING_FINALIZE)
+            _PBPY_PENDING_FINALIZE.clear()
+            for p_plan in pending:
+                p_plan.finalize_rust_codec()
+                _PBPY_PLAN_CACHE[p_plan.desc.type_name] = p_plan
+                _PBPY_RUST_BY_CLS[p_plan.msg_cls] = p_plan.rust_codec
+    except Exception:
+        if is_root:
+            _PBPY_PENDING_FINALIZE.clear()
+        raise
     finally:
         _PBPY_BUILDING.pop(key, None)
     return plan
@@ -965,14 +1029,18 @@ def marshal_proto(
     self_describing: bool = False,
 ) -> bytes:
     """Serializes a protobuf-py Message (primary) or google.protobuf Message into OmniBuf wire bytes."""
-    out = bytearray()
+    rc = _PBPY_RUST_BY_CLS.get(type(msg))
+    if rc is not None:
+        return rc.marshal(msg, deterministic=deterministic, self_describing=self_describing)
     if isinstance(msg, pbpy.Message):
         plan = _get_pbpy_plan(msg.desc())
-        if self_describing:
-            out.extend(plan.get_field0_wire())
-        _encode_pbpy_msg(out, plan, msg, deterministic)
-        return bytes(out)
+        return plan.rust_codec.marshal(
+            msg,
+            deterministic=deterministic,
+            self_describing=self_describing,
+        )
     if isinstance(msg, GpbMessage):
+        out = bytearray()
         if self_describing:
             meta = _build_gpb_schema_meta(msg.DESCRIPTOR)
             out.extend(encode_field0_schema_meta(meta))
@@ -1005,28 +1073,30 @@ def unmarshal_proto[G: GpbMessage](packet: Buffer, target: G) -> G: ...
 
 def unmarshal_proto(packet: Buffer, target: Any) -> Any:
     """Decodes OmniBuf wire bytes into a protobuf-py Message/DescMessage or google.protobuf Message."""
-    mv = memoryview(packet)
-    if isinstance(target, pbpy.DescMessage):
-        plan = _get_pbpy_plan(target)
-        inst = plan.msg_cls()
-        _decode_pbpy_msg(mv, plan, inst, 0, False)
-        return inst
-    if isinstance(target, type) and issubclass(target, pbpy.Message):
-        plan = _get_pbpy_plan(target.desc())
-        inst = target()
-        _decode_pbpy_msg(mv, plan, inst, 0, False)
-        return inst
-    if isinstance(target, pbpy.Message):
-        plan = _get_pbpy_plan(target.desc())
-        _decode_pbpy_msg(mv, plan, target, 0, False)
-        return target
-    if isinstance(target, type) and issubclass(target, GpbMessage):
-        g_inst = target()
-        _decode_gpb_msg(mv, g_inst, 0, False)
-        return g_inst
-    if isinstance(target, GpbMessage):
-        _decode_gpb_msg(mv, target, 0, False)
-        return target
+    if isinstance(target, type):
+        rc = _PBPY_RUST_BY_CLS.get(target)
+        if rc is not None:
+            return rc.unmarshal(packet)
+        if issubclass(target, pbpy.Message):
+            plan = _get_pbpy_plan(target.desc())
+            return plan.rust_codec.unmarshal(packet)
+        if issubclass(target, GpbMessage):
+            g_inst = target()
+            _decode_gpb_msg(memoryview(packet), g_inst, 0, False)
+            return g_inst
+    else:
+        rc = _PBPY_RUST_BY_CLS.get(type(target))
+        if rc is not None:
+            return rc.unmarshal(packet, target)
+        if isinstance(target, pbpy.DescMessage):
+            plan = _get_pbpy_plan(target)
+            return plan.rust_codec.unmarshal(packet)
+        if isinstance(target, pbpy.Message):
+            plan = _get_pbpy_plan(target.desc())
+            return plan.rust_codec.unmarshal(packet, target)
+        if isinstance(target, GpbMessage):
+            _decode_gpb_msg(memoryview(packet), target, 0, False)
+            return target
     raise OmniBufDecodeError(
         f"omnibuf: unmarshal_proto expected protobuf.Message or google.protobuf.Message, got {target!r}"
     )

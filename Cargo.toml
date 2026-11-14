@@ -1,0 +1,26 @@
+[package]
+name = "omnibuf-py-ext"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+publish = false
+
+[lib]
+name = "_omnibuf_ext"
+path = "rust/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+omnibuf_core = { package = "omnibuf", path = "../omnibuf-rs/crates/omnibuf", default-features = false }
+pyo3 = { version = "0.28", features = ["extension-module"] }
+ryu = "1.0"
+itoa = "1.0"
+
+[profile.dev]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

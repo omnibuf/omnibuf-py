@@ -2,7 +2,7 @@
 
 Explicit-typed, header-hop binary wire codec for Python (`v2.1`).
 
-`omnibuf` implements the complete OmniBuf v2.1 wire format in pure Python 3.11+ with strict type annotations (`py.typed`), `buf` CLI code generation, native [`protobuf-py`](https://github.com/bufbuild/protobuf-py) integration, `@omnibuf_message` dataclasses, lazy `Opaque` header-hop views, and schema-less `Field #0` inspection.
+`omnibuf` implements the complete OmniBuf v2.1 wire format for Python 3.11+ on top of a compiled Rust extension (`omnibuf._omnibuf_ext` powered by `omnibuf-rs` and PyO3), with strict type annotations (`py.typed`), `buf` CLI code generation, native [`protobuf-py`](https://github.com/bufbuild/protobuf-py) integration, `@omnibuf_message` dataclasses, lazy `Opaque` header-hop views, and schema-less `Field #0` inspection.
 
 ## Highlights
 
@@ -84,7 +84,7 @@ assert decoded.location.city == "Frankfurt"
 
 ### 2. Generated Codec and Lazy `Opaque` Views
 
-`protoc-gen-omnibuf-py` emits fast slotted dataclasses alongside `Opaque<Message>` wrappers. `Opaque` views hop across length headers in `O(1)` time per field, reading nested fields or splicing updated fields into raw packets while leaving untouched bytes intact.
+`protoc-gen-omnibuf-py` emits slotted dataclasses bound to `CompiledCodec` descriptors alongside `Opaque<Message>` views. `Opaque` views hop across length headers in `O(1)` time per field, reading nested slices directly from `bytes` buffers or splicing single-field edits in place.
 
 ```python
 from omnibuf.gen.omnibuf.bench import peer_omnibuf_pb
@@ -143,13 +143,13 @@ payload_json = omnibuf.decode_blind_json(raw)
 
 ## Development Workflow
 
-All tasks are managed through `uv`, `buf`, and `just`:
+Toolchains (`python`, `rust`, `uv`, `buf`, `just`) are managed via `mise`:
 
 ```bash
-just install      # Sync dependencies into .venv
+just install      # Build Rust extension via maturin and sync .venv
 just proto        # Run buf lint and buf generate
-just fmt          # Format code with ruff
-just lint         # Run buf lint, ruff check, and strict mypy
+just fmt          # Format Rust and Python code with cargo fmt and ruff
+just lint         # Run buf lint, cargo clippy, ruff check, and strict mypy
 just test         # Run pytest unit suite
 just conformance  # Run all 584 cross-language conformance cases
 just bench        # Run PeerUpdate benchmark suite -> testdata/benchmarks.json

@@ -1,4 +1,4 @@
-"""protoc-gen-omnibuf-py code generator plugin (Tier 1: Generated Codec + Opaque Views)."""
+"""protoc-gen-omnibuf-py code generator plugin (Tier 1: Rust-Backed Codec + Opaque Views)."""
 
 from __future__ import annotations
 
@@ -21,7 +21,6 @@ from .wire import (
     MAX_FIELD_NUMBER,
     WIRE_ARRAY,
     WIRE_BOOL_FALSE,
-    WIRE_BOOL_TRUE,
     WIRE_BYTES,
     WIRE_FIXED32,
     WIRE_FIXED64,
@@ -34,7 +33,6 @@ from .wire import (
     WIRE_STRING,
     WIRE_SUB_MSG,
     WIRE_UINT,
-    encode_tag,
 )
 
 
@@ -67,6 +65,25 @@ _PROTO_SCALAR_INFO: dict[int, tuple[str, int, str, str]] = {
     FieldDescriptorProto.TYPE_SFIXED64: ("sfixed64", WIRE_SFIXED64, "int", "0"),
     FieldDescriptorProto.TYPE_SINT32: ("sint32", WIRE_SINT, "int", "0"),
     FieldDescriptorProto.TYPE_SINT64: ("sint64", WIRE_SINT, "int", "0"),
+}
+
+_SCALAR_KIND_CODE: dict[str, int] = {
+    "bool": 0,
+    "uint32": 1,
+    "uint64": 2,
+    "sint32": 3,
+    "sint64": 4,
+    "enum": 5,
+    "fixed32": 6,
+    "sfixed32": 7,
+    "fixed64": 8,
+    "sfixed64": 9,
+    "float32": 10,
+    "float64": 11,
+    "string": 12,
+    "str_as_bytes": 13,
+    "bytes": 14,
+    "bytes_as_str": 15,
 }
 
 
@@ -223,231 +240,170 @@ def _build_schema_meta(
     return meta
 
 
-def _emit_tag_append(tag_b: bytes, indent: str) -> str:
-    if len(tag_b) == 1:
-        return f"{indent}dst.append({tag_b[0]})"
-    return f"{indent}dst.extend({tag_b!r})"
+def _emit_field_spec_expr(rf: _ResolvedField, ref_codec_fn: Any) -> str:
+    if rf.is_map:
+        k_kind, k_wt, _, _ = _PROTO_SCALAR_INFO[rf.map_key_type]
+        if rf.map_val_type == FieldDescriptorProto.TYPE_MESSAGE:
+            sub_c = ref_codec_fn(rf.sub_msg_full)
+            return (
+                f'{{"number": {rf.number}, "attr": {rf.attr_name!r}, '
+                f'"wire_name": {rf.proto_name!r}, "kind": "map", "wire_type": {WIRE_MAP}, '
+                f'"key_kind": {k_kind!r}, "key_wt": {k_wt}, '
+                f'"val_kind": "submsg", "val_wt": {WIRE_SUB_MSG}, '
+                f'"sub_codec": {sub_c}, "default_mode": "dict"}}'
+            )
+        v_kind, v_wt, _, _ = _PROTO_SCALAR_INFO[rf.map_val_type]
+        return (
+            f'{{"number": {rf.number}, "attr": {rf.attr_name!r}, '
+            f'"wire_name": {rf.proto_name!r}, "kind": "map", "wire_type": {WIRE_MAP}, '
+            f'"key_kind": {k_kind!r}, "key_wt": {k_wt}, '
+            f'"val_kind": {v_kind!r}, "val_wt": {v_wt}, "default_mode": "dict"}}'
+        )
+
+    if rf.repeated:
+        if rf.proto_type == FieldDescriptorProto.TYPE_MESSAGE:
+            sub_c = ref_codec_fn(rf.sub_msg_full)
+            return (
+                f'{{"number": {rf.number}, "attr": {rf.attr_name!r}, '
+                f'"wire_name": {rf.proto_name!r}, "kind": "array_submsg", '
+                f'"wire_type": {WIRE_ARRAY}, "sub_codec": {sub_c}, "default_mode": "list"}}'
+            )
+        e_kind, e_wt, _, _ = _PROTO_SCALAR_INFO[rf.proto_type]
+        return (
+            f'{{"number": {rf.number}, "attr": {rf.attr_name!r}, '
+            f'"wire_name": {rf.proto_name!r}, "kind": "array_scalar", '
+            f'"wire_type": {WIRE_ARRAY}, "elem_kind": {e_kind!r}, "elem_wt": {e_wt}, '
+            f'"default_mode": "list"}}'
+        )
+
+    if rf.proto_type == FieldDescriptorProto.TYPE_MESSAGE:
+        sub_c = ref_codec_fn(rf.sub_msg_full)
+        return (
+            f'{{"number": {rf.number}, "attr": {rf.attr_name!r}, '
+            f'"wire_name": {rf.proto_name!r}, "kind": "submsg", '
+            f'"wire_type": {WIRE_SUB_MSG}, "skip_if_none": True, "sub_codec": {sub_c}, '
+            f'"default_mode": "const", "default_val": None}}'
+        )
+
+    s_kind, s_wt, _, s_def = _PROTO_SCALAR_INFO[rf.proto_type]
+    def_expr = "None" if rf.explicit_presence else s_def
+    return (
+        f'{{"number": {rf.number}, "attr": {rf.attr_name!r}, '
+        f'"wire_name": {rf.proto_name!r}, "kind": {s_kind!r}, "wire_type": {s_wt}, '
+        f'"skip_if_none": {rf.explicit_presence!r}, '
+        f'"default_mode": "const", "default_val": {def_expr}}}'
+    )
 
 
-def _emit_scalar_encode_lines(
-    kind: str,
-    val_expr: str,
-    indent: str,
+def _emit_opaque_methods(
+    rf: _ResolvedField,
+    ref_codec_fn: Any,
+    ref_opaque_cls: Any,
 ) -> list[str]:
-    if kind == "uint32":
-        return [
-            f"{indent}_v = int({val_expr})",
-            f"{indent}if 0 <= _v <= 127:",
-            f"{indent}    dst.append((_v << 1) | 1)",
-            f"{indent}elif 0 <= _v <= 0xFFFFFFFF:",
-            f"{indent}    append_varint(dst, _v)",
-            f"{indent}else:",
-            f'{indent}    raise OmniBufEncodeError("omnibuf: uint32 out of range")',
-        ]
-    if kind == "uint64":
-        return [
-            f"{indent}_v = int({val_expr})",
-            f"{indent}if 0 <= _v <= 127:",
-            f"{indent}    dst.append((_v << 1) | 1)",
-            f"{indent}elif 0 <= _v <= 0xFFFFFFFFFFFFFFFF:",
-            f"{indent}    append_varint(dst, _v)",
-            f"{indent}else:",
-            f'{indent}    raise OmniBufEncodeError("omnibuf: uint64 out of range")',
-        ]
-    if kind == "sint32":
-        return [
-            f"{indent}_vi = int({val_expr})",
-            f"{indent}if -64 <= _vi <= 63:",
-            f"{indent}    dst.append(((((_vi << 1) ^ (_vi >> 31)) & 0xFF) << 1) | 1)",
-            f"{indent}else:",
-            f"{indent}    append_varint(dst, encode_zigzag32(_vi))",
-        ]
-    if kind == "sint64":
-        return [
-            f"{indent}_vi = int({val_expr})",
-            f"{indent}if -64 <= _vi <= 63:",
-            f"{indent}    dst.append(((((_vi << 1) ^ (_vi >> 63)) & 0xFF) << 1) | 1)",
-            f"{indent}else:",
-            f"{indent}    append_varint(dst, encode_zigzag(_vi))",
-        ]
-    if kind == "fixed32":
-        return [f"{indent}dst.extend(_U32_PACK(int({val_expr})))"]
-    if kind == "sfixed32":
-        return [f"{indent}dst.extend(_I32_PACK(int({val_expr})))"]
-    if kind == "fixed64":
-        return [f"{indent}dst.extend(_U64_PACK(int({val_expr})))"]
-    if kind == "sfixed64":
-        return [f"{indent}dst.extend(_I64_PACK(int({val_expr})))"]
-    if kind == "float32":
-        return [f"{indent}dst.extend(_F32_PACK(float({val_expr})))"]
-    if kind == "float64":
-        return [f"{indent}dst.extend(_F64_PACK(float({val_expr})))"]
-    if kind == "string":
-        return [
-            f"{indent}_raw = {val_expr}.encode('utf-8')",
-            f"{indent}_slen = len(_raw)",
-            f"{indent}if _slen <= 127:",
-            f"{indent}    dst.append((_slen << 1) | 1)",
-            f"{indent}else:",
-            f"{indent}    append_varint(dst, _slen)",
-            f"{indent}dst.extend(_raw)",
-        ]
-    if kind == "bytes":
-        return [
-            f"{indent}_b = {val_expr}",
-            f"{indent}_blen = len(_b)",
-            f"{indent}if _blen <= 127:",
-            f"{indent}    dst.append((_blen << 1) | 1)",
-            f"{indent}else:",
-            f"{indent}    append_varint(dst, _blen)",
-            f"{indent}dst.extend(_b)",
-        ]
-    if kind == "bool":
-        return [f"{indent}dst.append(1 if {val_expr} else 0)"]
-    return []
+    lines: list[str] = []
+    attr = rf.attr_name
+    num = rf.number
 
+    if rf.is_map:
+        k_kind, k_wt, k_py, _ = _PROTO_SCALAR_INFO[rf.map_key_type]
+        k_code = _SCALAR_KIND_CODE[k_kind]
+        if rf.map_val_type == FieldDescriptorProto.TYPE_MESSAGE:
+            v_py = rf.sub_msg_py
+            sub_c = ref_codec_fn(rf.sub_msg_full)
+            ret_tp = f"dict[{k_py}, {v_py}]"
+            lines.extend(
+                [
+                    f"    def get_{attr}(self) -> {ret_tp}:",
+                    f"        return self._get_map({num}, {k_wt}, {k_code}, {WIRE_SUB_MSG}, 0, {sub_c})",
+                    "",
+                    f"    def set_{attr}(self, val: {ret_tp}) -> None:",
+                    f"        self._set_dirty({num}, val)",
+                    "",
+                ]
+            )
+        else:
+            v_kind, v_wt, v_py, _ = _PROTO_SCALAR_INFO[rf.map_val_type]
+            v_code = _SCALAR_KIND_CODE[v_kind]
+            ret_tp = f"dict[{k_py}, {v_py}]"
+            lines.extend(
+                [
+                    f"    def get_{attr}(self) -> {ret_tp}:",
+                    f"        return self._get_map({num}, {k_wt}, {k_code}, {v_wt}, {v_code})",
+                    "",
+                    f"    def set_{attr}(self, val: {ret_tp}) -> None:",
+                    f"        self._set_dirty({num}, val)",
+                    "",
+                ]
+            )
+        return lines
 
-def _emit_scalar_decode_lines(
-    kind: str,
-    buf_var: str,
-    pos_var: str,
-    end_var: str,
-    target_lhs: str,
-    indent: str,
-) -> list[str]:
-    if kind == "uint32":
-        return [
-            f"{indent}if {pos_var} >= {end_var}:",
-            f'{indent}    raise OmniBufDecodeError("omnibuf: truncated uint32")',
-            f"{indent}_vb = {buf_var}[{pos_var}]",
-            f"{indent}if _vb & 1:",
-            f"{indent}    {target_lhs} = _vb >> 1",
-            f"{indent}    {pos_var} += 1",
-            f"{indent}else:",
-            f"{indent}    _v, _w = decode_varint({buf_var}, {pos_var}, {end_var})",
-            f"{indent}    if _w == 0:",
-            f'{indent}        raise OmniBufDecodeError("omnibuf: invalid uint32")',
-            f"{indent}    {target_lhs} = _v & 0xFFFFFFFF",
-            f"{indent}    {pos_var} += _w",
+    if rf.repeated:
+        if rf.proto_type == FieldDescriptorProto.TYPE_MESSAGE:
+            ret_tp = f"list[{rf.sub_msg_py}]"
+            sub_c = ref_codec_fn(rf.sub_msg_full)
+            lines.extend(
+                [
+                    f"    def get_{attr}(self) -> {ret_tp}:",
+                    f"        return self._get_submsg_array({num}, {sub_c})",
+                    "",
+                    f"    def set_{attr}(self, val: {ret_tp}) -> None:",
+                    f"        self._set_dirty({num}, val)",
+                    "",
+                ]
+            )
+        else:
+            e_kind, e_wt, e_py, _ = _PROTO_SCALAR_INFO[rf.proto_type]
+            e_code = _SCALAR_KIND_CODE[e_kind]
+            ret_tp = f"list[{e_py}]"
+            lines.extend(
+                [
+                    f"    def get_{attr}(self) -> {ret_tp}:",
+                    f"        return self._get_scalar_array({num}, {e_wt}, {e_code})",
+                    "",
+                    f"    def set_{attr}(self, val: {ret_tp}) -> None:",
+                    f"        self._set_dirty({num}, val)",
+                    "",
+                ]
+            )
+        return lines
+
+    if rf.proto_type == FieldDescriptorProto.TYPE_MESSAGE:
+        ret_tp = f"{rf.sub_msg_py} | None"
+        sub_c = ref_codec_fn(rf.sub_msg_full)
+        op_cls = ref_opaque_cls(rf.sub_msg_full)
+        lines.extend(
+            [
+                f"    def get_{attr}(self) -> {ret_tp}:",
+                f"        return self._get_submsg({num}, {sub_c})",
+                "",
+                f"    def opaque_{attr}(self) -> {op_cls} | None:",
+                f"        return self._opaque_sub({num}, {op_cls}, {sub_c})",
+                "",
+                f"    def set_{attr}(self, val: Any) -> None:",
+                f"        self._set_dirty({num}, val)",
+                "",
+            ]
+        )
+        return lines
+
+    s_kind, _, s_py, _ = _PROTO_SCALAR_INFO[rf.proto_type]
+    set_tp = f"{s_py} | None" if rf.explicit_presence else s_py
+    setter_call = (
+        f"self._set_uint64({num}, val)"
+        if (s_kind == "uint64" and not rf.explicit_presence)
+        else f"self._set_dirty({num}, val)"
+    )
+    lines.extend(
+        [
+            f"    def get_{attr}(self) -> {s_py}:",
+            f"        return self._get_{s_kind}({num})",
+            "",
+            f"    def set_{attr}(self, val: {set_tp}) -> None:",
+            f"        {setter_call}",
+            "",
         ]
-    if kind == "uint64":
-        return [
-            f"{indent}if {pos_var} >= {end_var}:",
-            f'{indent}    raise OmniBufDecodeError("omnibuf: truncated uint64")',
-            f"{indent}_vb = {buf_var}[{pos_var}]",
-            f"{indent}if _vb & 1:",
-            f"{indent}    {target_lhs} = _vb >> 1",
-            f"{indent}    {pos_var} += 1",
-            f"{indent}else:",
-            f"{indent}    _v, _w = decode_varint({buf_var}, {pos_var}, {end_var})",
-            f"{indent}    if _w == 0:",
-            f'{indent}        raise OmniBufDecodeError("omnibuf: invalid uint64")',
-            f"{indent}    {target_lhs} = _v",
-            f"{indent}    {pos_var} += _w",
-        ]
-    if kind == "sint32":
-        return [
-            f"{indent}if {pos_var} >= {end_var}:",
-            f'{indent}    raise OmniBufDecodeError("omnibuf: truncated sint32")',
-            f"{indent}_vb = {buf_var}[{pos_var}]",
-            f"{indent}if _vb & 1:",
-            f"{indent}    _u = _vb >> 1",
-            f"{indent}    {target_lhs} = (_u >> 1) ^ -(_u & 1)",
-            f"{indent}    {pos_var} += 1",
-            f"{indent}else:",
-            f"{indent}    _v, _w = decode_varint({buf_var}, {pos_var}, {end_var})",
-            f"{indent}    if _w == 0:",
-            f'{indent}        raise OmniBufDecodeError("omnibuf: invalid sint32")',
-            f"{indent}    {target_lhs} = decode_zigzag32(_v)",
-            f"{indent}    {pos_var} += _w",
-        ]
-    if kind == "sint64":
-        return [
-            f"{indent}if {pos_var} >= {end_var}:",
-            f'{indent}    raise OmniBufDecodeError("omnibuf: truncated sint64")',
-            f"{indent}_vb = {buf_var}[{pos_var}]",
-            f"{indent}if _vb & 1:",
-            f"{indent}    _u = _vb >> 1",
-            f"{indent}    {target_lhs} = (_u >> 1) ^ -(_u & 1)",
-            f"{indent}    {pos_var} += 1",
-            f"{indent}else:",
-            f"{indent}    _v, _w = decode_varint({buf_var}, {pos_var}, {end_var})",
-            f"{indent}    if _w == 0:",
-            f'{indent}        raise OmniBufDecodeError("omnibuf: invalid sint64")',
-            f"{indent}    {target_lhs} = decode_zigzag(_v)",
-            f"{indent}    {pos_var} += _w",
-        ]
-    if kind == "fixed32":
-        return [
-            f"{indent}if {pos_var} + 4 > {end_var}:",
-            f'{indent}    raise OmniBufDecodeError("omnibuf: truncated fixed32")',
-            f"{indent}({target_lhs},) = _U32_UNPACK({buf_var}, {pos_var})",
-            f"{indent}{pos_var} += 4",
-        ]
-    if kind == "sfixed32":
-        return [
-            f"{indent}if {pos_var} + 4 > {end_var}:",
-            f'{indent}    raise OmniBufDecodeError("omnibuf: truncated sfixed32")',
-            f"{indent}({target_lhs},) = _I32_UNPACK({buf_var}, {pos_var})",
-            f"{indent}{pos_var} += 4",
-        ]
-    if kind == "fixed64":
-        return [
-            f"{indent}if {pos_var} + 8 > {end_var}:",
-            f'{indent}    raise OmniBufDecodeError("omnibuf: truncated fixed64")',
-            f"{indent}({target_lhs},) = _U64_UNPACK({buf_var}, {pos_var})",
-            f"{indent}{pos_var} += 8",
-        ]
-    if kind == "sfixed64":
-        return [
-            f"{indent}if {pos_var} + 8 > {end_var}:",
-            f'{indent}    raise OmniBufDecodeError("omnibuf: truncated sfixed64")',
-            f"{indent}({target_lhs},) = _I64_UNPACK({buf_var}, {pos_var})",
-            f"{indent}{pos_var} += 8",
-        ]
-    if kind == "float32":
-        return [
-            f"{indent}if {pos_var} + 4 > {end_var}:",
-            f'{indent}    raise OmniBufDecodeError("omnibuf: truncated float32")',
-            f"{indent}({target_lhs},) = _F32_UNPACK({buf_var}, {pos_var})",
-            f"{indent}{pos_var} += 4",
-        ]
-    if kind == "float64":
-        return [
-            f"{indent}if {pos_var} + 8 > {end_var}:",
-            f'{indent}    raise OmniBufDecodeError("omnibuf: truncated float64")',
-            f"{indent}({target_lhs},) = _F64_UNPACK({buf_var}, {pos_var})",
-            f"{indent}{pos_var} += 8",
-        ]
-    if kind == "string":
-        return [
-            f"{indent}if {pos_var} >= {end_var}:",
-            f'{indent}    raise OmniBufDecodeError("omnibuf: truncated string")',
-            f"{indent}_sb = {buf_var}[{pos_var}]",
-            f"{indent}if _sb & 1:",
-            f"{indent}    _slen = _sb >> 1",
-            f"{indent}    {pos_var} += 1",
-            f"{indent}    if {pos_var} + _slen > {end_var}:",
-            f'{indent}        raise OmniBufDecodeError("omnibuf: truncated string")',
-            f"{indent}    {target_lhs} = {buf_var}[{pos_var} : {pos_var} + _slen].decode('utf-8')",
-            f"{indent}    {pos_var} += _slen",
-            f"{indent}else:",
-            f"{indent}    _s_mv, {pos_var} = read_len_bytes({buf_var}, {pos_var}, 0, {end_var})",
-            f"{indent}    {target_lhs} = _s_mv.decode('utf-8')",
-        ]
-    if kind == "bytes":
-        return [
-            f"{indent}_b_mv, {pos_var} = read_len_bytes({buf_var}, {pos_var}, 0, {end_var})",
-            f"{indent}{target_lhs} = bytes(_b_mv)",
-        ]
-    if kind == "bool":
-        return [
-            f"{indent}if {pos_var} >= {end_var} or {buf_var}[{pos_var}] > 1:",
-            f'{indent}    raise OmniBufDecodeError("omnibuf: invalid bool byte")',
-            f"{indent}{target_lhs} = {buf_var}[{pos_var}] == 1",
-            f"{indent}{pos_var} += 1",
-        ]
-    return []
+    )
+    return lines
 
 
 def _generate_file(
@@ -469,21 +425,13 @@ def _generate_file(
             imported_files[spec.file_name] = alias
         return f"{alias}.{spec.py_name}"
 
-    def _ref_encode_fn(full_type_name: str) -> str:
+    def _ref_codec_symbol(full_type_name: str) -> str:
         spec = reg.messages[full_type_name]
-        fn_name = f"_encode_{_to_snake_case(spec.py_name)}"
+        codec_name = f"_CODEC_{_to_snake_case(spec.py_name).upper()}"
         if spec.file_name == fdp.name:
-            return fn_name
+            return codec_name
         alias = imported_files.setdefault(spec.file_name, f"_imp_{len(imported_files)}")
-        return f"{alias}.{fn_name}"
-
-    def _ref_decode_fn(full_type_name: str) -> str:
-        spec = reg.messages[full_type_name]
-        fn_name = f"_decode_{_to_snake_case(spec.py_name)}"
-        if spec.file_name == fdp.name:
-            return fn_name
-        alias = imported_files.setdefault(spec.file_name, f"_imp_{len(imported_files)}")
-        return f"{alias}.{fn_name}"
+        return f"{alias}.{codec_name}"
 
     def _ref_opaque_cls(full_type_name: str) -> str:
         spec = reg.messages[full_type_name]
@@ -493,7 +441,6 @@ def _generate_file(
         alias = imported_files.setdefault(spec.file_name, f"_imp_{len(imported_files)}")
         return f"{alias}.{cls_name}"
 
-    # Resolve fields for all messages in this file
     for m_spec in local_msgs:
         mdp = m_spec.desc
         resolved: list[_ResolvedField] = []
@@ -560,59 +507,11 @@ def _generate_file(
         "",
         "from __future__ import annotations",
         "",
-        "import struct",
         "from dataclasses import dataclass, field",
-        "from typing import Any",
+        "from typing import Any, ClassVar",
         "",
-        "from omnibuf.field0 import read_field0_schema_meta",
-        "from omnibuf.opaque import (",
-        "    opaque_get_bool,",
-        "    opaque_get_bytes,",
-        "    opaque_get_fixed32,",
-        "    opaque_get_fixed64,",
-        "    opaque_get_float32,",
-        "    opaque_get_float64,",
-        "    opaque_get_map,",
-        "    opaque_get_scalar_array,",
-        "    opaque_get_sfixed32,",
-        "    opaque_get_sfixed64,",
-        "    opaque_get_sint32,",
-        "    opaque_get_sint64,",
-        "    opaque_get_string,",
-        "    opaque_get_submsg,",
-        "    opaque_get_submsg_array,",
-        "    opaque_get_submsg_slice,",
-        "    opaque_get_uint32,",
-        "    opaque_get_uint64,",
-        "    splice_dirty_fields,",
-        ")",
-        "from omnibuf.wire import (",
-        "    MAX_FIELD_NUMBER,",
-        "    MAX_NESTING_DEPTH,",
-        "    WIRE_ARRAY,",
-        "    WIRE_BOOL_FALSE,",
-        "    WIRE_BOOL_TRUE,",
-        "    WIRE_MAP,",
-        "    WIRE_SUB_MSG,",
-        "    Buffer,",
-        "    OmniBufDecodeError,",
-        "    OmniBufEncodeError,",
-        "    append_varint,",
-        "    backpatch_container_len,",
-        "    decode_utf8_strict,",
-        "    decode_varint,",
-        "    decode_zigzag,",
-        "    decode_zigzag32,",
-        "    encode_utf8_strict,",
-        "    encode_zigzag,",
-        "    encode_zigzag32,",
-        "    parse_array_header,",
-        "    parse_map_header,",
-        "    read_len_bytes,",
-        "    validate_field0_at,",
-        "    validate_message,",
-        "    validate_value,",
-        ")",
+        "from omnibuf._omnibuf_ext import CompiledCodec, OpaqueView",
+        "from omnibuf.wire import Buffer",
     ]
 
     for imp_file, alias in imported_files.items():
@@ -622,26 +521,8 @@ def _generate_file(
         else:
             lines.append(f"import {mod_stem} as {alias}")
 
-    lines.extend(
-        [
-            "",
-            "_U32_PACK = struct.Struct('<I').pack",
-            "_I32_PACK = struct.Struct('<i').pack",
-            "_U64_PACK = struct.Struct('<Q').pack",
-            "_I64_PACK = struct.Struct('<q').pack",
-            "_F32_PACK = struct.Struct('<f').pack",
-            "_F64_PACK = struct.Struct('<d').pack",
-            "_U32_UNPACK = struct.Struct('<I').unpack_from",
-            "_I32_UNPACK = struct.Struct('<i').unpack_from",
-            "_U64_UNPACK = struct.Struct('<Q').unpack_from",
-            "_I64_UNPACK = struct.Struct('<q').unpack_from",
-            "_F32_UNPACK = struct.Struct('<f').unpack_from",
-            "_F64_UNPACK = struct.Struct('<d').unpack_from",
-            "",
-        ]
-    )
+    lines.append("")
 
-    # Emit enums as IntEnum constants if present
     for e_spec in reg.file_enums[fdp.name]:
         lines.append(f"class {e_spec.py_name}:")
         if not e_spec.desc.value:
@@ -651,44 +532,42 @@ def _generate_file(
                 lines.append(f"    {_safe_ident(ev.name)} = {ev.number}")
         lines.append("")
 
-    # Emit dataclasses, codecs, and Opaque views for each message
     for m_spec in local_msgs:
         snake_msg = _to_snake_case(m_spec.py_name)
+        upper_msg = snake_msg.upper()
+        codec_var = f"_CODEC_{upper_msg}"
         meta = _build_schema_meta(m_spec, reg)
         field0_bytes = encode_field0_schema_meta(meta)
-        lines.append(f"_FIELD0_{snake_msg.upper()}: bytes = {field0_bytes!r}")
+        lines.append(f"_FIELD0_{upper_msg}: bytes = {field0_bytes!r}")
         lines.append("")
 
-        # 1. Message Dataclass
         lines.append("@dataclass(slots=True)")
         lines.append(f"class {m_spec.py_name}:")
-        if not m_spec.fields:
-            lines.append("    pass")
-        else:
-            for rf in m_spec.fields:
-                if rf.is_map:
-                    _, _, k_py, _ = _PROTO_SCALAR_INFO[rf.map_key_type]
-                    if rf.map_val_type == FieldDescriptorProto.TYPE_MESSAGE:
-                        v_py = rf.sub_msg_py
-                    else:
-                        _, _, v_py, _ = _PROTO_SCALAR_INFO[rf.map_val_type]
-                    lines.append(
-                        f"    {rf.attr_name}: dict[{k_py}, {v_py}] = field(default_factory=dict)"
-                    )
-                elif rf.repeated:
-                    if rf.proto_type == FieldDescriptorProto.TYPE_MESSAGE:
-                        e_py = rf.sub_msg_py
-                    else:
-                        _, _, e_py, _ = _PROTO_SCALAR_INFO[rf.proto_type]
-                    lines.append(f"    {rf.attr_name}: list[{e_py}] = field(default_factory=list)")
-                elif rf.proto_type == FieldDescriptorProto.TYPE_MESSAGE:
-                    lines.append(f"    {rf.attr_name}: {rf.sub_msg_py} | None = None")
+        lines.append(f"    __omnibuf_codec__: ClassVar[CompiledCodec[{m_spec.py_name}]]")
+        for rf in m_spec.fields:
+            if rf.is_map:
+                _, _, k_py, _ = _PROTO_SCALAR_INFO[rf.map_key_type]
+                if rf.map_val_type == FieldDescriptorProto.TYPE_MESSAGE:
+                    v_py = rf.sub_msg_py
                 else:
-                    _, _, s_py, s_def = _PROTO_SCALAR_INFO[rf.proto_type]
-                    if rf.explicit_presence:
-                        lines.append(f"    {rf.attr_name}: {s_py} | None = None")
-                    else:
-                        lines.append(f"    {rf.attr_name}: {s_py} = {s_def}")
+                    _, _, v_py, _ = _PROTO_SCALAR_INFO[rf.map_val_type]
+                lines.append(
+                    f"    {rf.attr_name}: dict[{k_py}, {v_py}] = field(default_factory=dict)"
+                )
+            elif rf.repeated:
+                if rf.proto_type == FieldDescriptorProto.TYPE_MESSAGE:
+                    e_py = rf.sub_msg_py
+                else:
+                    _, _, e_py, _ = _PROTO_SCALAR_INFO[rf.proto_type]
+                lines.append(f"    {rf.attr_name}: list[{e_py}] = field(default_factory=list)")
+            elif rf.proto_type == FieldDescriptorProto.TYPE_MESSAGE:
+                lines.append(f"    {rf.attr_name}: {rf.sub_msg_py} | None = None")
+            else:
+                _, _, s_py, s_def = _PROTO_SCALAR_INFO[rf.proto_type]
+                if rf.explicit_presence:
+                    lines.append(f"    {rf.attr_name}: {s_py} | None = None")
+                else:
+                    lines.append(f"    {rf.attr_name}: {s_py} = {s_def}")
 
         lines.extend(
             [
@@ -699,641 +578,58 @@ def _generate_file(
                 "        deterministic: bool = False,",
                 "        self_describing: bool = False,",
                 "    ) -> bytes:",
-                f"        return marshal_{snake_msg}(self, deterministic=deterministic, self_describing=self_describing)",
+                f"        return {codec_var}.marshal(self, deterministic=deterministic, self_describing=self_describing)",
                 "",
                 "    @classmethod",
                 f"    def unmarshal_omnibuf(cls, data: Buffer, out: {m_spec.py_name} | None = None) -> {m_spec.py_name}:",
-                f"        return unmarshal_{snake_msg}(data, out)",
+                f"        return {codec_var}.unmarshal(data, out)",
                 "",
-            ]
-        )
-
-        # 2. Helper to encode a single field by field_num (shared by _encode and Opaque splice)
-        lines.append(
-            f"def _encode_{snake_msg}_field(dst: bytearray, fnum: int, val: Any, deterministic: bool) -> None:"
-        )
-        if not m_spec.fields:
-            lines.append("    return")
-        else:
-            for idx, rf in enumerate(m_spec.fields):
-                kw = "if" if idx == 0 else "elif"
-                lines.append(f"    {kw} fnum == {rf.number}:")
-                lines.extend(_emit_field_encode_block(rf, "val", _ref_encode_fn, "        "))
-        lines.append("")
-
-        # 3. Full-message _encode_<msg> and marshal_<msg>
-        lines.append(
-            f"def _encode_{snake_msg}(dst: bytearray, msg: Any, deterministic: bool) -> None:"
-        )
-        if not m_spec.fields:
-            lines.append("    return")
-        else:
-            for rf in m_spec.fields:
-                v_var = f"_v_{rf.number}"
-                lines.append(f"    {v_var} = msg.{rf.attr_name}")
-                if (
-                    rf.proto_type == FieldDescriptorProto.TYPE_MESSAGE
-                    and not rf.repeated
-                    and not rf.is_map
-                ) or rf.explicit_presence:
-                    lines.append(f"    if {v_var} is not None:")
-                    lines.extend(_emit_field_encode_block(rf, v_var, _ref_encode_fn, "        "))
-                else:
-                    lines.extend(_emit_field_encode_block(rf, v_var, _ref_encode_fn, "    "))
-        lines.append("")
-
-        lines.extend(
-            [
-                f"def marshal_{snake_msg}(",
-                "    msg: Any,",
-                "    *,",
-                "    deterministic: bool = False,",
-                "    self_describing: bool = False,",
-                ") -> bytes:",
-                "    dst = bytearray()",
-                "    if self_describing:",
-                f"        dst.extend(_FIELD0_{snake_msg.upper()})",
-                "    try:",
-                f"        _encode_{snake_msg}(dst, msg, deterministic)",
-                "    except UnicodeEncodeError as exc:",
-                "        raise OmniBufEncodeError(str(exc)) from exc",
-                "    return bytes(dst)",
+                f"{codec_var}: CompiledCodec[{m_spec.py_name}] = CompiledCodec({m_spec.py_name}, {m_spec.short_name!r})",
+                f"{m_spec.py_name}.__omnibuf_codec__ = {codec_var}",
+                f"marshal_{snake_msg} = {codec_var}.marshal",
+                f"unmarshal_{snake_msg} = {codec_var}.unmarshal",
+                f"_decode_{snake_msg} = {codec_var}.decode_at",
                 "",
-            ]
-        )
-
-        # 4. Full-message _decode_<msg> and unmarshal_<msg>
-        lines.extend(
-            [
-                f"def _decode_{snake_msg}(",
-                "    data: Buffer,",
-                f"    out: {m_spec.py_name} | None = None,",
-                "    depth: int = 0,",
-                "    merge: bool = False,",
-                f") -> {m_spec.py_name}:",
-                "    if depth > MAX_NESTING_DEPTH:",
-                '        raise OmniBufDecodeError("omnibuf: nesting depth exceeds limit")',
-                "    if out is None:",
-                f"        out = {m_spec.py_name}()",
-                "    elif not merge:",
-            ]
-        )
-        if not m_spec.fields:
-            lines.append("        pass")
-        else:
-            for rf in m_spec.fields:
-                if rf.is_map or rf.repeated:
-                    lines.append(f"        out.{rf.attr_name}.clear()")
-                elif rf.proto_type == FieldDescriptorProto.TYPE_MESSAGE or rf.explicit_presence:
-                    lines.append(f"        out.{rf.attr_name} = None")
-                else:
-                    _, _, _, s_def = _PROTO_SCALAR_INFO[rf.proto_type]
-                    lines.append(f"        out.{rf.attr_name} = {s_def}")
-
-        lines.extend(
-            [
-                "    mv = data if isinstance(data, (bytes, bytearray)) else bytes(data)",
-                "    n = len(mv)",
-                "    pos = 0",
-                "    seen_mask = 0",
-                "    try:",
-                "        while pos < n:",
-                "            b0 = mv[pos]",
-                "            if b0 & 1:",
-                "                fnum = b0 >> 5",
-                "                wt = (b0 >> 1) & 0x0F",
-                "                pos += 1",
-                "            elif b0 & 2:",
-                "                if pos + 2 > n:",
-                '                    raise OmniBufDecodeError("omnibuf: truncated tag")',
-                "                u16 = (b0 | (mv[pos + 1] << 8)) >> 2",
-                "                fnum = u16 >> 4",
-                "                wt = u16 & 0x0F",
-                "                pos += 2",
-                "            else:",
-                "                tag, tn = decode_varint(mv, pos, n)",
-                "                if tn == 0 or (tag >> 4) > MAX_FIELD_NUMBER:",
-                '                    raise OmniBufDecodeError("omnibuf: invalid tag")',
-                "                fnum = tag >> 4",
-                "                wt = tag & 0x0F",
-                "                pos += tn",
-                "            if fnum == 0:",
-                "                pos = validate_field0_at(mv, pos, wt, depth, MAX_NESTING_DEPTH, n)",
-                "                continue",
-            ]
-        )
-
-        if not m_spec.fields:
-            lines.append(
-                "            pos = validate_value(mv, pos, wt, depth, MAX_NESTING_DEPTH, n)"
-            )
-        else:
-            for idx, rf in enumerate(m_spec.fields):
-                kw = "if" if idx == 0 else "elif"
-                lines.append(f"            {kw} fnum == {rf.number}:")
-                lines.extend(_emit_field_decode_block(rf, idx, _ref_decode_fn, "                "))
-            lines.append("            else:")
-            lines.append(
-                "                pos = validate_value(mv, pos, wt, depth, MAX_NESTING_DEPTH, n)"
-            )
-
-        lines.extend(
-            [
-                "    except UnicodeDecodeError as exc:",
-                "        raise OmniBufDecodeError(str(exc)) from exc",
-                "    return out",
-                "",
-                f"def unmarshal_{snake_msg}(data: Buffer, out: {m_spec.py_name} | None = None) -> {m_spec.py_name}:",
-                f"    return _decode_{snake_msg}(data, out, 0, False)",
-                "",
-            ]
-        )
-
-        # 5. Lazy Opaque<Message> View
-        use_bitmask = all(rf.number <= 4096 for rf in m_spec.fields)
-        dirty_slot = "_dirty_mask" if use_bitmask else "_dirty_nums"
-        slot_names = ["_raw", dirty_slot] + [f"_d_{rf.attr_name}" for rf in m_spec.fields]
-        slots_tuple = ", ".join(repr(s) for s in slot_names)
-        lines.extend(
-            [
-                f"class Opaque{m_spec.py_name}:",
-                f"    __slots__ = ({slots_tuple},)",
-                "",
-                "    def __init__(self, raw: Buffer) -> None:",
-                "        self._raw: Buffer = raw",
-                (
-                    "        self._dirty_mask: int = 0"
-                    if use_bitmask
-                    else "        self._dirty_nums: set[int] = set()"
-                ),
-                "",
-                "    def raw(self) -> Buffer:",
-                "        return self._raw",
+                f"class Opaque{m_spec.py_name}(OpaqueView):",
+                "    __slots__ = ()",
                 "",
             ]
         )
 
         for rf in m_spec.fields:
-            lines.extend(_emit_opaque_methods(rf, _ref_decode_fn, _ref_opaque_cls, use_bitmask))
+            lines.extend(_emit_opaque_methods(rf, _ref_codec_symbol, _ref_opaque_cls))
 
         lines.extend(
             [
-                "    def _encode_dirty(self, dst: bytearray, fnum: int) -> None:",
-            ]
-        )
-        if not m_spec.fields:
-            lines.append("        return")
-        else:
-            for idx, rf in enumerate(m_spec.fields):
-                kw = "if" if idx == 0 else "elif"
-                lines.append(f"        {kw} fnum == {rf.number}:")
-                lines.append(f"            _v = self._d_{rf.attr_name}")
-                if (
-                    rf.proto_type == FieldDescriptorProto.TYPE_MESSAGE
-                    and not rf.repeated
-                    and not rf.is_map
-                ):
-                    lines.append("            if _v is not None:")
-                    lines.append(
-                        f"                _encode_{snake_msg}_field(dst, {rf.number}, _v, True)"
-                    )
-                else:
-                    lines.append(
-                        f"            _encode_{snake_msg}_field(dst, {rf.number}, _v, True)"
-                    )
-
-        dirty_attr = "self._dirty_mask" if use_bitmask else "self._dirty_nums"
-        clear_stmt = (
-            "            self._dirty_mask = 0"
-            if use_bitmask
-            else "            self._dirty_nums.clear()"
-        )
-        lines.extend(
-            [
-                "",
                 "    def marshal(",
                 "        self,",
                 "        *,",
                 "        dst_prefix: Buffer | None = None,",
                 "        self_describing: bool = False,",
                 "    ) -> bytes:",
-                f"        if {dirty_attr}:",
-                "            try:",
-                f"                spliced = splice_dirty_fields(None, self._raw, {dirty_attr}, self._encode_dirty)",
-                "            except UnicodeEncodeError as exc:",
-                "                raise OmniBufEncodeError(str(exc)) from exc",
-                "            self._raw = spliced",
-                clear_stmt,
-                "        else:",
-                "            validate_message(self._raw)",
-                "            spliced = bytes(self._raw)",
-                "        if dst_prefix is None and not self_describing:",
-                "            return spliced",
-                "        prefix = bytearray(dst_prefix) if dst_prefix is not None else bytearray()",
-                "        if self_describing and read_field0_schema_meta(spliced) is None:",
-                f"            prefix.extend(_FIELD0_{snake_msg.upper()})",
-                "        if prefix:",
-                "            prefix.extend(spliced)",
-                "            return bytes(prefix)",
-                "        return spliced",
+                f"        return self._marshal_with_codec({codec_var}, dst_prefix=dst_prefix, self_describing=self_describing)",
                 "",
             ]
         )
+
+    for m_spec in local_msgs:
+        snake_msg = _to_snake_case(m_spec.py_name)
+        upper_msg = snake_msg.upper()
+        codec_var = f"_CODEC_{upper_msg}"
+        if not m_spec.fields:
+            lines.append(f"{codec_var}.set_fields([], _FIELD0_{upper_msg})")
+        else:
+            lines.append(f"{codec_var}.set_fields(")
+            lines.append("    [")
+            for rf in m_spec.fields:
+                lines.append(f"        {_emit_field_spec_expr(rf, _ref_codec_symbol)},")
+            lines.append("    ],")
+            lines.append(f"    _FIELD0_{upper_msg},")
+            lines.append(")")
+        lines.append("")
 
     out_path = re.sub(r"\.proto$", f"{suffix}.py", fdp.name)
     return out_path, "\n".join(lines)
-
-
-def _emit_field_encode_block(
-    rf: _ResolvedField,
-    val_expr: str,
-    ref_encode_fn: Any,
-    indent: str,
-) -> list[str]:
-    out: list[str] = []
-    if rf.is_map:
-        k_kind, k_wt, _, _ = _PROTO_SCALAR_INFO[rf.map_key_type]
-        is_v_msg = rf.map_val_type == FieldDescriptorProto.TYPE_MESSAGE
-        if is_v_msg:
-            v_kind, v_wt = "submsg", WIRE_SUB_MSG
-        else:
-            v_kind, v_wt, _, _ = _PROTO_SCALAR_INFO[rf.map_val_type]
-        tag_b = encode_tag(rf.number, WIRE_MAP)
-        out.extend(
-            [
-                f"{indent}dst.extend({tag_b!r})",
-                f"{indent}_lp = len(dst)",
-                f"{indent}dst.extend(b'\\x00\\x00')",
-                f"{indent}dst.append({k_wt})",
-                f"{indent}dst.append({v_wt})",
-                f"{indent}_mp = {val_expr}",
-                f"{indent}append_varint(dst, len(_mp))",
-                f"{indent}_keys = sorted(_mp.keys()) if deterministic and len(_mp) > 1 else _mp.keys()",
-                f"{indent}for _k in _keys:",
-                f"{indent}    _mv_val = _mp[_k]",
-            ]
-        )
-        out.extend(_emit_scalar_encode_lines(k_kind, "_k", indent + "    "))
-        if is_v_msg:
-            enc_fn = ref_encode_fn(rf.sub_msg_full)
-            out.extend(
-                [
-                    f"{indent}    _vp = len(dst)",
-                    f"{indent}    dst.extend(b'\\x00\\x00')",
-                    f"{indent}    if _mv_val is not None:",
-                    f"{indent}        {enc_fn}(dst, _mv_val, deterministic)",
-                    f"{indent}    backpatch_container_len(dst, _vp)",
-                ]
-            )
-        else:
-            out.extend(_emit_scalar_encode_lines(v_kind, "_mv_val", indent + "    "))
-        out.append(f"{indent}backpatch_container_len(dst, _lp)")
-        return out
-
-    if rf.repeated:
-        tag_b = encode_tag(rf.number, WIRE_ARRAY)
-        if rf.proto_type == FieldDescriptorProto.TYPE_MESSAGE:
-            enc_fn = ref_encode_fn(rf.sub_msg_full)
-            out.extend(
-                [
-                    f"{indent}dst.extend({tag_b!r})",
-                    f"{indent}_lp = len(dst)",
-                    f"{indent}dst.extend(b'\\x00\\x00')",
-                    f"{indent}dst.append({WIRE_SUB_MSG})",
-                    f"{indent}_arr = {val_expr}",
-                    f"{indent}append_varint(dst, len(_arr))",
-                    f"{indent}for _item in _arr:",
-                    f"{indent}    _ep = len(dst)",
-                    f"{indent}    dst.extend(b'\\x00\\x00')",
-                    f"{indent}    if _item is not None:",
-                    f"{indent}        {enc_fn}(dst, _item, deterministic)",
-                    f"{indent}    backpatch_container_len(dst, _ep)",
-                    f"{indent}backpatch_container_len(dst, _lp)",
-                ]
-            )
-        else:
-            e_kind, e_wt, _, _ = _PROTO_SCALAR_INFO[rf.proto_type]
-            out.extend(
-                [
-                    f"{indent}dst.extend({tag_b!r})",
-                    f"{indent}_lp = len(dst)",
-                    f"{indent}dst.extend(b'\\x00\\x00')",
-                    f"{indent}dst.append({e_wt})",
-                    f"{indent}_arr = {val_expr}",
-                    f"{indent}append_varint(dst, len(_arr))",
-                    f"{indent}for _item in _arr:",
-                ]
-            )
-            out.extend(_emit_scalar_encode_lines(e_kind, "_item", indent + "    "))
-            out.append(f"{indent}backpatch_container_len(dst, _lp)")
-        return out
-
-    if rf.proto_type == FieldDescriptorProto.TYPE_MESSAGE:
-        tag_b = encode_tag(rf.number, WIRE_SUB_MSG)
-        enc_fn = ref_encode_fn(rf.sub_msg_full)
-        out.extend(
-            [
-                _emit_tag_append(tag_b, indent),
-                f"{indent}_lp = len(dst)",
-                f"{indent}dst.extend(b'\\x00\\x00')",
-                f"{indent}{enc_fn}(dst, {val_expr}, deterministic)",
-                f"{indent}backpatch_container_len(dst, _lp)",
-            ]
-        )
-        return out
-
-    if rf.proto_type == FieldDescriptorProto.TYPE_BOOL:
-        t_false = encode_tag(rf.number, WIRE_BOOL_FALSE)
-        t_true = encode_tag(rf.number, WIRE_BOOL_TRUE)
-        if len(t_true) == 1 and len(t_false) == 1:
-            out.append(f"{indent}dst.append({t_true[0]} if {val_expr} else {t_false[0]})")
-        else:
-            out.append(f"{indent}dst.extend({t_true!r} if {val_expr} else {t_false!r})")
-        return out
-
-    s_kind, s_wt, _, _ = _PROTO_SCALAR_INFO[rf.proto_type]
-    tag_b = encode_tag(rf.number, s_wt)
-    out.append(_emit_tag_append(tag_b, indent))
-    out.extend(_emit_scalar_encode_lines(s_kind, val_expr, indent))
-    return out
-
-
-def _emit_field_decode_block(
-    rf: _ResolvedField,
-    field_idx: int,
-    ref_decode_fn: Any,
-    indent: str,
-) -> list[str]:
-    bit = 1 << field_idx
-    out: list[str] = []
-
-    if rf.is_map:
-        k_kind, k_wt, _, _ = _PROTO_SCALAR_INFO[rf.map_key_type]
-        is_v_msg = rf.map_val_type == FieldDescriptorProto.TYPE_MESSAGE
-        if is_v_msg:
-            v_kind, v_wt = "submsg", WIRE_SUB_MSG
-        else:
-            v_kind, v_wt, _, _ = _PROTO_SCALAR_INFO[rf.map_val_type]
-        out.extend(
-            [
-                f"{indent}if wt != WIRE_MAP:",
-                f"{indent}    pos = validate_value(mv, pos, wt, depth, MAX_NESTING_DEPTH, n)",
-                f"{indent}    continue",
-                f"{indent}if depth + 1 > MAX_NESTING_DEPTH:",
-                f'{indent}    raise OmniBufDecodeError("omnibuf: map depth exceeds limit")',
-                f"{indent}_already = ((seen_mask & {bit}) != 0) or merge",
-                f"{indent}seen_mask |= {bit}",
-                f"{indent}_m_mv, pos = read_len_bytes(mv, pos, 3, n)",
-                f"{indent}_kwt, _vwt, _cnt, _p, _ok = parse_map_header(_m_mv)",
-                f"{indent}if not _ok or _kwt != {k_wt} or _vwt != {v_wt}:",
-                f'{indent}    raise OmniBufDecodeError("omnibuf: invalid map header")',
-                f"{indent}_mp = out.{rf.attr_name}",
-                f"{indent}if not _already and _mp:",
-                f"{indent}    _mp.clear()",
-                f"{indent}_mend = len(_m_mv)",
-                f"{indent}for _ in range(_cnt):",
-            ]
-        )
-        out.extend(
-            _emit_scalar_decode_lines(k_kind, "_m_mv", "_p", "_mend", "_mk", indent + "    ")
-        )
-        if is_v_msg:
-            dec_fn = ref_decode_fn(rf.sub_msg_full)
-            out.extend(
-                [
-                    f"{indent}    _vmv, _p = read_len_bytes(_m_mv, _p, 0, _mend)",
-                    f"{indent}    _mp[_mk] = {dec_fn}(_vmv, None, depth + 2, False)",
-                ]
-            )
-        else:
-            out.extend(
-                _emit_scalar_decode_lines(
-                    v_kind, "_m_mv", "_p", "_mend", "_mp[_mk]", indent + "    "
-                )
-            )
-        out.extend(
-            [
-                f"{indent}if _p != _mend:",
-                f'{indent}    raise OmniBufDecodeError("omnibuf: trailing map bytes")',
-            ]
-        )
-        return out
-
-    if rf.repeated:
-        out.extend(
-            [
-                f"{indent}if wt != WIRE_ARRAY:",
-                f"{indent}    pos = validate_value(mv, pos, wt, depth, MAX_NESTING_DEPTH, n)",
-                f"{indent}    continue",
-                f"{indent}if depth + 1 > MAX_NESTING_DEPTH:",
-                f'{indent}    raise OmniBufDecodeError("omnibuf: array depth exceeds limit")',
-                f"{indent}_already = ((seen_mask & {bit}) != 0) or merge",
-                f"{indent}seen_mask |= {bit}",
-                f"{indent}_a_mv, pos = read_len_bytes(mv, pos, 2, n)",
-                f"{indent}_ewt, _cnt, _p, _ok = parse_array_header(_a_mv)",
-            ]
-        )
-        if rf.proto_type == FieldDescriptorProto.TYPE_MESSAGE:
-            dec_fn = ref_decode_fn(rf.sub_msg_full)
-            out.extend(
-                [
-                    f"{indent}if not _ok or _ewt != WIRE_SUB_MSG:",
-                    f'{indent}    raise OmniBufDecodeError("omnibuf: invalid submsg array header")',
-                    f"{indent}_lst = out.{rf.attr_name}",
-                    f"{indent}if not _already and _lst:",
-                    f"{indent}    _lst.clear()",
-                    f"{indent}_aend = len(_a_mv)",
-                    f"{indent}for _ in range(_cnt):",
-                    f"{indent}    _emv, _p = read_len_bytes(_a_mv, _p, 0, _aend)",
-                    f"{indent}    _lst.append({dec_fn}(_emv, None, depth + 2, False))",
-                    f"{indent}if _p != _aend:",
-                    f'{indent}    raise OmniBufDecodeError("omnibuf: trailing submsg array bytes")',
-                ]
-            )
-        else:
-            e_kind, e_wt, _, _ = _PROTO_SCALAR_INFO[rf.proto_type]
-            out.extend(
-                [
-                    f"{indent}if not _ok or _ewt != {e_wt}:",
-                    f'{indent}    raise OmniBufDecodeError("omnibuf: invalid array header")',
-                    f"{indent}_lst = out.{rf.attr_name}",
-                    f"{indent}if not _already and _lst:",
-                    f"{indent}    _lst.clear()",
-                    f"{indent}_aend = len(_a_mv)",
-                    f"{indent}for _ in range(_cnt):",
-                ]
-            )
-            out.extend(
-                _emit_scalar_decode_lines(e_kind, "_a_mv", "_p", "_aend", "_item", indent + "    ")
-            )
-            out.extend(
-                [
-                    f"{indent}    _lst.append(_item)",
-                    f"{indent}if _p != _aend:",
-                    f'{indent}    raise OmniBufDecodeError("omnibuf: trailing array bytes")',
-                ]
-            )
-        return out
-
-    if rf.proto_type == FieldDescriptorProto.TYPE_MESSAGE:
-        dec_fn = ref_decode_fn(rf.sub_msg_full)
-        out.extend(
-            [
-                f"{indent}if wt != WIRE_SUB_MSG:",
-                f"{indent}    pos = validate_value(mv, pos, wt, depth, MAX_NESTING_DEPTH, n)",
-                f"{indent}    continue",
-                f"{indent}_already = ((seen_mask & {bit}) != 0) or merge",
-                f"{indent}seen_mask |= {bit}",
-                f"{indent}_sub_mv, pos = read_len_bytes(mv, pos, 0, n)",
-                f"{indent}out.{rf.attr_name} = {dec_fn}(_sub_mv, out.{rf.attr_name}, depth + 1, _already)",
-            ]
-        )
-        return out
-
-    if rf.proto_type == FieldDescriptorProto.TYPE_BOOL:
-        out.extend(
-            [
-                f"{indent}if wt != WIRE_BOOL_FALSE and wt != WIRE_BOOL_TRUE:",
-                f"{indent}    pos = validate_value(mv, pos, wt, depth, MAX_NESTING_DEPTH, n)",
-                f"{indent}    continue",
-                f"{indent}seen_mask |= {bit}",
-                f"{indent}out.{rf.attr_name} = (wt == WIRE_BOOL_TRUE)",
-            ]
-        )
-        return out
-
-    s_kind, s_wt, _, _ = _PROTO_SCALAR_INFO[rf.proto_type]
-    out.extend(
-        [
-            f"{indent}if wt != {s_wt}:",
-            f"{indent}    pos = validate_value(mv, pos, wt, depth, MAX_NESTING_DEPTH, n)",
-            f"{indent}    continue",
-            f"{indent}seen_mask |= {bit}",
-        ]
-    )
-    out.extend(_emit_scalar_decode_lines(s_kind, "mv", "pos", "n", f"out.{rf.attr_name}", indent))
-    return out
-
-
-def _emit_opaque_methods(
-    rf: _ResolvedField,
-    ref_decode_fn: Any,
-    ref_opaque_cls: Any,
-    use_bitmask: bool = True,
-) -> list[str]:
-    lines: list[str] = []
-    attr = rf.attr_name
-    num = rf.number
-    dirty_check = f"self._dirty_mask & {1 << num}" if use_bitmask else f"{num} in self._dirty_nums"
-    dirty_mark = (
-        f"self._dirty_mask |= {1 << num}" if use_bitmask else f"self._dirty_nums.add({num})"
-    )
-
-    if rf.is_map:
-        k_kind, k_wt, k_py, _ = _PROTO_SCALAR_INFO[rf.map_key_type]
-        if rf.map_val_type == FieldDescriptorProto.TYPE_MESSAGE:
-            v_kind, v_wt, v_py = "submsg", WIRE_SUB_MSG, rf.sub_msg_py
-            sub_dec = ref_decode_fn(rf.sub_msg_full)
-        else:
-            v_kind, v_wt, v_py, _ = _PROTO_SCALAR_INFO[rf.map_val_type]
-            sub_dec = "None"
-        ret_tp = f"dict[{k_py}, {v_py}]"
-        lines.extend(
-            [
-                f"    def get_{attr}(self) -> {ret_tp}:",
-                f"        if {dirty_check}:",
-                f"            return self._d_{attr}  # type: ignore[no-any-return, attr-defined]",
-                f"        return opaque_get_map(self._raw, {num}, {k_wt}, {k_kind!r}, {v_wt}, {v_kind!r}, {sub_dec})",
-                "",
-                f"    def set_{attr}(self, val: {ret_tp}) -> None:",
-                f"        self._d_{attr}: Any = val",
-                f"        {dirty_mark}",
-                "",
-            ]
-        )
-        return lines
-
-    if rf.repeated:
-        if rf.proto_type == FieldDescriptorProto.TYPE_MESSAGE:
-            ret_tp = f"list[{rf.sub_msg_py}]"
-            dec_fn = ref_decode_fn(rf.sub_msg_full)
-            lines.extend(
-                [
-                    f"    def get_{attr}(self) -> {ret_tp}:",
-                    f"        if {dirty_check}:",
-                    f"            return self._d_{attr}  # type: ignore[no-any-return, attr-defined]",
-                    f"        return opaque_get_submsg_array(self._raw, {num}, {dec_fn})",
-                    "",
-                    f"    def set_{attr}(self, val: {ret_tp}) -> None:",
-                    f"        self._d_{attr}: Any = val",
-                    f"        {dirty_mark}",
-                    "",
-                ]
-            )
-        else:
-            e_kind, e_wt, e_py, _ = _PROTO_SCALAR_INFO[rf.proto_type]
-            ret_tp = f"list[{e_py}]"
-            lines.extend(
-                [
-                    f"    def get_{attr}(self) -> {ret_tp}:",
-                    f"        if {dirty_check}:",
-                    f"            return self._d_{attr}  # type: ignore[no-any-return, attr-defined]",
-                    f"        return opaque_get_scalar_array(self._raw, {num}, {e_wt}, {e_kind!r})",
-                    "",
-                    f"    def set_{attr}(self, val: {ret_tp}) -> None:",
-                    f"        self._d_{attr}: Any = val",
-                    f"        {dirty_mark}",
-                    "",
-                ]
-            )
-        return lines
-
-    if rf.proto_type == FieldDescriptorProto.TYPE_MESSAGE:
-        ret_tp = f"{rf.sub_msg_py} | None"
-        dec_fn = ref_decode_fn(rf.sub_msg_full)
-        op_cls = ref_opaque_cls(rf.sub_msg_full)
-        lines.extend(
-            [
-                f"    def get_{attr}(self) -> {ret_tp}:",
-                f"        if {dirty_check}:",
-                f"            return self._d_{attr}  # type: ignore[no-any-return, attr-defined]",
-                f"        return opaque_get_submsg(self._raw, {num}, {dec_fn})",
-                "",
-                f"    def opaque_{attr}(self) -> {op_cls} | None:",
-                f"        if {dirty_check}:",
-                f"            _cur = self._d_{attr}  # type: ignore[attr-defined]",
-                "            if _cur is None:",
-                "                return None",
-                f"            return {op_cls}(_cur.marshal_omnibuf())",
-                f"        _sub = opaque_get_submsg_slice(self._raw, {num})",
-                "        if _sub is None:",
-                "            return None",
-                f"        return {op_cls}(_sub)",
-                "",
-                f"    def set_{attr}(self, val: Any) -> None:",
-                f"        self._d_{attr}: Any = val",
-                f"        {dirty_mark}",
-                "",
-            ]
-        )
-        return lines
-
-    s_kind, _, s_py, _ = _PROTO_SCALAR_INFO[rf.proto_type]
-    helper = f"opaque_get_{s_kind}"
-    lines.extend(
-        [
-            f"    def get_{attr}(self) -> {s_py}:",
-            f"        if {dirty_check}:",
-            f"            return self._d_{attr}  # type: ignore[no-any-return, attr-defined]",
-            f"        return {helper}(self._raw, {num})",
-            "",
-            f"    def set_{attr}(self, val: {s_py}) -> None:",
-            f"        self._d_{attr}: Any = val",
-            f"        {dirty_mark}",
-            "",
-        ]
-    )
-    return lines
 
 
 def generate_code(req: plugin_pb2.CodeGeneratorRequest) -> plugin_pb2.CodeGeneratorResponse:

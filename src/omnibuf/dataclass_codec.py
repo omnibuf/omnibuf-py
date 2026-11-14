@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import dataclasses
-import struct
 import sys
 import types
 import typing
@@ -11,20 +10,13 @@ from collections.abc import Callable
 from dataclasses import MISSING, Field, dataclass
 from typing import Annotated, Any, Literal, Union, dataclass_transform, overload
 
+from ._omnibuf_ext import CompiledCodec
 from .encoder import Encoder
 from .field0 import SchemaMeta, encode_field0_schema_meta
 from .wire import (
-    INT32_MAX,
-    INT32_MIN,
-    INT64_MAX,
-    INT64_MIN,
     MAX_FIELD_NUMBER,
-    MAX_NESTING_DEPTH,
-    UINT32_MAX,
-    UINT64_MAX,
     WIRE_ARRAY,
     WIRE_BOOL_FALSE,
-    WIRE_BOOL_TRUE,
     WIRE_BYTES,
     WIRE_FIXED32,
     WIRE_FIXED64,
@@ -38,24 +30,7 @@ from .wire import (
     WIRE_SUB_MSG,
     WIRE_UINT,
     Buffer,
-    OmniBufDecodeError,
     OmniBufEncodeError,
-    append_varint,
-    backpatch_container_len,
-    decode_utf8_strict,
-    decode_varint,
-    decode_zigzag,
-    decode_zigzag32,
-    encode_tag,
-    encode_utf8_strict,
-    encode_zigzag,
-    encode_zigzag32,
-    parse_array_header,
-    parse_map_header,
-    read_len_slice,
-    to_uint32,
-    validate_field0_at,
-    validate_value,
 )
 
 type WireName = Literal[
@@ -190,21 +165,9 @@ def omnibuf_field(
 
 _REGISTERED_TYPES: dict[str, type[Any]] = {}
 _CODEC_CACHE: dict[type[Any], _StructCodec] = {}
+_RUST_CODEC_CACHE: dict[type[Any], CompiledCodec[Any]] = {}
 _BUILDING_CODECS: dict[type[Any], _StructCodec] = {}
-
-_U32_PACK = struct.Struct("<I").pack
-_I32_PACK = struct.Struct("<i").pack
-_U64_PACK = struct.Struct("<Q").pack
-_I64_PACK = struct.Struct("<q").pack
-_F32_PACK = struct.Struct("<f").pack
-_F64_PACK = struct.Struct("<d").pack
-
-_U32_UNPACK = struct.Struct("<I").unpack_from
-_I32_UNPACK = struct.Struct("<i").unpack_from
-_U64_UNPACK = struct.Struct("<Q").unpack_from
-_I64_UNPACK = struct.Struct("<q").unpack_from
-_F32_UNPACK = struct.Struct("<f").unpack_from
-_F64_UNPACK = struct.Struct("<d").unpack_from
+_PENDING_FINALIZE: list[_StructCodec] = []
 
 
 def _apply_default_if_missing(cls: type[Any]) -> None:
@@ -217,7 +180,6 @@ def _apply_default_if_missing(cls: type[Any]) -> None:
             continue
         val = cls.__dict__[attr_name]
         if isinstance(val, Field) and val.default is MISSING and val.default_factory is MISSING:
-            # Inspect raw string/type hint to choose sensible default when omitted
             raw_ann = annotations[attr_name]
             ann_str = raw_ann if isinstance(raw_ann, str) else repr(raw_ann)
             meta = dict(val.metadata)
@@ -385,11 +347,8 @@ class _FieldCodec:
     attr: str
     field_num: int
     wire_name: str
-    kind: str  # scalar kind or "submsg" | "array_scalar" | "array_submsg" | "map"
+    kind: str
     wire_type: int
-    tag_bytes: bytes
-    tag_false: bytes  # for bool
-    tag_true: bytes  # for bool
     optional: bool
     omitempty: bool
     elem_kind: str = ""
@@ -405,39 +364,28 @@ class _FieldCodec:
     default_val: Any = None
     default_factory: Callable[[], Any] | None = None
 
-    def make_default(self) -> Any:
-        if self.optional:
-            return None
-        if self.default_factory is not None:
-            return self.default_factory()
-        if self.kind == "submsg" and self.sub_type is not None:
-            return self.sub_type()
-        if self.kind in ("array_scalar", "array_submsg"):
-            return []
-        if self.kind == "map":
-            return {}
-        return self.default_val
-
 
 class _StructCodec:
     __slots__ = (
         "cls",
         "type_name",
         "fields",
-        "by_num",
         "_schema_meta",
         "_field0_wire",
-        "fast_encode_fn",
+        "rust_codec",
     )
 
-    def __init__(self, cls: type[Any], type_name: str) -> None:
+    def __init__(self, cls: type[Any], type_name: str, *, fast_alloc: bool) -> None:
         self.cls = cls
         self.type_name = type_name
         self.fields: list[_FieldCodec] = []
-        self.by_num: dict[int, _FieldCodec] = {}
         self._schema_meta: SchemaMeta | None = None
         self._field0_wire: bytes | None = None
-        self.fast_encode_fn: Callable[[bytearray, Any, bool], None] | None = None
+        self.rust_codec: CompiledCodec[Any] = CompiledCodec(
+            cls,
+            type_name,
+            fast_alloc=fast_alloc,
+        )
 
     def get_schema_meta(self, visiting: frozenset[type[Any]] = frozenset()) -> SchemaMeta:
         if self._schema_meta is not None and not visiting:
@@ -456,6 +404,63 @@ class _StructCodec:
         if self._field0_wire is None:
             self._field0_wire = encode_field0_schema_meta(self.get_schema_meta())
         return self._field0_wire
+
+    def finalize_rust_codec(self) -> None:
+        specs: list[dict[str, Any]] = []
+        for fc in self.fields:
+            spec: dict[str, Any] = {
+                "number": fc.field_num,
+                "attr": fc.attr,
+                "wire_name": fc.wire_name,
+                "kind": fc.kind,
+                "wire_type": fc.wire_type,
+                "skip_if_none": fc.optional,
+                "omitempty": fc.omitempty,
+            }
+            if fc.kind == "submsg":
+                assert fc.sub_codec is not None
+                spec["sub_codec"] = fc.sub_codec.rust_codec
+            elif fc.kind == "array_scalar":
+                spec["elem_kind"] = fc.elem_kind
+                spec["elem_wt"] = fc.elem_wt
+            elif fc.kind == "array_submsg":
+                assert fc.sub_codec is not None
+                spec["sub_codec"] = fc.sub_codec.rust_codec
+            elif fc.kind == "map":
+                spec["key_kind"] = fc.key_kind
+                spec["key_wt"] = fc.key_wt
+                spec["val_kind"] = fc.val_kind
+                spec["val_wt"] = fc.val_wt
+                if fc.val_kind == "submsg":
+                    assert fc.sub_codec is not None
+                    spec["sub_codec"] = fc.sub_codec.rust_codec
+
+            if fc.optional:
+                spec["default_mode"] = "const"
+                spec["default_val"] = None
+            elif fc.default_factory is not None:
+                if fc.default_factory is list:
+                    spec["default_mode"] = "list"
+                elif fc.default_factory is dict:
+                    spec["default_mode"] = "dict"
+                else:
+                    spec["default_mode"] = "factory"
+                    spec["default_val"] = fc.default_factory
+            elif fc.kind == "submsg":
+                assert fc.sub_codec is not None
+                spec["default_mode"] = "submsg"
+                spec["sub_codec"] = fc.sub_codec.rust_codec
+            elif fc.kind in ("array_scalar", "array_submsg"):
+                spec["default_mode"] = "list"
+            elif fc.kind == "map":
+                spec["default_mode"] = "dict"
+            else:
+                spec["default_mode"] = "const"
+                spec["default_val"] = fc.default_val
+
+            specs.append(spec)
+
+        self.rust_codec.set_fields(specs, self.get_field0_wire())
 
 
 def _resolve_type_hints(cls: type[Any]) -> dict[str, Any]:
@@ -476,12 +481,24 @@ def _get_struct_codec(cls: type[Any]) -> _StructCodec:
     if not dataclasses.is_dataclass(cls):
         raise OmniBufEncodeError(f"omnibuf: {cls!r} is not an @omnibuf_message / @dataclass")
 
+    dc_fields = dataclasses.fields(cls)
+    all_annotated = all(isinstance(f.metadata.get(_META_KEY), FieldInfo) for f in dc_fields)
+    slots_val = getattr(cls, "__slots__", ())
+    has_dict_slot = "__dict__" in (slots_val if isinstance(slots_val, tuple) else (slots_val,))
+    req_fast = (
+        "__slots__" in cls.__dict__
+        and not has_dict_slot
+        and not hasattr(cls, "__post_init__")
+        and cls.__bases__ == (object,)
+        and all_annotated
+    )
+
     type_name = getattr(cls, "__omnibuf_type_name__", cls.__name__)
-    sc = _StructCodec(cls, str(type_name))
+    is_root = not _BUILDING_CODECS
+    sc = _StructCodec(cls, str(type_name), fast_alloc=req_fast)
     _BUILDING_CODECS[cls] = sc
     try:
         hints = _resolve_type_hints(cls)
-        dc_fields = dataclasses.fields(cls)
         compiled: list[_FieldCodec] = []
         seen_nums: set[int] = set()
 
@@ -514,7 +531,6 @@ def _get_struct_codec(cls: type[Any]) -> _StructCodec:
                 elem_raw = args[0]
                 elem_no_opt, elem_is_opt = _unwrap_optional(elem_raw)
                 elem_base, elem_ann_wire = _unwrap_annotated(elem_no_opt)
-                tag_b = encode_tag(fnum, WIRE_ARRAY)
                 if isinstance(elem_base, type) and dataclasses.is_dataclass(elem_base):
                     sub_sc = _get_struct_codec(elem_base)
                     fc = _FieldCodec(
@@ -524,9 +540,6 @@ def _get_struct_codec(cls: type[Any]) -> _StructCodec:
                         wire_name=wire_name,
                         kind="array_submsg",
                         wire_type=WIRE_ARRAY,
-                        tag_bytes=tag_b,
-                        tag_false=b"",
-                        tag_true=b"",
                         optional=is_opt,
                         omitempty=info.omitempty,
                         elem_kind="submsg",
@@ -551,9 +564,6 @@ def _get_struct_codec(cls: type[Any]) -> _StructCodec:
                         wire_name=wire_name,
                         kind="array_scalar",
                         wire_type=WIRE_ARRAY,
-                        tag_bytes=tag_b,
-                        tag_false=b"",
-                        tag_true=b"",
                         optional=is_opt,
                         omitempty=info.omitempty,
                         elem_kind=e_kind,
@@ -585,7 +595,6 @@ def _get_struct_codec(cls: type[Any]) -> _StructCodec:
                     )
                 v_no_opt, v_is_opt = _unwrap_optional(v_raw)
                 v_base, v_ann = _unwrap_annotated(v_no_opt)
-                tag_b = encode_tag(fnum, WIRE_MAP)
                 if isinstance(v_base, type) and dataclasses.is_dataclass(v_base):
                     sub_sc = _get_struct_codec(v_base)
                     fc = _FieldCodec(
@@ -595,9 +604,6 @@ def _get_struct_codec(cls: type[Any]) -> _StructCodec:
                         wire_name=wire_name,
                         kind="map",
                         wire_type=WIRE_MAP,
-                        tag_bytes=tag_b,
-                        tag_false=b"",
-                        tag_true=b"",
                         optional=is_opt,
                         omitempty=info.omitempty,
                         key_kind=k_kind,
@@ -624,9 +630,6 @@ def _get_struct_codec(cls: type[Any]) -> _StructCodec:
                         wire_name=wire_name,
                         kind="map",
                         wire_type=WIRE_MAP,
-                        tag_bytes=tag_b,
-                        tag_false=b"",
-                        tag_true=b"",
                         optional=is_opt,
                         omitempty=info.omitempty,
                         key_kind=k_kind,
@@ -638,7 +641,6 @@ def _get_struct_codec(cls: type[Any]) -> _StructCodec:
                     )
             elif isinstance(base_tp, type) and dataclasses.is_dataclass(base_tp):
                 sub_sc = _get_struct_codec(base_tp)
-                tag_b = encode_tag(fnum, WIRE_SUB_MSG)
                 fc = _FieldCodec(
                     index=len(compiled),
                     attr=dc_f.name,
@@ -646,9 +648,6 @@ def _get_struct_codec(cls: type[Any]) -> _StructCodec:
                     wire_name=wire_name,
                     kind="submsg",
                     wire_type=WIRE_SUB_MSG,
-                    tag_bytes=tag_b,
-                    tag_false=b"",
-                    tag_true=b"",
                     optional=is_opt,
                     omitempty=info.omitempty,
                     sub_type=base_tp,
@@ -666,9 +665,6 @@ def _get_struct_codec(cls: type[Any]) -> _StructCodec:
                         wire_name=wire_name,
                         kind="bool",
                         wire_type=WIRE_BOOL_FALSE,
-                        tag_bytes=b"",
-                        tag_false=encode_tag(fnum, WIRE_BOOL_FALSE),
-                        tag_true=encode_tag(fnum, WIRE_BOOL_TRUE),
                         optional=is_opt,
                         omitempty=info.omitempty,
                         default_val=False if def_val is None else def_val,
@@ -692,9 +688,6 @@ def _get_struct_codec(cls: type[Any]) -> _StructCodec:
                         wire_name=wire_name,
                         kind=s_kind,
                         wire_type=s_wt,
-                        tag_bytes=encode_tag(fnum, s_wt),
-                        tag_false=b"",
-                        tag_true=b"",
                         optional=is_opt,
                         omitempty=info.omitempty,
                         default_val=default_scalar,
@@ -705,450 +698,23 @@ def _get_struct_codec(cls: type[Any]) -> _StructCodec:
         compiled.sort(key=lambda item: item.field_num)
         for idx, fc in enumerate(compiled):
             fc.index = idx
-            sc.by_num[fc.field_num] = fc
         sc.fields = compiled
-        _CODEC_CACHE[cls] = sc
+        _PENDING_FINALIZE.append(sc)
+
+        if is_root:
+            pending = list(_PENDING_FINALIZE)
+            _PENDING_FINALIZE.clear()
+            for p_sc in pending:
+                p_sc.finalize_rust_codec()
+                _CODEC_CACHE[p_sc.cls] = p_sc
+                _RUST_CODEC_CACHE[p_sc.cls] = p_sc.rust_codec
+    except Exception:
+        if is_root:
+            _PENDING_FINALIZE.clear()
+        raise
     finally:
         _BUILDING_CODECS.pop(cls, None)
     return sc
-
-
-def _is_value_empty(fc: _FieldCodec, val: Any) -> bool:
-    if val is None:
-        return True
-    if fc.kind == "bool":
-        return not bool(val)
-    if fc.kind in (
-        "uint32",
-        "uint64",
-        "sint32",
-        "sint64",
-        "fixed32",
-        "sfixed32",
-        "fixed64",
-        "sfixed64",
-    ):
-        return bool(val == 0)
-    if fc.kind in ("float32", "float64"):
-        return bool(val == 0.0)
-    if fc.kind in (
-        "string",
-        "str_as_bytes",
-        "bytes",
-        "bytes_as_str",
-        "array_scalar",
-        "array_submsg",
-        "map",
-    ):
-        return len(val) == 0
-    if fc.kind == "submsg" and fc.sub_codec is not None:
-        return all(
-            _is_value_empty(sub_fc, getattr(val, sub_fc.attr)) for sub_fc in fc.sub_codec.fields
-        )
-    return False
-
-
-def _write_scalar_payload(dst: bytearray, kind: str, val: Any, field_name: str) -> None:
-    if kind == "bool":
-        dst.append(1 if val else 0)
-    elif kind == "uint32":
-        if val < 0 or val > UINT32_MAX:
-            raise OmniBufEncodeError(f"omnibuf: field {field_name} uint32 {val} out of range")
-        append_varint(dst, val)
-    elif kind == "uint64":
-        if val < 0 or val > UINT64_MAX:
-            raise OmniBufEncodeError(f"omnibuf: field {field_name} uint64 {val} out of range")
-        append_varint(dst, val)
-    elif kind == "sint32":
-        append_varint(dst, encode_zigzag32(val))
-    elif kind == "sint64":
-        append_varint(dst, encode_zigzag(val))
-    elif kind == "fixed32":
-        if val < 0 or val > UINT32_MAX:
-            raise OmniBufEncodeError(f"omnibuf: field {field_name} fixed32 {val} out of range")
-        dst.extend(_U32_PACK(val))
-    elif kind == "sfixed32":
-        if val < INT32_MIN or val > INT32_MAX:
-            raise OmniBufEncodeError(f"omnibuf: field {field_name} sfixed32 {val} out of range")
-        dst.extend(_I32_PACK(val))
-    elif kind == "fixed64":
-        if val < 0 or val > UINT64_MAX:
-            raise OmniBufEncodeError(f"omnibuf: field {field_name} fixed64 {val} out of range")
-        dst.extend(_U64_PACK(val))
-    elif kind == "sfixed64":
-        if val < INT64_MIN or val > INT64_MAX:
-            raise OmniBufEncodeError(f"omnibuf: field {field_name} sfixed64 {val} out of range")
-        dst.extend(_I64_PACK(val))
-    elif kind == "float32":
-        try:
-            dst.extend(_F32_PACK(val))
-        except OverflowError as exc:
-            raise OmniBufEncodeError(f"omnibuf: field {field_name} float32 overflow") from exc
-    elif kind == "float64":
-        dst.extend(_F64_PACK(val))
-    elif kind == "string" or kind == "str_as_bytes":
-        raw = encode_utf8_strict(val, field_name)
-        append_varint(dst, len(raw))
-        dst.extend(raw)
-    elif kind == "bytes":
-        append_varint(dst, len(val))
-        dst.extend(val)
-    elif kind == "bytes_as_str":
-        decode_utf8_strict(val, 0)
-        append_varint(dst, len(val))
-        dst.extend(val)
-    else:
-        raise OmniBufEncodeError(f"omnibuf: unknown scalar kind {kind!r}")
-
-
-def _encode_struct_into(
-    dst: bytearray,
-    sc: _StructCodec,
-    obj: Any,
-    deterministic: bool,
-) -> None:
-    for fc in sc.fields:
-        val = getattr(obj, fc.attr)
-        if val is None:
-            if fc.optional:
-                continue
-            val = fc.make_default()
-        if fc.omitempty and _is_value_empty(fc, val):
-            continue
-
-        kind = fc.kind
-        if kind == "bool":
-            dst.extend(fc.tag_true if val else fc.tag_false)
-            continue
-
-        dst.extend(fc.tag_bytes)
-        if kind in (
-            "uint32",
-            "uint64",
-            "sint32",
-            "sint64",
-            "fixed32",
-            "sfixed32",
-            "fixed64",
-            "sfixed64",
-            "float32",
-            "float64",
-            "string",
-            "str_as_bytes",
-            "bytes",
-            "bytes_as_str",
-        ):
-            _write_scalar_payload(dst, kind, val, fc.wire_name)
-        elif kind == "submsg":
-            assert fc.sub_codec is not None
-            len_pos = len(dst)
-            dst.extend(b"\x00\x00")
-            _encode_struct_into(dst, fc.sub_codec, val, deterministic)
-            backpatch_container_len(dst, len_pos)
-        elif kind == "array_scalar":
-            len_pos = len(dst)
-            dst.extend(b"\x00\x00")
-            dst.append(fc.elem_wt)
-            append_varint(dst, len(val))
-            e_kind = fc.elem_kind
-            for item in val:
-                _write_scalar_payload(dst, e_kind, item, fc.wire_name)
-            backpatch_container_len(dst, len_pos)
-        elif kind == "array_submsg":
-            assert fc.sub_codec is not None
-            len_pos = len(dst)
-            dst.extend(b"\x00\x00")
-            dst.append(WIRE_SUB_MSG)
-            append_varint(dst, len(val))
-            sub_sc = fc.sub_codec
-            for item in val:
-                elem_len_pos = len(dst)
-                dst.extend(b"\x00\x00")
-                if item is not None:
-                    _encode_struct_into(dst, sub_sc, item, deterministic)
-                backpatch_container_len(dst, elem_len_pos)
-            backpatch_container_len(dst, len_pos)
-        elif kind == "map":
-            len_pos = len(dst)
-            dst.extend(b"\x00\x00")
-            dst.append(fc.key_wt)
-            dst.append(fc.val_wt)
-            append_varint(dst, len(val))
-            keys = sorted(val.keys()) if deterministic and len(val) > 1 else val.keys()
-            k_kind = fc.key_kind
-            v_kind = fc.val_kind
-            map_sub_sc = fc.sub_codec
-            for k in keys:
-                v = val[k]
-                _write_scalar_payload(dst, k_kind, k, fc.wire_name)
-                if v_kind == "submsg":
-                    assert map_sub_sc is not None
-                    v_len_pos = len(dst)
-                    dst.extend(b"\x00\x00")
-                    if v is not None:
-                        _encode_struct_into(dst, map_sub_sc, v, deterministic)
-                    backpatch_container_len(dst, v_len_pos)
-                else:
-                    _write_scalar_payload(dst, v_kind, v, fc.wire_name)
-            backpatch_container_len(dst, len_pos)
-
-
-def _read_scalar_payload(
-    mv: memoryview,
-    pos: int,
-    end: int,
-    kind: str,
-) -> tuple[Any, int]:
-    if kind == "bool":
-        if pos >= end:
-            raise OmniBufDecodeError("omnibuf: truncated bool element")
-        b = mv[pos]
-        if b > 1:
-            raise OmniBufDecodeError(f"omnibuf: invalid bool byte 0x{b:02x}")
-        return (b == 1), pos + 1
-    if kind == "uint32":
-        v, w = decode_varint(mv, pos, end)
-        if w == 0:
-            raise OmniBufDecodeError(f"omnibuf: invalid uint32 varint at byte {pos}")
-        return to_uint32(v), pos + w
-    if kind == "uint64":
-        v, w = decode_varint(mv, pos, end)
-        if w == 0:
-            raise OmniBufDecodeError(f"omnibuf: invalid uint64 varint at byte {pos}")
-        return v, pos + w
-    if kind == "sint32":
-        v, w = decode_varint(mv, pos, end)
-        if w == 0:
-            raise OmniBufDecodeError(f"omnibuf: invalid sint32 varint at byte {pos}")
-        return decode_zigzag32(v), pos + w
-    if kind == "sint64":
-        v, w = decode_varint(mv, pos, end)
-        if w == 0:
-            raise OmniBufDecodeError(f"omnibuf: invalid sint64 varint at byte {pos}")
-        return decode_zigzag(v), pos + w
-    if kind == "fixed32":
-        if pos + 4 > end:
-            raise OmniBufDecodeError("omnibuf: truncated fixed32")
-        (u32,) = _U32_UNPACK(mv, pos)
-        return int(u32), pos + 4
-    if kind == "sfixed32":
-        if pos + 4 > end:
-            raise OmniBufDecodeError("omnibuf: truncated sfixed32")
-        (i32,) = _I32_UNPACK(mv, pos)
-        return int(i32), pos + 4
-    if kind == "fixed64":
-        if pos + 8 > end:
-            raise OmniBufDecodeError("omnibuf: truncated fixed64")
-        (u64,) = _U64_UNPACK(mv, pos)
-        return int(u64), pos + 8
-    if kind == "sfixed64":
-        if pos + 8 > end:
-            raise OmniBufDecodeError("omnibuf: truncated sfixed64")
-        (i64,) = _I64_UNPACK(mv, pos)
-        return int(i64), pos + 8
-    if kind == "float32":
-        if pos + 4 > end:
-            raise OmniBufDecodeError("omnibuf: truncated float32")
-        (f32,) = _F32_UNPACK(mv, pos)
-        return float(f32), pos + 4
-    if kind == "float64":
-        if pos + 8 > end:
-            raise OmniBufDecodeError("omnibuf: truncated float64")
-        (f64,) = _F64_UNPACK(mv, pos)
-        return float(f64), pos + 8
-    if kind == "string":
-        s_pos = pos
-        raw, next_pos = read_len_slice(mv, pos, 0, end)
-        return decode_utf8_strict(raw, s_pos), next_pos
-    if kind == "str_as_bytes":
-        s_pos = pos
-        raw, next_pos = read_len_slice(mv, pos, 0, end)
-        return decode_utf8_strict(raw, s_pos), next_pos
-    if kind == "bytes":
-        raw, next_pos = read_len_slice(mv, pos, 0, end)
-        return bytes(raw), next_pos
-    if kind == "bytes_as_str":
-        s_pos = pos
-        raw, next_pos = read_len_slice(mv, pos, 0, end)
-        decode_utf8_strict(raw, s_pos)
-        return bytes(raw), next_pos
-    raise OmniBufDecodeError(f"omnibuf: unsupported scalar kind {kind!r}")
-
-
-def _decode_struct_into(
-    data: memoryview,
-    sc: _StructCodec,
-    dst: Any,
-    depth: int,
-    merge: bool,
-) -> None:
-    if depth > MAX_NESTING_DEPTH:
-        raise OmniBufDecodeError(f"omnibuf: nesting depth {depth} exceeds {MAX_NESTING_DEPTH}")
-    n = len(data)
-    pos = 0
-    seen_mask = 0
-    by_num = sc.by_num
-
-    while pos < n:
-        b0 = data[pos]
-        if b0 & 1:
-            fnum = b0 >> 5
-            wt = (b0 >> 1) & 0x0F
-            pos += 1
-        elif b0 & 2:
-            if pos + 2 > n:
-                raise OmniBufDecodeError(f"omnibuf: truncated tag at byte {pos}")
-            u16 = (b0 | (data[pos + 1] << 8)) >> 2
-            fnum = u16 >> 4
-            wt = u16 & 0x0F
-            pos += 2
-        else:
-            tag, tn = decode_varint(data, pos, n)
-            if tn == 0 or (tag >> 4) > MAX_FIELD_NUMBER:
-                raise OmniBufDecodeError(f"omnibuf: invalid tag at byte {pos}")
-            fnum = tag >> 4
-            wt = tag & 0x0F
-            pos += tn
-
-        if fnum == 0:
-            pos = validate_field0_at(data, pos, wt, depth, MAX_NESTING_DEPTH, n)
-            continue
-
-        fc = by_num.get(fnum)
-        if fc is None:
-            pos = validate_value(data, pos, wt, depth, MAX_NESTING_DEPTH, n)
-            continue
-
-        is_bool = fc.kind == "bool"
-        if (is_bool and wt not in (WIRE_BOOL_FALSE, WIRE_BOOL_TRUE)) or (
-            not is_bool and fc.wire_type != wt
-        ):
-            pos = validate_value(data, pos, wt, depth, MAX_NESTING_DEPTH, n)
-            continue
-
-        bit = 1 << fc.index
-        already_seen = ((seen_mask & bit) != 0) or merge
-        seen_mask |= bit
-
-        kind = fc.kind
-        if is_bool:
-            setattr(dst, fc.attr, wt == WIRE_BOOL_TRUE)
-        elif kind in (
-            "uint32",
-            "uint64",
-            "sint32",
-            "sint64",
-            "fixed32",
-            "sfixed32",
-            "fixed64",
-            "sfixed64",
-            "float32",
-            "float64",
-            "string",
-            "str_as_bytes",
-            "bytes",
-            "bytes_as_str",
-        ):
-            val, pos = _read_scalar_payload(data, pos, n, kind)
-            setattr(dst, fc.attr, val)
-        elif kind == "submsg":
-            assert fc.sub_codec is not None and fc.sub_type is not None
-            sub_mv, pos = read_len_slice(data, pos, 0, n)
-            cur_sub = getattr(dst, fc.attr, None)
-            if cur_sub is None:
-                cur_sub = fc.sub_type()
-                setattr(dst, fc.attr, cur_sub)
-            _decode_struct_into(sub_mv, fc.sub_codec, cur_sub, depth + 1, already_seen)
-        elif kind == "array_scalar":
-            if depth + 1 > MAX_NESTING_DEPTH:
-                raise OmniBufDecodeError(
-                    f"omnibuf: array nesting depth {depth + 1} exceeds {MAX_NESTING_DEPTH}"
-                )
-            arr_mv, pos = read_len_slice(data, pos, 2, n)
-            elem_wt, count, p, ok = parse_array_header(arr_mv)
-            if not ok or elem_wt != fc.elem_wt:
-                raise OmniBufDecodeError(f"omnibuf: invalid array header on field {fc.wire_name}")
-            cur_list = getattr(dst, fc.attr, None)
-            if not isinstance(cur_list, list):
-                cur_list = []
-                setattr(dst, fc.attr, cur_list)
-            elif not already_seen:
-                cur_list.clear()
-            arr_end = len(arr_mv)
-            e_kind = fc.elem_kind
-            for _ in range(count):
-                item, p = _read_scalar_payload(arr_mv, p, arr_end, e_kind)
-                cur_list.append(item)
-            if p != arr_end:
-                raise OmniBufDecodeError(f"omnibuf: trailing array bytes on field {fc.wire_name}")
-        elif kind == "array_submsg":
-            if depth + 1 > MAX_NESTING_DEPTH:
-                raise OmniBufDecodeError(
-                    f"omnibuf: array nesting depth {depth + 1} exceeds {MAX_NESTING_DEPTH}"
-                )
-            assert fc.sub_codec is not None and fc.sub_type is not None
-            arr_mv, pos = read_len_slice(data, pos, 2, n)
-            elem_wt, count, p, ok = parse_array_header(arr_mv)
-            if not ok or elem_wt != WIRE_SUB_MSG:
-                raise OmniBufDecodeError(
-                    f"omnibuf: invalid submsg array header on field {fc.wire_name}"
-                )
-            cur_list = getattr(dst, fc.attr, None)
-            if not isinstance(cur_list, list):
-                cur_list = []
-                setattr(dst, fc.attr, cur_list)
-            elif not already_seen:
-                cur_list.clear()
-            arr_end = len(arr_mv)
-            sub_sc = fc.sub_codec
-            sub_tp = fc.sub_type
-            for _ in range(count):
-                elem_mv, p = read_len_slice(arr_mv, p, 0, arr_end)
-                elem_obj = sub_tp()
-                _decode_struct_into(elem_mv, sub_sc, elem_obj, depth + 2, False)
-                cur_list.append(elem_obj)
-            if p != arr_end:
-                raise OmniBufDecodeError(
-                    f"omnibuf: trailing submsg array bytes on field {fc.wire_name}"
-                )
-        elif kind == "map":
-            if depth + 1 > MAX_NESTING_DEPTH:
-                raise OmniBufDecodeError(
-                    f"omnibuf: map nesting depth {depth + 1} exceeds {MAX_NESTING_DEPTH}"
-                )
-            map_mv, pos = read_len_slice(data, pos, 3, n)
-            key_wt, val_wt, count, p, ok = parse_map_header(map_mv)
-            if not ok or key_wt != fc.key_wt or val_wt != fc.val_wt:
-                raise OmniBufDecodeError(f"omnibuf: invalid map header on field {fc.wire_name}")
-            cur_map = getattr(dst, fc.attr, None)
-            if not isinstance(cur_map, dict):
-                cur_map = {}
-                setattr(dst, fc.attr, cur_map)
-            elif not already_seen:
-                cur_map.clear()
-            map_end = len(map_mv)
-            k_kind = fc.key_kind
-            v_kind = fc.val_kind
-            dec_map_sc = fc.sub_codec
-            dec_map_tp = fc.sub_type
-            for _ in range(count):
-                k_val, p = _read_scalar_payload(map_mv, p, map_end, k_kind)
-                if v_kind == "submsg":
-                    assert dec_map_sc is not None and dec_map_tp is not None
-                    v_mv, p = read_len_slice(map_mv, p, 0, map_end)
-                    v_obj = dec_map_tp()
-                    _decode_struct_into(v_mv, dec_map_sc, v_obj, depth + 2, False)
-                    cur_map[k_val] = v_obj
-                else:
-                    v_val, p = _read_scalar_payload(map_mv, p, map_end, v_kind)
-                    cur_map[k_val] = v_val
-            if p != map_end:
-                raise OmniBufDecodeError(f"omnibuf: trailing map bytes on field {fc.wire_name}")
-
-    if not merge:
-        for fc in sc.fields:
-            if (seen_mask & (1 << fc.index)) == 0:
-                setattr(dst, fc.attr, fc.make_default())
 
 
 def marshal(
@@ -1158,12 +724,10 @@ def marshal(
     self_describing: bool = False,
 ) -> bytes:
     """Serializes an @omnibuf_message dataclass instance into OmniBuf wire bytes."""
-    sc = _get_struct_codec(type(msg))
-    out = bytearray()
-    if self_describing:
-        out.extend(sc.get_field0_wire())
-    _encode_struct_into(out, sc, msg, deterministic)
-    return bytes(out)
+    rc = _RUST_CODEC_CACHE.get(type(msg))
+    if rc is None:
+        rc = _get_struct_codec(type(msg)).rust_codec
+    return rc.marshal(msg, deterministic=deterministic, self_describing=self_describing)
 
 
 @overload
@@ -1177,13 +741,14 @@ def unmarshal[T](packet: Buffer, target: T) -> T: ...
 def unmarshal(packet: Buffer, target: Any) -> Any:
     """Decodes OmniBuf wire bytes into an @omnibuf_message class or existing instance."""
     if isinstance(target, type):
-        sc = _get_struct_codec(target)
-        inst = target()
-    else:
-        sc = _get_struct_codec(type(target))
-        inst = target
-    _decode_struct_into(memoryview(packet), sc, inst, 0, False)
-    return inst
+        rc = _RUST_CODEC_CACHE.get(target)
+        if rc is None:
+            rc = _get_struct_codec(target).rust_codec
+        return rc.unmarshal(packet)
+    rc = _RUST_CODEC_CACHE.get(type(target))
+    if rc is None:
+        rc = _get_struct_codec(type(target)).rust_codec
+    return rc.unmarshal(packet, target)
 
 
 def schema_meta_for(target: Any) -> SchemaMeta:
