@@ -161,7 +161,7 @@ def test_recursive_treenode_and_nested_cluster_dataclasses() -> None:
         weight=-50,
         primary=TreeNode(id=2, name="primary-child", weight=10),
         children=[TreeNode(id=3, name="c1"), TreeNode(id=4, name="c2")],
-        branches=[None, TreeNode(id=5, name="b1")],
+        branches=[TreeNode(), TreeNode(id=5, name="b1")],
         labels={"depth": 2, "nodes": 5},
     )
     raw = marshal(root, deterministic=True, self_describing=True)
@@ -169,14 +169,13 @@ def test_recursive_treenode_and_nested_cluster_dataclasses() -> None:
     assert decoded.id == 1
     assert decoded.primary == TreeNode(id=2, name="primary-child", weight=10)
     assert decoded.children == [TreeNode(id=3, name="c1"), TreeNode(id=4, name="c2")]
-    # A None element in list[TreeNode | None] encodes as a 0-byte WireSubMsg and decodes to zero TreeNode()
     assert decoded.branches == [TreeNode(), TreeNode(id=5, name="b1")]
     assert decoded.labels == {"depth": 2, "nodes": 5}
     blind = decode_blind(raw)
     assert blind["name"] == "root"
-    assert blind["primary"]["field_2"] == "primary-child"
-    assert blind["branches"][0] == {}
-    assert blind["branches"][1]["field_2"] == "b1"
+    assert blind["primary"]["name"] == "primary-child"
+    assert blind["branches"][0]["name"] == ""
+    assert blind["branches"][1]["name"] == "b1"
 
     cluster = NestedCluster(
         cluster_name="eu-fra",

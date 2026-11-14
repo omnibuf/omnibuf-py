@@ -1,19 +1,19 @@
 # omnibuf
 
-Explicit-typed, header-hop binary wire codec for Python (`v2.1`).
+Explicit-typed, header-hop binary wire codec for Python (`v0.1`).
 
-`omnibuf` implements the complete OmniBuf v2.1 wire format for Python 3.11+ on top of a compiled Rust extension (`omnibuf._omnibuf_ext` powered by `omnibuf-rs` and PyO3), with strict type annotations (`py.typed`), `buf` CLI code generation, native [`protobuf-py`](https://github.com/bufbuild/protobuf-py) integration, `@omnibuf_message` dataclasses, lazy `Opaque` header-hop views, and schema-less `Field #0` inspection.
+`omnibuf` implements the OmniBuf v0.1 wire format for Python 3.11+ backed by a compiled Rust extension. Every package distribution ships strict type annotations (`py.typed`), `buf` CLI code generation, native [`protobuf-py`](https://github.com/bufbuild/protobuf-py) support, `@omnibuf_message` dataclasses, lazy `Opaque` views, and schema-less `Field #0` inspection.
 
 ## Highlights
 
-- **Prefix-Varint (`TZCNT`) Framing**: The first byte determines integer width (`1`, `2`, `4`, or `9` bytes) via trailing-zero count. Reserved markers (`(b & 0x07) == 0` with `b != 0`) fail fast on decode.
-- **16 Explicit Wire Types**: Signed integers, unsigned integers, booleans, 32-bit/64-bit floats, strings, raw bytes, sub-messages, typed arrays, and typed maps carry distinct 4-bit wire tags.
+- **Prefix-Varint Framing**: A single leading byte fixes integer width (`1`, `2`, `4`, or `9` bytes) through trailing-zero count. Reserved markers (`(b & 0x07) == 0` with `b != 0`) fail immediately during decode.
+- **16 Explicit Wire Types**: Distinct 4-bit tags separate signed integers, unsigned integers, booleans, 32-bit and 64-bit floats, UTF-8 strings, raw bytes, sub-messages, typed arrays, typed maps, and extended payloads.
 - **Four Integration Tiers**:
-  - `protoc-gen-omnibuf-py` codegen producing slotted dataclasses, unrolled codecs, and lazy `Opaque<Message>` views
-  - Direct `marshal` / `unmarshal` over `protobuf-py` (`_pb.py` classes and `DescMessage` descriptors), plus `google.protobuf` (`_pb2.py`) compatibility
-  - Annotated Python dataclasses via `@omnibuf_message` and `omnibuf_field(...)`
-  - Schema-less `decode_blind` and `decode_blind_json` powered by embedded `Field #0` metadata
-- **584/584 Conformance Verified**: Passes every case in the cross-language OmniBuf conformance suite with zero skips.
+  - `protoc-gen-omnibuf-py` codegen emitting slotted dataclasses, compiled codecs, `oneof` tracking, and lazy `Opaque<Message>` views
+  - Direct `marshal` and `unmarshal` over `protobuf-py` (`_pb.py` classes and `DescMessage` descriptors), plus optional `google.protobuf` (`_pb2.py`) support
+  - Annotated Python dataclasses via `@omnibuf_message`, `omnibuf_field(...)`, and `enum.IntEnum` or integer-valued `enum.Enum` types
+  - Schema-less `decode_blind` and `decode_blind_json` driven by embedded `Field #0` metadata
+- **758/758 Conformance Verified**: Passes the entire cross-language OmniBuf conformance suite with zero skips.
 
 ## Installation
 
@@ -21,15 +21,16 @@ Explicit-typed, header-hop binary wire codec for Python (`v2.1`).
 uv add omnibuf protobuf-py protobuf-py-ext
 ```
 
-For schema linting and code generation, install `buf` and add `protoc-gen-py` to development dependencies:
+Projects that run `protoc-gen-omnibuf-py` or decode legacy `google.protobuf` `_pb2` classes install the `protobuf` extra alongside `protoc-gen-py`:
 
 ```bash
+uv add "omnibuf[protobuf]"
 uv add --dev protoc-gen-py
 ```
 
 ## Code Generation with Buf
 
-Configure `buf.yaml` and `buf.gen.yaml` at your repository root:
+Add `buf.yaml` and `buf.gen.yaml` at the repository root:
 
 ```yaml
 # buf.yaml
@@ -56,13 +57,13 @@ plugins:
     out: src/omnibuf/gen
 ```
 
-Run `buf lint` and `buf generate` to emit `<name>_pb.py` (`protobuf-py`) and `<name>_omnibuf_pb.py` (`omnibuf`) modules.
+Run `buf lint` and `buf generate`. Buf emits `<name>_pb.py` (`protobuf-py`) and `<name>_omnibuf_pb.py` (`omnibuf`) modules in one pass.
 
 ## Usage
 
 ### 1. `protobuf-py` Messages
 
-`omnibuf.marshal` and `omnibuf.unmarshal` work directly with `protobuf-py` generated `_pb.py` message classes, instances, and `DescMessage` descriptors.
+`omnibuf.marshal` and `omnibuf.unmarshal` accept `protobuf-py` generated `_pb.py` message classes, instances, and `DescMessage` descriptors directly.
 
 ```python
 import omnibuf
@@ -82,9 +83,9 @@ decoded = omnibuf.unmarshal(packet, peer_pb.PeerUpdate)
 assert decoded.location.city == "Frankfurt"
 ```
 
-### 2. Generated Codec and Lazy `Opaque` Views
+### 2. Generated Codecs and Lazy `Opaque` Views
 
-`protoc-gen-omnibuf-py` emits slotted dataclasses bound to `CompiledCodec` descriptors alongside `Opaque<Message>` views. `Opaque` views hop across length headers in `O(1)` time per field, reading nested slices directly from `bytes` buffers or splicing single-field edits in place.
+`protoc-gen-omnibuf-py` emits slotted dataclasses paired with `Opaque<Message>` views. `Opaque` views hop across length headers in `O(1)` time per field. Nested slices read directly from `bytes` buffers, and single-field edits splice into existing wire bytes.
 
 ```python
 from omnibuf.gen.omnibuf.bench import peer_omnibuf_pb
@@ -100,7 +101,7 @@ updated_packet = view.marshal()
 
 ### 3. Annotated Python Dataclasses
 
-Plain Python projects can define wire schemas directly with `@omnibuf_message`, `omnibuf_field`, and explicit scalar type aliases (`Uint32`, `Uint64`, `Sint32`, `Sint64`, `Fixed32`, `Sfixed32`, `Fixed64`, `Sfixed64`, `Float32`, `Float64`).
+Pure Python schemas declare wire field numbers with `@omnibuf_message`, `omnibuf_field`, and explicit scalar aliases (`Uint32`, `Uint64`, `Sint32`, `Sint64`, `Fixed32`, `Sfixed32`, `Fixed64`, `Sfixed64`, `Float32`, `Float64`).
 
 ```python
 import omnibuf
@@ -132,7 +133,7 @@ restored = omnibuf.unmarshal(raw, PeerSummary)
 
 ### 4. Schema-less Inspection via `Field #0`
 
-Packets serialized with `self_describing=True` carry recursive field names inside `Field #0`. `decode_blind` and `decode_blind_json` inspect arbitrary packets with two-pass `Field #0` resolution, shortest round-trip `float32` formatting, Base64 bytes, and full 64-bit integer precision.
+Self-describing packets embed recursive field names inside `Field #0`. `decode_blind` and `decode_blind_json` resolve `Field #0` metadata in two passes, format shortest round-trip `float32` decimals, encode raw bytes as Base64, and preserve full 64-bit integer precision.
 
 ```python
 import omnibuf
@@ -141,18 +142,31 @@ payload_dict = omnibuf.decode_blind(raw)
 payload_json = omnibuf.decode_blind_json(raw)
 ```
 
+## Benchmarks
+
+`benchmarks/bench.py` measures `PeerUpdate` across six categories:
+
+- Full Message Encode Speed
+- Full Message Decode Speed
+- Read a Single Nested Field
+- Selective Single-Field Mutation
+- Large Embedded Message Encode
+- Embedded Message Growth
+
+Methodology: canonical `PeerUpdate` carries 11 fields (`366 B` in OmniBuf, `341 B` in Protobuf). Full decode materializes and reads all 11 fields across every codec. Mutation benchmarks check `location.city == "Frankfurt"` before incrementing `sequence` or growing `location.datacenter` past `16 KiB` ahead of 32 trailing `Neighbor` entries.
+
 ## Development Workflow
 
-Toolchains (`python`, `rust`, `uv`, `buf`, `just`) are managed via `mise`:
+Toolchains (`python`, `rust`, `uv`, `buf`, `just`) are pinned in `mise.toml`:
 
 ```bash
-just install      # Build Rust extension via maturin and sync .venv
+just install      # Build Rust extension and sync .venv
 just proto        # Run buf lint and buf generate
-just fmt          # Format Rust and Python code with cargo fmt and ruff
+just fmt          # Format Rust and Python sources
 just lint         # Run buf lint, cargo clippy, ruff check, and strict mypy
-just test         # Run pytest unit suite
-just conformance  # Run all 584 cross-language conformance cases
-just bench        # Run PeerUpdate benchmark suite -> testdata/benchmarks.json
+just test         # Run pytest suite
+just conformance  # Run all 758 cross-language conformance cases
+just bench        # Run PeerUpdate benchmarks -> testdata/benchmarks.json
 just ci           # Run fmt-check, lint, test, and conformance
 ```
 

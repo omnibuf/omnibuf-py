@@ -161,7 +161,7 @@ class TreeNode:
     weight: Sint64 = omnibuf_field(3, wire="sint", default=0)
     primary: TreeNode | None = omnibuf_field(4, default=None)
     children: list[TreeNode] = omnibuf_field(5, default_factory=list)
-    branches: list[TreeNode | None] = omnibuf_field(6, default_factory=list)
+    branches: list[TreeNode] = omnibuf_field(6, default_factory=list)
     labels: dict[str, Uint64] = omnibuf_field(7, default_factory=dict)
 
 
@@ -225,11 +225,13 @@ def _handle_blind(req: ConformanceFrameRequest) -> ConformanceFrameResponse:
     payload = req.omnibuf_payload
     if req.requested_output_format == WIRE_FORMAT_JSON:
         try:
-            resp.json_payload = decode_blind_json(payload, allow_nan=False)
+            resp.json_payload = decode_blind_json(
+                payload,
+                allow_nan=False,
+                fallback_on_non_finite=True,
+            )
         except OmniBufDecodeError as exc:
             resp.parse_error = str(exc)
-        except ValueError:
-            resp.json_payload = "{}"
         return resp
 
     try:
@@ -245,17 +247,27 @@ def _handle_plugin_tier(
     resp = ConformanceFrameResponse()
     payload = req.omnibuf_payload
 
+    msg_type = req.message_type
     if req.test_opaque_splice or req.test_opaque_splice_shrink:
         try:
             _check_splice_aliased_prefix(payload)
+            if msg_type == "omnibuf.bench.PeerUpdate":
+                probe_peer = peer_omnibuf_pb.OpaquePeerUpdate(payload)
+                probe_peer.set_sequence(0)
+                _ = probe_peer.marshal()
+            elif msg_type == "omnibuf.conformance.TestAllTypes":
+                probe_all = conformance_omnibuf_pb.OpaqueTestAllTypes(payload)
+                probe_all.set_f1_uint32(0)
+                _ = probe_all.marshal()
         except OmniBufDecodeError as exc:
             resp.parse_error = str(exc)
+            return resp
+        except OmniBufEncodeError as exc:
+            resp.serialize_error = str(exc)
             return resp
         except Exception as exc:  # noqa: BLE001
             resp.runtime_error = str(exc)
             return resp
-
-    msg_type = req.message_type
     if msg_type == "omnibuf.bench.PeerUpdate":
         msg = peer_omnibuf_pb.PeerUpdate(
             asn=999999,
@@ -583,7 +595,7 @@ def _handle_annotated_struct_tier(
             name="stale",
             primary=TreeNode(id=888, name="stale-child"),
             children=[TreeNode(id=777)],
-            branches=[TreeNode(id=666), None],
+            branches=[TreeNode(id=666)],
             labels={"stale": 1},
         )
     elif msg_type == "omnibuf.conformance.NestedCluster":

@@ -1,12 +1,11 @@
 use std::collections::BTreeMap;
 
 use omnibuf_core::blind::{BlindValue, decode_blind, encode_base64, stringify_blind_json};
-use pyo3::exceptions::PyValueError;
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBool, PyBytes, PyDict, PyFloat, PyString};
 
-use crate::{BorrowedBytes, decode_err};
+use crate::{LeafBytes, decode_err, encode_err};
 
 #[inline]
 fn round_f32_shortest_to_f64(f: f32) -> f64 {
@@ -158,7 +157,13 @@ fn format_allow_nan_val(dst: &mut String, val: &BlindValue, step: &str, cur_inde
             } else {
                 let mut b = ryu::Buffer::new();
                 let s = b.format_finite(*f);
-                dst.push_str(s.strip_suffix(".0").unwrap_or(s));
+                if s != "-0.0"
+                    && let Some(stripped) = s.strip_suffix(".0")
+                {
+                    dst.push_str(stripped);
+                } else {
+                    dst.push_str(s);
+                }
             }
         }
         BlindValue::Float64(f) => {
@@ -173,7 +178,13 @@ fn format_allow_nan_val(dst: &mut String, val: &BlindValue, step: &str, cur_inde
             } else {
                 let mut b = ryu::Buffer::new();
                 let s = b.format_finite(*f);
-                dst.push_str(s.strip_suffix(".0").unwrap_or(s));
+                if s != "-0.0"
+                    && let Some(stripped) = s.strip_suffix(".0")
+                {
+                    dst.push_str(stripped);
+                } else {
+                    dst.push_str(s);
+                }
             }
         }
         BlindValue::String(s) => write_escaped_json_str(dst, s),
@@ -219,25 +230,34 @@ pub fn decode_blind_py<'py>(
     py: Python<'py>,
     packet: &Bound<'py, PyAny>,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let borrowed = BorrowedBytes::extract(py, packet.as_ptr())?;
-    let map = decode_blind(borrowed.as_slice()).map_err(|e| decode_err(py, e.to_string()))?;
+    let map = {
+        let borrowed = LeafBytes::extract(py, packet.as_ptr())?;
+        decode_blind(borrowed.as_slice()).map_err(|e| decode_err(py, e.to_string()))?
+    };
     blind_map_to_py_dict(py, &map)
 }
 
 #[pyfunction]
-#[pyo3(signature = (packet, *, allow_nan=false, indent=None))]
+#[pyo3(signature = (packet, *, allow_nan=false, fallback_on_non_finite=false, indent=None))]
 pub fn decode_blind_json_py(
     py: Python<'_>,
     packet: &Bound<'_, PyAny>,
     allow_nan: bool,
+    fallback_on_non_finite: bool,
     indent: Option<usize>,
 ) -> PyResult<String> {
-    let borrowed = BorrowedBytes::extract(py, packet.as_ptr())?;
-    let map = decode_blind(borrowed.as_slice()).map_err(|e| decode_err(py, e.to_string()))?;
+    let map = {
+        let borrowed = LeafBytes::extract(py, packet.as_ptr())?;
+        decode_blind(borrowed.as_slice()).map_err(|e| decode_err(py, e.to_string()))?
+    };
     if map_has_non_finite(&map) {
         if !allow_nan {
-            return Err(PyValueError::new_err(
-                "Out of range float values are not JSON compliant",
+            if fallback_on_non_finite {
+                return Ok("{}".to_owned());
+            }
+            return Err(encode_err(
+                py,
+                "omnibuf: non-finite float values (NaN/Inf) are not valid JSON",
             ));
         }
         let step = match indent {

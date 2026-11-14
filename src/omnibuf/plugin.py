@@ -8,19 +8,23 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any
 
-from google.protobuf.compiler import plugin_pb2
-from google.protobuf.descriptor_pb2 import (
-    DescriptorProto,
-    EnumDescriptorProto,
-    FieldDescriptorProto,
-    FileDescriptorProto,
-)
+try:
+    from google.protobuf.compiler import plugin_pb2
+    from google.protobuf.descriptor_pb2 import (
+        DescriptorProto,
+        EnumDescriptorProto,
+        FieldDescriptorProto,
+        FileDescriptorProto,
+    )
+except ImportError as exc:
+    raise ImportError("protoc-gen-omnibuf-py requires protobuf; install omnibuf[protobuf]") from exc
 
 from .field0 import SchemaMeta, encode_field0_schema_meta
 from .wire import (
     MAX_FIELD_NUMBER,
     WIRE_ARRAY,
     WIRE_BOOL_FALSE,
+    WIRE_BOOL_TRUE,
     WIRE_BYTES,
     WIRE_FIXED32,
     WIRE_FIXED64,
@@ -87,12 +91,32 @@ _SCALAR_KIND_CODE: dict[str, int] = {
 }
 
 
+def _field_wire_mask(rf: _ResolvedField) -> int:
+    if rf.is_map:
+        return 1 << WIRE_MAP
+    if rf.repeated:
+        return 1 << WIRE_ARRAY
+    if rf.proto_type == FieldDescriptorProto.TYPE_MESSAGE:
+        return 1 << WIRE_SUB_MSG
+    if rf.proto_type == FieldDescriptorProto.TYPE_BOOL:
+        return (1 << WIRE_BOOL_FALSE) | (1 << WIRE_BOOL_TRUE)
+    _, wt, _, _ = _PROTO_SCALAR_INFO[rf.proto_type]
+    return 1 << wt
+
+
 @dataclass(slots=True)
 class _MapEntrySpec:
     full_name: str
     key_type: int
     val_type: int
     val_type_name: str
+
+
+@dataclass(slots=True)
+class _OneofGroup:
+    proto_name: str
+    safe_name: str
+    members: list[_ResolvedField] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -103,6 +127,7 @@ class _MsgSpec:
     file_name: str
     desc: DescriptorProto
     fields: list[_ResolvedField] = field(default_factory=list)
+    oneofs: list[_OneofGroup] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -122,6 +147,8 @@ class _ResolvedField:
     repeated: bool
     is_map: bool
     explicit_presence: bool
+    real_oneof: str | None = None
+    oneof_siblings: list[_ResolvedField] = field(default_factory=list)
     map_key_type: int = 0
     map_val_type: int = 0
     sub_msg_full: str = ""
@@ -210,7 +237,7 @@ def _module_import_for_proto(
     stem = f"{tgt_clean[-1]}{suffix}"
     tgt_parts = tgt_clean[:-1]
     if not cur_parts:
-        return ".".join(tgt_parts), stem
+        return (f".{'.'.join(tgt_parts)}" if tgt_parts else "."), stem
     common = 0
     while (
         common < len(cur_parts)
@@ -241,6 +268,9 @@ def _build_schema_meta(
 
 
 def _emit_field_spec_expr(rf: _ResolvedField, ref_codec_fn: Any) -> str:
+    sib_nums = [s.number for s in rf.oneof_siblings]
+    sib_suffix = f', "oneof_siblings": {sib_nums!r}' if sib_nums else ""
+
     if rf.is_map:
         k_kind, k_wt, _, _ = _PROTO_SCALAR_INFO[rf.map_key_type]
         if rf.map_val_type == FieldDescriptorProto.TYPE_MESSAGE:
@@ -282,7 +312,7 @@ def _emit_field_spec_expr(rf: _ResolvedField, ref_codec_fn: Any) -> str:
             f'{{"number": {rf.number}, "attr": {rf.attr_name!r}, '
             f'"wire_name": {rf.proto_name!r}, "kind": "submsg", '
             f'"wire_type": {WIRE_SUB_MSG}, "skip_if_none": True, "sub_codec": {sub_c}, '
-            f'"default_mode": "const", "default_val": None}}'
+            f'"default_mode": "const", "default_val": None{sib_suffix}}}'
         )
 
     s_kind, s_wt, _, s_def = _PROTO_SCALAR_INFO[rf.proto_type]
@@ -291,8 +321,20 @@ def _emit_field_spec_expr(rf: _ResolvedField, ref_codec_fn: Any) -> str:
         f'{{"number": {rf.number}, "attr": {rf.attr_name!r}, '
         f'"wire_name": {rf.proto_name!r}, "kind": {s_kind!r}, "wire_type": {s_wt}, '
         f'"skip_if_none": {rf.explicit_presence!r}, '
-        f'"default_mode": "const", "default_val": {def_expr}}}'
+        f'"default_mode": "const", "default_val": {def_expr}{sib_suffix}}}'
     )
+
+
+def _sibling_specs_expr(rf: _ResolvedField) -> str:
+    if not rf.oneof_siblings:
+        return ""
+    pairs = ", ".join(f"({s.number}, {_field_wire_mask(s)})" for s in rf.oneof_siblings)
+    return f"({pairs},)"
+
+
+def _sibling_nums_expr(rf: _ResolvedField) -> str:
+    nums = ", ".join(str(s.number) for s in rf.oneof_siblings)
+    return f"({nums},)"
 
 
 def _emit_opaque_methods(
@@ -303,6 +345,7 @@ def _emit_opaque_methods(
     lines: list[str] = []
     attr = rf.attr_name
     num = rf.number
+    sib_specs = _sibling_specs_expr(rf)
 
     if rf.is_map:
         k_kind, k_wt, k_py, _ = _PROTO_SCALAR_INFO[rf.map_key_type]
@@ -367,39 +410,71 @@ def _emit_opaque_methods(
             )
         return lines
 
+    mask = _field_wire_mask(rf)
+    has_arg = f"{num}, {mask}, {sib_specs}" if sib_specs else f"{num}, {mask}"
+
     if rf.proto_type == FieldDescriptorProto.TYPE_MESSAGE:
         ret_tp = f"{rf.sub_msg_py} | None"
         sub_c = ref_codec_fn(rf.sub_msg_full)
         op_cls = ref_opaque_cls(rf.sub_msg_full)
+        sub_args = f"{num}, {sub_c}, {sib_specs}" if sib_specs else f"{num}, {sub_c}"
+        op_args = (
+            f"{num}, {op_cls}, {sub_c}, {sib_specs}" if sib_specs else f"{num}, {op_cls}, {sub_c}"
+        )
+        set_call = (
+            f"self._set_oneof_dirty({num}, val, {_sibling_nums_expr(rf)})"
+            if rf.oneof_siblings
+            else f"self._set_dirty({num}, val)"
+        )
         lines.extend(
             [
+                f"    def has_{attr}(self) -> bool:",
+                f"        return self._has_field({has_arg})",
+                "",
                 f"    def get_{attr}(self) -> {ret_tp}:",
-                f"        return self._get_submsg({num}, {sub_c})",
+                f"        return self._get_submsg({sub_args})",
                 "",
                 f"    def opaque_{attr}(self) -> {op_cls} | None:",
-                f"        return self._opaque_sub({num}, {op_cls}, {sub_c})",
+                f"        return self._opaque_sub({op_args})",
                 "",
-                f"    def set_{attr}(self, val: Any) -> None:",
-                f"        self._set_dirty({num}, val)",
+                f"    def set_{attr}(self, val: {ret_tp}) -> None:",
+                f"        {set_call}",
                 "",
             ]
         )
         return lines
 
     s_kind, _, s_py, _ = _PROTO_SCALAR_INFO[rf.proto_type]
-    set_tp = f"{s_py} | None" if rf.explicit_presence else s_py
-    setter_call = (
-        f"self._set_uint64({num}, val)"
-        if (s_kind == "uint64" and not rf.explicit_presence)
-        else f"self._set_dirty({num}, val)"
-    )
+    if rf.explicit_presence:
+        opt_tp = f"{s_py} | None"
+        opt_args = f"{num}, {sib_specs}" if sib_specs else f"{num}"
+        set_call = (
+            f"self._set_oneof_dirty({num}, val, {_sibling_nums_expr(rf)})"
+            if rf.oneof_siblings
+            else f"self._set_{s_kind}({num}, val, True)"
+        )
+        lines.extend(
+            [
+                f"    def has_{attr}(self) -> bool:",
+                f"        return self._has_field({has_arg})",
+                "",
+                f"    def get_{attr}(self) -> {opt_tp}:",
+                f"        return self._get_opt_{s_kind}({opt_args})",
+                "",
+                f"    def set_{attr}(self, val: {opt_tp}) -> None:",
+                f"        {set_call}",
+                "",
+            ]
+        )
+        return lines
+
     lines.extend(
         [
             f"    def get_{attr}(self) -> {s_py}:",
             f"        return self._get_{s_kind}({num})",
             "",
-            f"    def set_{attr}(self, val: {set_tp}) -> None:",
-            f"        {setter_call}",
+            f"    def set_{attr}(self, val: {s_py}) -> None:",
+            f"        self._set_{s_kind}({num}, val)",
             "",
         ]
     )
@@ -411,6 +486,8 @@ def _generate_file(
     reg: _Registry,
     suffix: str,
 ) -> tuple[str, str]:
+    if fdp.extension:
+        raise ValueError(f"omnibuf: Proto2 file extensions are not supported in {fdp.name}")
     is_proto2 = fdp.syntax in ("", "proto2")
     local_msgs = reg.file_messages[fdp.name]
     imported_files: dict[str, str] = {}
@@ -443,8 +520,16 @@ def _generate_file(
 
     for m_spec in local_msgs:
         mdp = m_spec.desc
+        if mdp.extension or mdp.extension_range:
+            raise ValueError(f"omnibuf: Proto2 extensions are not supported on {m_spec.full_name}")
         resolved: list[_ResolvedField] = []
+        oneof_map: dict[int, _OneofGroup] = {}
+
         for fd in mdp.field:
+            if fd.type == FieldDescriptorProto.TYPE_GROUP:
+                raise ValueError(
+                    f"omnibuf: Proto2 group field {m_spec.full_name}.{fd.name} is not supported"
+                )
             num = fd.number
             if num < 1 or num > MAX_FIELD_NUMBER or (19000 <= num <= 19999):
                 raise ValueError(f"omnibuf: invalid field number {num} on {m_spec.full_name}")
@@ -456,6 +541,10 @@ def _generate_file(
                 else None
             )
             if map_entry is not None:
+                if map_entry.val_type == FieldDescriptorProto.TYPE_GROUP:
+                    raise ValueError(
+                        f"omnibuf: Proto2 group map value on {m_spec.full_name}.{fd.name} is not supported"
+                    )
                 sub_full = (
                     map_entry.val_type_name
                     if map_entry.val_type == FieldDescriptorProto.TYPE_MESSAGE
@@ -480,26 +569,45 @@ def _generate_file(
             else:
                 is_msg = fd.type == FieldDescriptorProto.TYPE_MESSAGE
                 has_oneof = fd.HasField("oneof_index")
+                is_real_oneof = has_oneof and not bool(fd.proto3_optional)
+                oneof_proto_name: str | None = None
+                if is_real_oneof:
+                    oidx = fd.oneof_index
+                    oneof_proto_name = mdp.oneof_decl[oidx].name
+                    if oidx not in oneof_map:
+                        oneof_map[oidx] = _OneofGroup(
+                            proto_name=oneof_proto_name,
+                            safe_name=_safe_ident(_to_snake_case(oneof_proto_name)),
+                        )
                 explicit = not rep and (
                     is_msg or bool(fd.proto3_optional) or has_oneof or is_proto2
                 )
                 sub_full = fd.type_name if is_msg else ""
                 sub_py = _ref_msg_symbol(sub_full) if sub_full else ""
-                resolved.append(
-                    _ResolvedField(
-                        number=num,
-                        proto_name=fd.name,
-                        attr_name=attr,
-                        proto_type=fd.type,
-                        repeated=rep,
-                        is_map=False,
-                        explicit_presence=explicit,
-                        sub_msg_full=sub_full,
-                        sub_msg_py=sub_py,
-                    )
+                rf_obj = _ResolvedField(
+                    number=num,
+                    proto_name=fd.name,
+                    attr_name=attr,
+                    proto_type=fd.type,
+                    repeated=rep,
+                    is_map=False,
+                    explicit_presence=explicit,
+                    real_oneof=oneof_proto_name,
+                    sub_msg_full=sub_full,
+                    sub_msg_py=sub_py,
                 )
+                resolved.append(rf_obj)
+                if is_real_oneof:
+                    oneof_map[fd.oneof_index].members.append(rf_obj)
+
+        for grp in oneof_map.values():
+            grp.members.sort(key=lambda item: item.number)
+            for member in grp.members:
+                member.oneof_siblings = [m for m in grp.members if m.number != member.number]
+
         resolved.sort(key=lambda item: item.number)
         m_spec.fields = resolved
+        m_spec.oneofs = [oneof_map[idx] for idx in sorted(oneof_map)]
 
     lines: list[str] = [
         f"# Code generated by protoc-gen-omnibuf-py from {fdp.name}. DO NOT EDIT.",
@@ -508,7 +616,7 @@ def _generate_file(
         "from __future__ import annotations",
         "",
         "from dataclasses import dataclass, field",
-        "from typing import Any, ClassVar",
+        "from typing import ClassVar",
         "",
         "from omnibuf._omnibuf_ext import CompiledCodec, OpaqueView",
         "from omnibuf.wire import Buffer",
@@ -516,10 +624,7 @@ def _generate_file(
 
     for imp_file, alias in imported_files.items():
         pkg_mod, mod_stem = _module_import_for_proto(fdp.name, imp_file, suffix)
-        if pkg_mod:
-            lines.append(f"from {pkg_mod} import {mod_stem} as {alias}")
-        else:
-            lines.append(f"import {mod_stem} as {alias}")
+        lines.append(f"from {pkg_mod} import {mod_stem} as {alias}")
 
     lines.append("")
 
@@ -569,6 +674,14 @@ def _generate_file(
                 else:
                     lines.append(f"    {rf.attr_name}: {s_py} = {s_def}")
 
+        for grp in m_spec.oneofs:
+            lines.append("")
+            lines.append(f"    def which_{grp.safe_name}(self) -> str | None:")
+            for member in grp.members:
+                lines.append(f"        if self.{member.attr_name} is not None:")
+                lines.append(f"            return {member.proto_name!r}")
+            lines.append("        return None")
+
         lines.extend(
             [
                 "",
@@ -598,6 +711,18 @@ def _generate_file(
 
         for rf in m_spec.fields:
             lines.extend(_emit_opaque_methods(rf, _ref_codec_symbol, _ref_opaque_cls))
+
+        for grp in m_spec.oneofs:
+            cand_items = ", ".join(
+                f"({m.number}, {_field_wire_mask(m)}, {m.proto_name!r})" for m in grp.members
+            )
+            lines.extend(
+                [
+                    f"    def which_{grp.safe_name}(self) -> str | None:",
+                    f"        return self._which_oneof(({cand_items},))",
+                    "",
+                ]
+            )
 
         lines.extend(
             [

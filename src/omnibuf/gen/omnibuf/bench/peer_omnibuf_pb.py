@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, ClassVar
+from typing import ClassVar
 
 from omnibuf._omnibuf_ext import CompiledCodec, OpaqueView
 from omnibuf.wire import Buffer
@@ -46,37 +46,37 @@ class OpaqueLocation(OpaqueView):
         return self._get_string(1)
 
     def set_region(self, val: str) -> None:
-        self._set_dirty(1, val)
+        self._set_string(1, val)
 
     def get_datacenter(self) -> str:
         return self._get_string(2)
 
     def set_datacenter(self, val: str) -> None:
-        self._set_dirty(2, val)
+        self._set_string(2, val)
 
     def get_city(self) -> str:
         return self._get_string(3)
 
     def set_city(self, val: str) -> None:
-        self._set_dirty(3, val)
+        self._set_string(3, val)
 
     def get_rack(self) -> int:
         return self._get_uint32(4)
 
     def set_rack(self, val: int) -> None:
-        self._set_dirty(4, val)
+        self._set_uint32(4, val)
 
     def get_latitude(self) -> float:
         return self._get_float32(5)
 
     def set_latitude(self, val: float) -> None:
-        self._set_dirty(5, val)
+        self._set_float32(5, val)
 
     def get_longitude(self) -> float:
         return self._get_float32(6)
 
     def set_longitude(self, val: float) -> None:
-        self._set_dirty(6, val)
+        self._set_float32(6, val)
 
     def marshal(
         self,
@@ -121,25 +121,25 @@ class OpaqueNeighbor(OpaqueView):
         return self._get_uint32(1)
 
     def set_peer_asn(self, val: int) -> None:
-        self._set_dirty(1, val)
+        self._set_uint32(1, val)
 
     def get_router(self) -> str:
         return self._get_string(2)
 
     def set_router(self, val: str) -> None:
-        self._set_dirty(2, val)
+        self._set_string(2, val)
 
     def get_latency_us(self) -> int:
         return self._get_uint32(3)
 
     def set_latency_us(self, val: int) -> None:
-        self._set_dirty(3, val)
+        self._set_uint32(3, val)
 
     def get_established(self) -> bool:
         return self._get_bool(4)
 
     def set_established(self, val: bool) -> None:
-        self._set_dirty(4, val)
+        self._set_bool(4, val)
 
     def marshal(
         self,
@@ -191,19 +191,19 @@ class OpaquePeerUpdate(OpaqueView):
         return self._get_uint32(1)
 
     def set_asn(self, val: int) -> None:
-        self._set_dirty(1, val)
+        self._set_uint32(1, val)
 
     def get_router_id(self) -> str:
         return self._get_string(2)
 
     def set_router_id(self, val: str) -> None:
-        self._set_dirty(2, val)
+        self._set_string(2, val)
 
     def get_active(self) -> bool:
         return self._get_bool(3)
 
     def set_active(self, val: bool) -> None:
-        self._set_dirty(3, val)
+        self._set_bool(3, val)
 
     def get_uptime_sec(self) -> int:
         return self._get_uint64(4)
@@ -215,13 +215,13 @@ class OpaquePeerUpdate(OpaqueView):
         return self._get_sint32(5)
 
     def set_rssi_dbm(self, val: int) -> None:
-        self._set_dirty(5, val)
+        self._set_sint32(5, val)
 
     def get_cpu_load(self) -> float:
         return self._get_float64(6)
 
     def set_cpu_load(self, val: float) -> None:
-        self._set_dirty(6, val)
+        self._set_float64(6, val)
 
     def get_tags(self) -> list[str]:
         return self._get_scalar_array(7, 10, 12)
@@ -235,13 +235,16 @@ class OpaquePeerUpdate(OpaqueView):
     def set_prefixes(self, val: list[int]) -> None:
         self._set_dirty(8, val)
 
+    def has_location(self) -> bool:
+        return self._has_field(9, 4096)
+
     def get_location(self) -> Location | None:
         return self._get_submsg(9, _CODEC_LOCATION)
 
     def opaque_location(self) -> OpaqueLocation | None:
         return self._opaque_sub(9, OpaqueLocation, _CODEC_LOCATION)
 
-    def set_location(self, val: Any) -> None:
+    def set_location(self, val: Location | None) -> None:
         self._set_dirty(9, val)
 
     def get_neighbors(self) -> list[Neighbor]:

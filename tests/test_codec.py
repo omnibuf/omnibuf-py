@@ -16,6 +16,7 @@ from omnibuf import (
     Decoder,
     Encoder,
     OmniBufDecodeError,
+    OmniBufEncodeError,
 )
 from omnibuf.wire import encode_tag, encode_varint
 
@@ -76,21 +77,29 @@ def test_decoder_enforces_max_container_depth() -> None:
             cur = cur.read_submsg_decoder()
 
 
-def test_decoder_skips_valid_wire_extended_and_rejects_high_subtype() -> None:
+def test_decoder_skips_valid_wire_extended_and_rejects_empty_payload() -> None:
     enc = Encoder()
-    enc.write_extended(4, 0x2A, b"\x11\x22\x33")
-    enc.write_uint32(5, 77)
+    enc.write_extended(4, 0x00, b"")
+    enc.write_extended(5, 0x80, b"\xaa")
+    enc.write_extended(6, 0xFF, b"\x11\x22\x33")
+    enc.write_uint32(7, 77)
     valid_pkt = enc.finish()
 
     dec = Decoder(valid_pkt)
-    tag = dec.read_tag()
-    assert tag == (4, WIRE_EXTENDED)
-    dec.skip_field(4, WIRE_EXTENDED)
-    assert dec.read_tag() == (5, WIRE_UINT)
+    for expected_fnum in (4, 5, 6):
+        tag = dec.read_tag()
+        assert tag == (expected_fnum, WIRE_EXTENDED)
+        dec.skip_field(expected_fnum, WIRE_EXTENDED)
+    assert dec.read_tag() == (7, WIRE_UINT)
     assert dec.read_uint32() == 77
 
-    invalid_pkt = encode_tag(4, WIRE_EXTENDED) + encode_varint(1) + bytes([0x80])
-    dec_bad = Decoder(invalid_pkt)
+    with pytest.raises(OmniBufEncodeError):
+        enc.write_extended(4, -1, b"")
+    with pytest.raises(OmniBufEncodeError):
+        enc.write_extended(4, 0x100, b"")
+
+    empty_ext_pkt = encode_tag(4, WIRE_EXTENDED) + encode_varint(0)
+    dec_bad = Decoder(empty_ext_pkt)
     bad_tag = dec_bad.read_tag()
     assert bad_tag == (4, WIRE_EXTENDED)
     with pytest.raises(OmniBufDecodeError):

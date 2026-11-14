@@ -1,4 +1,4 @@
-"""Single-pass OmniBuf v2.1 binary Encoder with dynamic container length backpatching."""
+"""Single-pass OmniBuf v0.1 binary Encoder with dynamic container length backpatching."""
 
 from __future__ import annotations
 
@@ -52,7 +52,7 @@ _F64_PACK = struct.Struct("<d").pack
 
 
 class Encoder:
-    """Single-pass OmniBuf v2.1 writer backed by a growable bytearray and container stack."""
+    """Single-pass OmniBuf v0.1 writer backed by a growable bytearray and container stack."""
 
     __slots__ = ("_buf", "_len_stack", "_count_stack")
 
@@ -235,9 +235,9 @@ class Encoder:
         self._buf.extend(val)
 
     def write_extended(self, field_num: int, ext_type: int, payload: Buffer) -> None:
-        if ext_type < 0 or ext_type > 0x7F:
+        if ext_type < 0 or ext_type > 0xFF:
             raise OmniBufEncodeError(
-                f"omnibuf: WireExtended subtype {ext_type} out of 0..127 range"
+                f"omnibuf: WireExtended subtype {ext_type} out of 0..255 range"
             )
         append_tag(self._buf, field_num, WIRE_EXTENDED)
         append_varint(self._buf, 1 + len(payload))

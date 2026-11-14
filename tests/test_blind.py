@@ -11,6 +11,7 @@ import pytest
 from omnibuf import (
     Encoder,
     OmniBufDecodeError,
+    OmniBufEncodeError,
     SchemaMeta,
     decode_blind,
     decode_blind_json,
@@ -81,8 +82,10 @@ def test_blind_json_nan_disallowed_by_default() -> None:
     decoded = decode_blind(pkt)
     assert math.isnan(decoded["field_1"])
 
-    with pytest.raises(ValueError):
+    with pytest.raises(OmniBufEncodeError):
         decode_blind_json(pkt, allow_nan=False)
+    assert decode_blind_json(pkt, allow_nan=True) == '{"field_1":NaN}'
+    assert decode_blind_json(pkt, allow_nan=False, fallback_on_non_finite=True) == "{}"
 
 
 def test_blind_rejects_wire_shape_conflict_and_name_collision() -> None:

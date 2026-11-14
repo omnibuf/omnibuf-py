@@ -24,7 +24,6 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "protobuf>=6.30.0",
     "protobuf-py>=0.7.0",
     "protobuf-py-ext>=0.7.0",
 ]
@@ -43,6 +42,7 @@ dev = [
     "msgpack>=1.1.0",
     "msgspec>=0.19.0",
     "mypy>=1.15.0",
+    "protobuf>=6.30.0",
     "protoc-gen-py>=0.7.0",
     "pytest>=8.3.0",
     "ruff>=0.11.0",

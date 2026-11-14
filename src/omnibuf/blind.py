@@ -21,15 +21,21 @@ def decode_blind_json(
     *,
     allow_nan: bool = False,
     indent: int | None = None,
+    fallback_on_non_finite: bool = False,
 ) -> str:
     """Decodes any OmniBuf packet without a schema and formats it as JSON.
 
     WireBytes values are encoded as standard Base64 strings. Float32 values use
     shortest round-tripping decimal formatting, and uint64/sint64 preserve full
-    64-bit integer precision. When allow_nan is False and a float field contains
-    NaN or Inf, raises ValueError unless handled by the caller.
+    64-bit integer precision. When allow_nan is False and fallback_on_non_finite is
+    False, raises OmniBufEncodeError on NaN or Inf float fields.
     """
-    return _omnibuf_ext.decode_blind_json_py(packet, allow_nan=allow_nan, indent=indent)
+    return _omnibuf_ext.decode_blind_json_py(
+        packet,
+        allow_nan=allow_nan,
+        indent=indent,
+        fallback_on_non_finite=fallback_on_non_finite,
+    )
 
 
 __all__ = [

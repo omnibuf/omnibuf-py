@@ -1,4 +1,4 @@
-"""Unit tests for OmniBuf v2.1 Prefix-Varint, ZigZag, UTF-8, float32, locate_field, and splice_fields."""
+"""Unit tests for OmniBuf v0.1 Prefix-Varint, ZigZag, UTF-8, float32, locate_field, and splice_fields."""
 
 from __future__ import annotations
 

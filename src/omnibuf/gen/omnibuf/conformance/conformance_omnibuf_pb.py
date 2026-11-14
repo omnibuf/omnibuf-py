@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, ClassVar
+from typing import ClassVar
 
 from omnibuf._omnibuf_ext import CompiledCodec, OpaqueView
 from omnibuf.wire import Buffer
@@ -61,55 +61,55 @@ class OpaqueConformanceRequest(OpaqueView):
         return self._get_string(1)
 
     def set_test_name(self, val: str) -> None:
-        self._set_dirty(1, val)
+        self._set_string(1, val)
 
     def get_message_type(self) -> str:
         return self._get_string(2)
 
     def set_message_type(self, val: str) -> None:
-        self._set_dirty(2, val)
+        self._set_string(2, val)
 
     def get_tier(self) -> int:
         return self._get_sint32(3)
 
     def set_tier(self, val: int) -> None:
-        self._set_dirty(3, val)
+        self._set_sint32(3, val)
 
     def get_requested_output_format(self) -> int:
         return self._get_sint32(4)
 
     def set_requested_output_format(self, val: int) -> None:
-        self._set_dirty(4, val)
+        self._set_sint32(4, val)
 
     def get_omnibuf_payload(self) -> bytes:
         return self._get_bytes(5)
 
     def set_omnibuf_payload(self, val: bytes) -> None:
-        self._set_dirty(5, val)
+        self._set_bytes(5, val)
 
     def get_json_payload(self) -> str:
         return self._get_string(6)
 
     def set_json_payload(self, val: str) -> None:
-        self._set_dirty(6, val)
+        self._set_string(6, val)
 
     def get_self_describing(self) -> bool:
         return self._get_bool(7)
 
     def set_self_describing(self, val: bool) -> None:
-        self._set_dirty(7, val)
+        self._set_bool(7, val)
 
     def get_test_opaque_splice(self) -> bool:
         return self._get_bool(8)
 
     def set_test_opaque_splice(self, val: bool) -> None:
-        self._set_dirty(8, val)
+        self._set_bool(8, val)
 
     def get_test_opaque_splice_shrink(self) -> bool:
         return self._get_bool(9)
 
     def set_test_opaque_splice_shrink(self, val: bool) -> None:
-        self._set_dirty(9, val)
+        self._set_bool(9, val)
 
     def marshal(
         self,
@@ -156,37 +156,37 @@ class OpaqueConformanceResponse(OpaqueView):
         return self._get_string(1)
 
     def set_parse_error(self, val: str) -> None:
-        self._set_dirty(1, val)
+        self._set_string(1, val)
 
     def get_serialize_error(self) -> str:
         return self._get_string(2)
 
     def set_serialize_error(self, val: str) -> None:
-        self._set_dirty(2, val)
+        self._set_string(2, val)
 
     def get_runtime_error(self) -> str:
         return self._get_string(3)
 
     def set_runtime_error(self, val: str) -> None:
-        self._set_dirty(3, val)
+        self._set_string(3, val)
 
     def get_skipped(self) -> str:
         return self._get_string(4)
 
     def set_skipped(self, val: str) -> None:
-        self._set_dirty(4, val)
+        self._set_string(4, val)
 
     def get_omnibuf_payload(self) -> bytes:
         return self._get_bytes(5)
 
     def set_omnibuf_payload(self, val: bytes) -> None:
-        self._set_dirty(5, val)
+        self._set_bytes(5, val)
 
     def get_json_payload(self) -> str:
         return self._get_string(6)
 
     def set_json_payload(self, val: str) -> None:
-        self._set_dirty(6, val)
+        self._set_string(6, val)
 
     def marshal(
         self,
@@ -231,25 +231,25 @@ class OpaqueAllTypesSubMsg(OpaqueView):
         return self._get_uint32(1)
 
     def set_id(self, val: int) -> None:
-        self._set_dirty(1, val)
+        self._set_uint32(1, val)
 
     def get_label(self) -> str:
         return self._get_string(2)
 
     def set_label(self, val: str) -> None:
-        self._set_dirty(2, val)
+        self._set_string(2, val)
 
     def get_flag(self) -> bool:
         return self._get_bool(3)
 
     def set_flag(self, val: bool) -> None:
-        self._set_dirty(3, val)
+        self._set_bool(3, val)
 
     def get_score(self) -> int:
         return self._get_sint64(4)
 
     def set_score(self, val: int) -> None:
-        self._set_dirty(4, val)
+        self._set_sint64(4, val)
 
     def marshal(
         self,
@@ -307,7 +307,7 @@ class OpaqueTestAllTypes(OpaqueView):
         return self._get_uint32(1)
 
     def set_f1_uint32(self, val: int) -> None:
-        self._set_dirty(1, val)
+        self._set_uint32(1, val)
 
     def get_f2_uint64(self) -> int:
         return self._get_uint64(2)
@@ -319,31 +319,34 @@ class OpaqueTestAllTypes(OpaqueView):
         return self._get_sint32(3)
 
     def set_f3_sint32(self, val: int) -> None:
-        self._set_dirty(3, val)
+        self._set_sint32(3, val)
 
     def get_f4_sint64(self) -> int:
         return self._get_sint64(4)
 
     def set_f4_sint64(self, val: int) -> None:
-        self._set_dirty(4, val)
+        self._set_sint64(4, val)
 
     def get_f5_bool(self) -> bool:
         return self._get_bool(5)
 
     def set_f5_bool(self, val: bool) -> None:
-        self._set_dirty(5, val)
+        self._set_bool(5, val)
 
     def get_f6_string(self) -> str:
         return self._get_string(6)
 
     def set_f6_string(self, val: str) -> None:
-        self._set_dirty(6, val)
+        self._set_string(6, val)
 
     def get_f7_bytes(self) -> bytes:
         return self._get_bytes(7)
 
     def set_f7_bytes(self, val: bytes) -> None:
-        self._set_dirty(7, val)
+        self._set_bytes(7, val)
+
+    def has_f8_sub_msg(self) -> bool:
+        return self._has_field(8, 4096)
 
     def get_f8_sub_msg(self) -> AllTypesSubMsg | None:
         return self._get_submsg(8, _CODEC_ALL_TYPES_SUB_MSG)
@@ -351,7 +354,7 @@ class OpaqueTestAllTypes(OpaqueView):
     def opaque_f8_sub_msg(self) -> OpaqueAllTypesSubMsg | None:
         return self._opaque_sub(8, OpaqueAllTypesSubMsg, _CODEC_ALL_TYPES_SUB_MSG)
 
-    def set_f8_sub_msg(self, val: Any) -> None:
+    def set_f8_sub_msg(self, val: AllTypesSubMsg | None) -> None:
         self._set_dirty(8, val)
 
     def get_f9_string_arr(self) -> list[str]:
@@ -382,31 +385,31 @@ class OpaqueTestAllTypes(OpaqueView):
         return self._get_float32(13)
 
     def set_f13_float32(self, val: float) -> None:
-        self._set_dirty(13, val)
+        self._set_float32(13, val)
 
     def get_f14_float64(self) -> float:
         return self._get_float64(14)
 
     def set_f14_float64(self, val: float) -> None:
-        self._set_dirty(14, val)
+        self._set_float64(14, val)
 
     def get_f15_fixed32(self) -> int:
         return self._get_fixed32(15)
 
     def set_f15_fixed32(self, val: int) -> None:
-        self._set_dirty(15, val)
+        self._set_fixed32(15, val)
 
     def get_f16_fixed64(self) -> int:
         return self._get_fixed64(16)
 
     def set_f16_fixed64(self, val: int) -> None:
-        self._set_dirty(16, val)
+        self._set_fixed64(16, val)
 
     def get_f20_overflow_str(self) -> str:
         return self._get_string(20)
 
     def set_f20_overflow_str(self, val: str) -> None:
-        self._set_dirty(20, val)
+        self._set_string(20, val)
 
     def marshal(
         self,

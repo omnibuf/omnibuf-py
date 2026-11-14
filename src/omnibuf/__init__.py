@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Any, overload
+from typing import TYPE_CHECKING, Any, overload
 
 import protobuf as pbpy
-from google.protobuf.message import Message as GpbMessage
+
+if TYPE_CHECKING:
+    from google.protobuf.message import Message as GpbMessage
 
 from ._omnibuf_ext import CompiledCodec, OpaqueView
 from .blind import decode_blind, decode_blind_json

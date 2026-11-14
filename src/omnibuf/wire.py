@@ -1,4 +1,4 @@
-"""Low-level OmniBuf v2.1 Prefix-Varint (TZCNT) primitives, wire constants, and O(1) skipping."""
+"""Low-level OmniBuf v0.1 Prefix-Varint (TZCNT) primitives, wire constants, and O(1) skipping."""
 
 from __future__ import annotations
 
@@ -405,7 +405,7 @@ def read_len_bytes(
 
 
 def is_valid_map_types(key_wt: int, val_wt: int) -> bool:
-    """Checks whether (key_wt, val_wt) are valid OmniBuf v2.1 WireMap header types."""
+    """Checks whether (key_wt, val_wt) are valid OmniBuf v0.1 WireMap header types."""
     return (
         key_wt in VALID_MAP_KEY_TYPES and 0 <= val_wt <= WIRE_EXTENDED and val_wt != WIRE_BOOL_TRUE
     )
@@ -580,7 +580,14 @@ def skip_validated_value(packet: Buffer, pos: int, wt: int, end: int | None = No
             rem = b_len - 1 - cw
             if rem < 0:
                 return -1
-            ok = (rem == 0) if cnt == 0 else (cnt <= rem)
+            if ewt == WIRE_BOOL_FALSE:
+                ok = rem == cnt
+            elif ewt in (WIRE_FIXED32, WIRE_SFIXED32, WIRE_FLOAT32):
+                ok = (rem & 3) == 0 and (rem >> 2) == cnt
+            elif ewt in (WIRE_FIXED64, WIRE_SFIXED64, WIRE_FLOAT64):
+                ok = (rem & 7) == 0 and (rem >> 3) == cnt
+            else:
+                ok = (rem == 0) if cnt == 0 else (cnt <= rem)
             return body_end if ok else -1
         if wt == WIRE_MAP:
             if b_len < 3:
@@ -602,7 +609,7 @@ def skip_validated_value(packet: Buffer, pos: int, wt: int, end: int | None = No
                 return -1
             ok = (rem == 0) if cnt == 0 else (cnt <= (rem >> 1))
             return body_end if ok else -1
-        return body_end if (b_len >= 1 and packet[body_start] < 0x80) else -1
+        return body_end if b_len >= 1 else -1
     return -1
 
 
@@ -695,11 +702,7 @@ def validate_value(
         return next_pos
 
     if wt == WIRE_EXTENDED:
-        ext_body, next_pos = read_len_slice(data, pos, 1, limit)
-        if ext_body[0] >= 0x80:
-            raise OmniBufDecodeError(
-                f"omnibuf: invalid WireExtended subtype 0x{ext_body[0]:02x} at byte {pos}"
-            )
+        _, next_pos = read_len_slice(data, pos, 1, limit)
         return next_pos
 
     next_pos = fast_skip_value(data, pos, wt, limit)
@@ -778,7 +781,7 @@ def _validate_schema_meta_body(body: memoryview, depth: int, limit_depth: int) -
                     raise OmniBufDecodeError("omnibuf: invalid field number in SchemaMeta.children")
                 p += kw
                 child_slice, p = read_len_slice(map_body, p, 0, len(map_body))
-                _validate_schema_meta_body(child_slice, depth + 1, limit_depth)
+                _validate_schema_meta_body(child_slice, depth + 2, limit_depth)
             if p != len(map_body):
                 raise OmniBufDecodeError("omnibuf: trailing bytes in SchemaMeta.children")
         else:

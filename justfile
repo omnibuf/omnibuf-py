@@ -37,7 +37,7 @@ lint:
 test:
     uv run pytest
 
-# Run the language-independent 584-case OmniBuf conformance suite across all 4 tiers
+# Run the language-independent 758-case OmniBuf conformance suite across all 4 tiers
 conformance:
     {{conformance_runner}} uv run python -m omnibuf.conformance
 

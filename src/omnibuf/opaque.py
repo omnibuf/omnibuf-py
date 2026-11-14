@@ -11,12 +11,12 @@ from ._omnibuf_ext import OpaqueView
 from .wire import (
     MAX_FIELD_NUMBER,
     MAX_NESTING_DEPTH,
-    TZCNT_WIDTH_TABLE,
     WIRE_ARRAY,
     WIRE_MAP,
     WIRE_SUB_MSG,
     Buffer,
     OmniBufDecodeError,
+    OmniBufEncodeError,
     SpliceField,
     decode_utf8_strict,
     decode_varint,
@@ -26,12 +26,11 @@ from .wire import (
     parse_array_header,
     parse_map_header,
     read_len_slice,
-    skip_validated_value,
-    skip_value,
     splice_fields,
     to_uint32,
     validate_field0_at,
     validate_message,
+    validate_value,
 )
 
 _U32_UNPACK = struct.Struct("<I").unpack_from
@@ -76,13 +75,12 @@ def opaque_get_submsg[T](
     while pos < n:
         b_start, b_end, pos = next_container_span(raw, pos, field_num, WIRE_SUB_MSG, 0)
         if b_start == -2:
-            return None
+            raise OmniBufDecodeError(
+                f"omnibuf: malformed packet while reading submsg field #{field_num}"
+            )
         if b_start == -1:
             break
-        try:
-            result = decode_fn(raw[b_start:b_end], result, 1, result is not None)
-        except OmniBufDecodeError:
-            return None
+        result = decode_fn(raw[b_start:b_end], result, 1, result is not None)
     return result
 
 
@@ -163,22 +161,21 @@ def opaque_get_scalar_array(
     while pos < n:
         b_start, b_end, pos = next_container_span(raw, pos, field_num, WIRE_ARRAY, 2)
         if b_start == -2:
-            return []
+            raise OmniBufDecodeError(
+                f"omnibuf: malformed packet while reading array field #{field_num}"
+            )
         if b_start == -1:
             break
         body_mv = memoryview(raw)[b_start:b_end]
         elem_wt, count, p, ok = parse_array_header(body_mv)
         if not ok or elem_wt != exp_elem_wt:
-            return []
+            raise OmniBufDecodeError(f"omnibuf: invalid WireArray header on field #{field_num}")
         end = len(body_mv)
-        try:
-            for _ in range(count):
-                val, p = _read_scalar_elem(body_mv, p, end, elem_kind)
-                out.append(val)
-        except OmniBufDecodeError:
-            return []
+        for _ in range(count):
+            val, p = _read_scalar_elem(body_mv, p, end, elem_kind)
+            out.append(val)
         if p != end:
-            return []
+            raise OmniBufDecodeError(f"omnibuf: trailing WireArray bytes on field #{field_num}")
     return out
 
 
@@ -193,22 +190,25 @@ def opaque_get_submsg_array[T](
     while pos < n:
         b_start, b_end, pos = next_container_span(raw, pos, field_num, WIRE_ARRAY, 2)
         if b_start == -2:
-            return []
+            raise OmniBufDecodeError(
+                f"omnibuf: malformed packet while reading submsg array field #{field_num}"
+            )
         if b_start == -1:
             break
         body = raw[b_start:b_end]
         elem_wt, count, p, ok = parse_array_header(body)
         if not ok or elem_wt != WIRE_SUB_MSG:
-            return []
+            raise OmniBufDecodeError(
+                f"omnibuf: invalid WireArray<WireSubMsg> header on field #{field_num}"
+            )
         end = len(body)
-        try:
-            for _ in range(count):
-                elem_mv, p = read_len_slice(body, p, 0, end)
-                out.append(decode_fn(elem_mv, None, 2, False))
-        except OmniBufDecodeError:
-            return []
+        for _ in range(count):
+            elem_mv, p = read_len_slice(body, p, 0, end)
+            out.append(decode_fn(elem_mv, None, 2, False))
         if p != end:
-            return []
+            raise OmniBufDecodeError(
+                f"omnibuf: trailing WireArray<WireSubMsg> bytes on field #{field_num}"
+            )
     return out
 
 
@@ -227,29 +227,57 @@ def opaque_get_map(
     while pos < n:
         b_start, b_end, pos = next_container_span(raw, pos, field_num, WIRE_MAP, 3)
         if b_start == -2:
-            return {}
+            raise OmniBufDecodeError(
+                f"omnibuf: malformed packet while reading map field #{field_num}"
+            )
         if b_start == -1:
             break
         body_mv = memoryview(raw)[b_start:b_end]
         key_wt, val_wt, count, p, ok = parse_map_header(body_mv)
         if not ok or key_wt != exp_key_wt or val_wt != exp_val_wt:
-            return {}
+            raise OmniBufDecodeError(f"omnibuf: invalid WireMap header on field #{field_num}")
         end = len(body_mv)
-        try:
-            for _ in range(count):
-                k, p = _read_scalar_elem(body_mv, p, end, key_kind)
-                if val_kind == "submsg":
-                    assert sub_decode_fn is not None
-                    v_mv, p = read_len_slice(body_mv, p, 0, end)
-                    out[k] = sub_decode_fn(v_mv, None, 2, False)
-                else:
-                    v, p = _read_scalar_elem(body_mv, p, end, val_kind)
-                    out[k] = v
-        except OmniBufDecodeError:
-            return {}
+        for _ in range(count):
+            k, p = _read_scalar_elem(body_mv, p, end, key_kind)
+            if val_kind == "submsg":
+                assert sub_decode_fn is not None
+                v_mv, p = read_len_slice(body_mv, p, 0, end)
+                out[k] = sub_decode_fn(v_mv, None, 2, False)
+            else:
+                v, p = _read_scalar_elem(body_mv, p, end, val_kind)
+                out[k] = v
         if p != end:
-            return {}
+            raise OmniBufDecodeError(f"omnibuf: trailing WireMap bytes on field #{field_num}")
     return out
+
+
+def _normalize_dirty_set(dirty_nums: set[int] | int) -> set[int]:
+    if isinstance(dirty_nums, bool):
+        raise OmniBufEncodeError("omnibuf: dirty_nums cannot be bool")
+    if isinstance(dirty_nums, int):
+        if dirty_nums < 0:
+            raise OmniBufEncodeError(f"omnibuf: negative dirty_nums bitmask {dirty_nums}")
+        if dirty_nums & 1:
+            raise OmniBufEncodeError("omnibuf: Field #0 cannot be spliced via dirty_nums")
+        if dirty_nums == 0:
+            return set()
+        if (dirty_nums.bit_length() - 1) > MAX_FIELD_NUMBER:
+            raise OmniBufEncodeError("omnibuf: dirty_nums field number exceeds MAX_FIELD_NUMBER")
+        out: set[int] = set()
+        rem = dirty_nums
+        while rem:
+            lsb = rem & -rem
+            out.add(lsb.bit_length() - 1)
+            rem ^= lsb
+        return out
+    out_set: set[int] = set()
+    for item in dirty_nums:
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise OmniBufEncodeError(f"omnibuf: invalid splice field number {item!r}")
+        if item <= 0 or item > MAX_FIELD_NUMBER:
+            raise OmniBufEncodeError(f"omnibuf: invalid splice field number {item}")
+        out_set.add(item)
+    return out_set
 
 
 def splice_dirty_fields(
@@ -259,7 +287,8 @@ def splice_dirty_fields(
     encode_one_field: Callable[[bytearray, int], None],
 ) -> bytes:
     """Fast single-pass field splicer used by Opaque<Message>.marshal()."""
-    if not dirty_nums:
+    dirty_set = _normalize_dirty_set(dirty_nums)
+    if not dirty_set:
         validate_message(src_packet)
         if dst_prefix is None:
             return bytes(src_packet)
@@ -268,113 +297,6 @@ def splice_dirty_fields(
         return bytes(out)
 
     n = len(src_packet)
-    tz_widths = TZCNT_WIDTH_TABLE
-
-    single_fnum = -1
-    if isinstance(dirty_nums, int):
-        if (dirty_nums & (dirty_nums - 1)) == 0:
-            single_fnum = dirty_nums.bit_length() - 1
-    elif len(dirty_nums) == 1:
-        single_fnum = next(iter(dirty_nums))
-
-    # Zero-list/dict/set fast path when mutating a single field (the common case).
-    if single_fnum >= 0:
-        target_fnum = single_fnum
-        pos = 0
-        match_count = 0
-        only_start = -1
-        only_end = -1
-        while pos < n:
-            f_start = pos
-            b0 = src_packet[pos]
-            if b0 & 1:
-                fnum = b0 >> 5
-                wt = (b0 >> 1) & 0x0F
-                pos += 1
-            elif b0 & 2:
-                if pos + 2 > n:
-                    raise OmniBufDecodeError(f"omnibuf: truncated tag at byte {pos}")
-                u16 = (b0 | (src_packet[pos + 1] << 8)) >> 2
-                fnum = u16 >> 4
-                wt = u16 & 0x0F
-                pos += 2
-            else:
-                tag, tn = decode_varint(src_packet, pos, n)
-                if tn == 0 or (tag >> 4) > MAX_FIELD_NUMBER:
-                    raise OmniBufDecodeError(f"omnibuf: invalid tag at byte {pos}")
-                fnum = tag >> 4
-                wt = tag & 0x0F
-                pos += tn
-
-            if fnum == 0:
-                next_pos = validate_field0_at(src_packet, pos, wt, 0, MAX_NESTING_DEPTH, n)
-            elif wt <= 1:
-                if pos >= n:
-                    raise OmniBufDecodeError(f"omnibuf: truncated varint at byte {pos}")
-                w = tz_widths[src_packet[pos]]
-                if w == 0 or pos + w > n:
-                    raise OmniBufDecodeError(f"omnibuf: invalid varint at byte {pos}")
-                next_pos = pos + w
-            elif wt <= 3:
-                next_pos = pos
-            elif wt <= 9:
-                next_pos = pos + (4 << (wt & 1))
-                if next_pos > n:
-                    raise OmniBufDecodeError(f"omnibuf: truncated fixed value at byte {pos}")
-            elif wt <= 12:
-                if pos >= n:
-                    raise OmniBufDecodeError(f"omnibuf: truncated length at byte {pos}")
-                lb0 = src_packet[pos]
-                if lb0 & 1:
-                    next_pos = pos + 1 + (lb0 >> 1)
-                elif lb0 & 2:
-                    if pos + 2 > n:
-                        raise OmniBufDecodeError(f"omnibuf: truncated length at byte {pos}")
-                    next_pos = pos + 2 + ((lb0 | (src_packet[pos + 1] << 8)) >> 2)
-                else:
-                    b_len, bn = decode_varint(src_packet, pos, n)
-                    if bn == 0:
-                        raise OmniBufDecodeError(f"omnibuf: invalid length at byte {pos}")
-                    next_pos = pos + bn + b_len
-                if next_pos > n:
-                    raise OmniBufDecodeError(f"omnibuf: payload out of bounds at byte {pos}")
-            else:
-                next_pos = skip_validated_value(src_packet, pos, wt, n)
-                if next_pos < 0:
-                    raise OmniBufDecodeError(f"omnibuf: invalid container header at byte {pos}")
-
-            if fnum == target_fnum:
-                match_count += 1
-                only_start = f_start
-                only_end = next_pos
-            pos = next_pos
-
-        if match_count == 0:
-            out = bytearray(dst_prefix) if dst_prefix is not None else bytearray()
-            out.extend(src_packet)
-            encode_one_field(out, target_fnum)
-            return bytes(out)
-        if match_count == 1:
-            out = bytearray(dst_prefix) if dst_prefix is not None else bytearray()
-            if only_start > 0:
-                out.extend(src_packet[:only_start])
-            encode_one_field(out, target_fnum)
-            if only_end < n:
-                out.extend(src_packet[only_end:])
-            return bytes(out)
-
-    dirty_set: set[int]
-    if isinstance(dirty_nums, int):
-        dirty_set = set()
-        rem_mask = dirty_nums
-        while rem_mask:
-            lsb = rem_mask & -rem_mask
-            dirty_set.add(lsb.bit_length() - 1)
-            rem_mask ^= lsb
-    else:
-        dirty_set = dirty_nums
-
-    # Multi-field or duplicate-field fallback scan tracking spans to replace at last occurrence.
     out = bytearray(dst_prefix) if dst_prefix is not None else bytearray()
     spans: list[tuple[int, int, int]] = []
     last_idx: dict[int, int] = {}
@@ -404,7 +326,7 @@ def splice_dirty_fields(
         if fnum == 0:
             next_pos = validate_field0_at(src_packet, pos, wt, 0, MAX_NESTING_DEPTH, n)
         else:
-            next_pos = skip_value(src_packet, pos, wt, n)
+            next_pos = validate_value(src_packet, pos, wt, 0, MAX_NESTING_DEPTH, n)
         idx = len(spans)
         spans.append((fnum, f_start, next_pos))
         if fnum in dirty_set:

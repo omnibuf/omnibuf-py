@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import ast
 import dataclasses
+import enum
 import sys
+import threading
 import types
 import typing
 from collections.abc import Callable
@@ -73,6 +76,20 @@ Float32 = Annotated[float, _WireHint("float32")]
 Float64 = Annotated[float, _WireHint("float64")]
 
 _META_KEY = "omnibuf"
+_INT_ALIAS_NAMES = frozenset(
+    {
+        "int",
+        "Uint32",
+        "Uint64",
+        "Sint32",
+        "Sint64",
+        "Fixed32",
+        "Sfixed32",
+        "Fixed64",
+        "Sfixed64",
+    }
+)
+_FLOAT_ALIAS_NAMES = frozenset({"float", "Float32", "Float64"})
 
 
 @dataclass(slots=True, frozen=True)
@@ -142,7 +159,7 @@ def omnibuf_field(
     omitempty: bool = False,
 ) -> Any:
     """Declares an OmniBuf field number and optional wire overrides on a dataclass field."""
-    if field_num <= 0 or field_num > MAX_FIELD_NUMBER:
+    if isinstance(field_num, bool) or field_num <= 0 or field_num > MAX_FIELD_NUMBER:
         raise ValueError(f"omnibuf: invalid field number {field_num}")
     info = FieldInfo(
         field_num=field_num,
@@ -163,6 +180,7 @@ def omnibuf_field(
     return dataclasses.field(metadata=meta)
 
 
+_CODEC_LOCK = threading.RLock()
 _REGISTERED_TYPES: dict[str, type[Any]] = {}
 _CODEC_CACHE: dict[type[Any], _StructCodec] = {}
 _RUST_CODEC_CACHE: dict[type[Any], CompiledCodec[Any]] = {}
@@ -170,45 +188,159 @@ _BUILDING_CODECS: dict[type[Any], _StructCodec] = {}
 _PENDING_FINALIZE: list[_StructCodec] = []
 
 
-def _apply_default_if_missing(cls: type[Any]) -> None:
+def _is_int_enum_type(tp: Any) -> typing.TypeGuard[type[enum.Enum]]:
+    if not (isinstance(tp, type) and issubclass(tp, enum.Enum)):
+        return False
+    if issubclass(tp, int) and not issubclass(tp, bool):
+        return True
+    members = list(tp)
+    if not members:
+        return False
+    return all(isinstance(m.value, int) and not isinstance(m.value, bool) for m in members)
+
+
+def _default_for_enum(enum_cls: type[enum.Enum]) -> Any:
+    vmap = getattr(enum_cls, "_value2member_map_", {})
+    if 0 in vmap:
+        return vmap[0]
+    members = list(enum_cls)
+    return members[0] if members else 0
+
+
+def _ast_terminal_name(node: ast.expr) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
+
+
+def _ast_is_none(node: ast.expr) -> bool:
+    return (isinstance(node, ast.Constant) and node.value is None) or (
+        isinstance(node, ast.Name) and node.id == "None"
+    )
+
+
+def _ast_flatten_bitor(node: ast.expr) -> list[ast.expr]:
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        return _ast_flatten_bitor(node.left) + _ast_flatten_bitor(node.right)
+    return [node]
+
+
+def _infer_ast_default(
+    node: ast.expr,
+    mod_ns: dict[str, Any],
+) -> tuple[bool, Any, Callable[[], Any] | None]:
+    if _ast_is_none(node):
+        return True, None, None
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        parts = _ast_flatten_bitor(node)
+        if any(_ast_is_none(p) for p in parts):
+            return True, None, None
+        return False, MISSING, None
+    if isinstance(node, ast.Subscript):
+        head = _ast_terminal_name(node.value)
+        if head == "Optional":
+            return True, None, None
+        if head == "Union":
+            elts = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+            if any(_ast_is_none(e) for e in elts):
+                return True, None, None
+            return False, MISSING, None
+        if head in ("list", "List"):
+            return True, MISSING, list
+        if head in ("dict", "Dict"):
+            return True, MISSING, dict
+        if head == "Annotated":
+            first = node.slice.elts[0] if isinstance(node.slice, ast.Tuple) else node.slice
+            return _infer_ast_default(first, mod_ns)
+        return False, MISSING, None
+
+    ident = _ast_terminal_name(node)
+    if ident is None:
+        return False, MISSING, None
+    if ident == "bool":
+        return True, False, None
+    if ident == "str":
+        return True, "", None
+    if ident in ("bytes", "bytearray"):
+        return True, b"", None
+    if ident in _FLOAT_ALIAS_NAMES:
+        return True, 0.0, None
+    if ident in _INT_ALIAS_NAMES:
+        return True, 0, None
+    resolved = mod_ns.get(ident)
+    if _is_int_enum_type(resolved):
+        return True, _default_for_enum(resolved), None
+    return False, MISSING, None
+
+
+def _infer_runtime_default(raw_ann: Any) -> tuple[bool, Any, Callable[[], Any] | None]:
+    unwrapped, is_opt = _unwrap_optional(raw_ann)
+    if is_opt or unwrapped is type(None):
+        return True, None, None
+    base, _ = _unwrap_annotated(unwrapped)
+    origin = typing.get_origin(base)
+    if origin is list or base is list:
+        return True, MISSING, list
+    if origin is dict or base is dict:
+        return True, MISSING, dict
+    if base is bool:
+        return True, False, None
+    if base is str:
+        return True, "", None
+    if base in (bytes, bytearray):
+        return True, b"", None
+    if base is float:
+        return True, 0.0, None
+    if base is int and not isinstance(base, bool):
+        return True, 0, None
+    if _is_int_enum_type(base):
+        return True, _default_for_enum(base), None
+    return False, MISSING, None
+
+
+def _apply_default_if_missing(
+    cls: type[Any],
+    extra_ns: dict[str, Any] | None = None,
+) -> None:
     """Allows @omnibuf_message classes to omit boilerplate default=0 / default_factory=list."""
     annotations = getattr(cls, "__annotations__", None)
     if not annotations:
         return
-    for attr_name in annotations:
+    mod = sys.modules.get(cls.__module__)
+    mod_ns: dict[str, Any] = dict(vars(mod)) if mod is not None else {}
+    if extra_ns:
+        mod_ns.update(extra_ns)
+
+    for attr_name, raw_ann in annotations.items():
         if attr_name not in cls.__dict__:
             continue
         val = cls.__dict__[attr_name]
-        if isinstance(val, Field) and val.default is MISSING and val.default_factory is MISSING:
-            raw_ann = annotations[attr_name]
-            ann_str = raw_ann if isinstance(raw_ann, str) else repr(raw_ann)
+        if not (
+            isinstance(val, Field) and val.default is MISSING and val.default_factory is MISSING
+        ):
+            continue
+
+        matched = False
+        def_val: Any = MISSING
+        def_fac: Callable[[], Any] | None = None
+        if isinstance(raw_ann, str):
+            try:
+                parsed = ast.parse(raw_ann, mode="eval").body
+            except SyntaxError:
+                parsed = None
+            if parsed is not None:
+                matched, def_val, def_fac = _infer_ast_default(parsed, mod_ns)
+        else:
+            matched, def_val, def_fac = _infer_runtime_default(raw_ann)
+
+        if matched:
             meta = dict(val.metadata)
-            if "None" in ann_str:
-                setattr(cls, attr_name, dataclasses.field(default=None, metadata=meta))
-            elif ann_str.startswith(("list[", "typing.List[", "List[")):
-                setattr(cls, attr_name, dataclasses.field(default_factory=list, metadata=meta))
-            elif ann_str.startswith(("dict[", "typing.Dict[", "Dict[")):
-                setattr(cls, attr_name, dataclasses.field(default_factory=dict, metadata=meta))
-            elif raw_ann is bool or ann_str == "bool":
-                setattr(cls, attr_name, dataclasses.field(default=False, metadata=meta))
-            elif raw_ann is str or ann_str == "str":
-                setattr(cls, attr_name, dataclasses.field(default="", metadata=meta))
-            elif raw_ann in (bytes, bytearray) or ann_str in ("bytes", "bytearray"):
-                setattr(cls, attr_name, dataclasses.field(default=b"", metadata=meta))
-            elif raw_ann is float or ann_str in ("float", "Float32", "Float64"):
-                setattr(cls, attr_name, dataclasses.field(default=0.0, metadata=meta))
-            elif raw_ann is int or ann_str in (
-                "int",
-                "Uint32",
-                "Uint64",
-                "Sint32",
-                "Sint64",
-                "Fixed32",
-                "Sfixed32",
-                "Fixed64",
-                "Sfixed64",
-            ):
-                setattr(cls, attr_name, dataclasses.field(default=0, metadata=meta))
+            if def_fac is not None:
+                setattr(cls, attr_name, dataclasses.field(default_factory=def_fac, metadata=meta))
+            else:
+                setattr(cls, attr_name, dataclasses.field(default=def_val, metadata=meta))
 
 
 @overload
@@ -244,13 +376,31 @@ def omnibuf_message(
 ) -> Any:
     """Marks a dataclass as an OmniBuf message (automatically applying @dataclass if needed)."""
     resolved_name = cls_or_name if isinstance(cls_or_name, str) else type_name
+    caller_locals: dict[str, Any] | None = None
+    try:
+        frame = sys._getframe(1)
+        if frame.f_locals is not frame.f_globals:
+            caller_locals = dict(frame.f_locals)
+    except ValueError:
+        caller_locals = None
 
     def wrap(target: type[Any]) -> type[Any]:
+        local_snap = caller_locals
+        if local_snap is None:
+            try:
+                w_frame = sys._getframe(1)
+                if w_frame.f_locals is not w_frame.f_globals:
+                    local_snap = dict(w_frame.f_locals)
+            except ValueError:
+                local_snap = None
         if not dataclasses.is_dataclass(target):
-            _apply_default_if_missing(target)
+            _apply_default_if_missing(target, local_snap)
             target = dataclass(slots=slots)(target)
+        if local_snap is not None:
+            setattr(target, "__omnibuf_localns__", local_snap)  # noqa: B010
         setattr(target, "__omnibuf_type_name__", resolved_name or target.__name__)  # noqa: B010
-        _REGISTERED_TYPES[target.__name__] = target
+        with _CODEC_LOCK:
+            _REGISTERED_TYPES[target.__name__] = target
         return target
 
     if isinstance(cls_or_name, type):
@@ -288,54 +438,64 @@ def _unwrap_optional(tp: Any) -> tuple[Any, bool]:
     return tp, False
 
 
-def _scalar_spec(py_type: Any, wire_opt: WireName | None) -> tuple[str, int]:
-    """Maps (Python scalar type, optional wire override) to (scalar_kind, wire_type)."""
+def _scalar_spec_ext(
+    py_type: Any,
+    wire_opt: WireName | None,
+) -> tuple[str, int, type[Any] | None]:
+    """Maps (Python scalar/enum type, optional wire override) to (scalar_kind, wire_type, enum_cls)."""
     base, ann_wire = _unwrap_annotated(py_type)
     eff = wire_opt or ann_wire
 
     if base is bool:
         if eff not in (None, "bool"):
             raise OmniBufEncodeError(f"omnibuf: invalid wire override {eff!r} for bool")
-        return "bool", WIRE_BOOL_FALSE
+        return "bool", WIRE_BOOL_FALSE, None
 
     if base is str:
         if eff in (None, "string"):
-            return "string", WIRE_STRING
+            return "string", WIRE_STRING, None
         if eff == "bytes":
-            return "str_as_bytes", WIRE_BYTES
+            return "str_as_bytes", WIRE_BYTES, None
         raise OmniBufEncodeError(f"omnibuf: invalid wire override {eff!r} for str")
 
     if base in (bytes, bytearray):
         if eff in (None, "bytes"):
-            return "bytes", WIRE_BYTES
+            return "bytes", WIRE_BYTES, None
         if eff == "string":
-            return "bytes_as_str", WIRE_STRING
+            return "bytes_as_str", WIRE_STRING, None
         raise OmniBufEncodeError(f"omnibuf: invalid wire override {eff!r} for bytes")
 
     if base is float:
         if eff == "float32":
-            return "float32", WIRE_FLOAT32
+            return "float32", WIRE_FLOAT32, None
         if eff in (None, "float64"):
-            return "float64", WIRE_FLOAT64
+            return "float64", WIRE_FLOAT64, None
         raise OmniBufEncodeError(f"omnibuf: invalid wire override {eff!r} for float")
+
+    if isinstance(base, type) and issubclass(base, enum.Enum):
+        if not _is_int_enum_type(base):
+            raise OmniBufEncodeError(f"omnibuf: enum {base!r} must have integer member values")
+        if eff not in (None, "sint", "sint32"):
+            raise OmniBufEncodeError(f"omnibuf: invalid wire override {eff!r} for enum {base!r}")
+        return "enum", WIRE_SINT, base
 
     if base is int:
         if eff == "uint32":
-            return "uint32", WIRE_UINT
+            return "uint32", WIRE_UINT, None
         if eff in ("uint", "uint64"):
-            return "uint64", WIRE_UINT
+            return "uint64", WIRE_UINT, None
         if eff == "sint32":
-            return "sint32", WIRE_SINT
+            return "sint32", WIRE_SINT, None
         if eff in (None, "sint", "sint64"):
-            return "sint64", WIRE_SINT
+            return "sint64", WIRE_SINT, None
         if eff == "fixed32":
-            return "fixed32", WIRE_FIXED32
+            return "fixed32", WIRE_FIXED32, None
         if eff == "sfixed32":
-            return "sfixed32", WIRE_SFIXED32
+            return "sfixed32", WIRE_SFIXED32, None
         if eff == "fixed64":
-            return "fixed64", WIRE_FIXED64
+            return "fixed64", WIRE_FIXED64, None
         if eff == "sfixed64":
-            return "sfixed64", WIRE_SFIXED64
+            return "sfixed64", WIRE_SFIXED64, None
         raise OmniBufEncodeError(f"omnibuf: invalid wire override {eff!r} for int")
 
     raise OmniBufEncodeError(f"omnibuf: unsupported scalar type {py_type!r}")
@@ -351,14 +511,13 @@ class _FieldCodec:
     wire_type: int
     optional: bool
     omitempty: bool
+    enum_cls: type[Any] | None = None
     elem_kind: str = ""
     elem_wt: int = 0
-    elem_optional: bool = False
     key_kind: str = ""
     key_wt: int = 0
     val_kind: str = ""
     val_wt: int = 0
-    val_optional: bool = False
     sub_type: type[Any] | None = None
     sub_codec: _StructCodec | None = None
     default_val: Any = None
@@ -417,6 +576,8 @@ class _StructCodec:
                 "skip_if_none": fc.optional,
                 "omitempty": fc.omitempty,
             }
+            if fc.enum_cls is not None:
+                spec["enum_cls"] = fc.enum_cls
             if fc.kind == "submsg":
                 assert fc.sub_codec is not None
                 spec["sub_codec"] = fc.sub_codec.rust_codec
@@ -465,8 +626,13 @@ class _StructCodec:
 
 def _resolve_type_hints(cls: type[Any]) -> dict[str, Any]:
     mod = sys.modules.get(cls.__module__)
-    globalns: dict[str, Any] = dict(vars(mod)) if mod is not None else {}
-    localns: dict[str, Any] = dict(_REGISTERED_TYPES)
+    globalns: dict[str, Any] = dict(_REGISTERED_TYPES)
+    if mod is not None:
+        globalns.update(vars(mod))
+    localns: dict[str, Any] = {}
+    saved_locals = getattr(cls, "__omnibuf_localns__", None)
+    if isinstance(saved_locals, dict):
+        localns.update(saved_locals)
     localns[cls.__name__] = cls
     return typing.get_type_hints(cls, globalns=globalns, localns=localns, include_extras=True)
 
@@ -475,246 +641,271 @@ def _get_struct_codec(cls: type[Any]) -> _StructCodec:
     cached = _CODEC_CACHE.get(cls)
     if cached is not None:
         return cached
-    in_progress = _BUILDING_CODECS.get(cls)
-    if in_progress is not None:
-        return in_progress
-    if not dataclasses.is_dataclass(cls):
-        raise OmniBufEncodeError(f"omnibuf: {cls!r} is not an @omnibuf_message / @dataclass")
+    with _CODEC_LOCK:
+        cached = _CODEC_CACHE.get(cls)
+        if cached is not None:
+            return cached
+        in_progress = _BUILDING_CODECS.get(cls)
+        if in_progress is not None:
+            return in_progress
+        if not dataclasses.is_dataclass(cls):
+            raise OmniBufEncodeError(f"omnibuf: {cls!r} is not an @omnibuf_message / @dataclass")
 
-    dc_fields = dataclasses.fields(cls)
-    all_annotated = all(isinstance(f.metadata.get(_META_KEY), FieldInfo) for f in dc_fields)
-    slots_val = getattr(cls, "__slots__", ())
-    has_dict_slot = "__dict__" in (slots_val if isinstance(slots_val, tuple) else (slots_val,))
-    req_fast = (
-        "__slots__" in cls.__dict__
-        and not has_dict_slot
-        and not hasattr(cls, "__post_init__")
-        and cls.__bases__ == (object,)
-        and all_annotated
-    )
+        dc_fields = dataclasses.fields(cls)
+        all_annotated = all(isinstance(f.metadata.get(_META_KEY), FieldInfo) for f in dc_fields)
+        slots_val = getattr(cls, "__slots__", ())
+        has_dict_slot = "__dict__" in (slots_val if isinstance(slots_val, tuple) else (slots_val,))
+        req_fast = (
+            "__slots__" in cls.__dict__
+            and not has_dict_slot
+            and not hasattr(cls, "__post_init__")
+            and cls.__bases__ == (object,)
+            and all_annotated
+        )
 
-    type_name = getattr(cls, "__omnibuf_type_name__", cls.__name__)
-    is_root = not _BUILDING_CODECS
-    sc = _StructCodec(cls, str(type_name), fast_alloc=req_fast)
-    _BUILDING_CODECS[cls] = sc
-    try:
-        hints = _resolve_type_hints(cls)
-        compiled: list[_FieldCodec] = []
-        seen_nums: set[int] = set()
+        type_name = getattr(cls, "__omnibuf_type_name__", cls.__name__)
+        is_root = not _BUILDING_CODECS
+        sc = _StructCodec(cls, str(type_name), fast_alloc=req_fast)
+        _BUILDING_CODECS[cls] = sc
+        try:
+            hints = _resolve_type_hints(cls)
+            compiled: list[_FieldCodec] = []
+            seen_nums: set[int] = set()
 
-        for dc_f in dc_fields:
-            info = dc_f.metadata.get(_META_KEY)
-            if not isinstance(info, FieldInfo):
-                continue
-            fnum = info.field_num
-            if fnum in seen_nums:
-                raise OmniBufEncodeError(
-                    f"omnibuf: duplicate field number {fnum} on {cls.__name__}"
-                )
-            seen_nums.add(fnum)
-
-            wire_name = info.name or dc_f.name
-            raw_tp = hints.get(dc_f.name, dc_f.type)
-            unwrapped_opt, is_opt = _unwrap_optional(raw_tp)
-            base_tp, ann_wire = _unwrap_annotated(unwrapped_opt)
-            origin = typing.get_origin(base_tp)
-
-            def_val = None if dc_f.default is MISSING else dc_f.default
-            def_fac = None if dc_f.default_factory is MISSING else dc_f.default_factory
-
-            if origin is list:
-                args = typing.get_args(base_tp)
-                if len(args) != 1:
+            for dc_f in dc_fields:
+                info = dc_f.metadata.get(_META_KEY)
+                if not isinstance(info, FieldInfo):
+                    continue
+                fnum = info.field_num
+                if fnum in seen_nums:
                     raise OmniBufEncodeError(
-                        f"omnibuf: list field {dc_f.name} requires element type"
+                        f"omnibuf: duplicate field number {fnum} on {cls.__name__}"
                     )
-                elem_raw = args[0]
-                elem_no_opt, elem_is_opt = _unwrap_optional(elem_raw)
-                elem_base, elem_ann_wire = _unwrap_annotated(elem_no_opt)
-                if isinstance(elem_base, type) and dataclasses.is_dataclass(elem_base):
-                    sub_sc = _get_struct_codec(elem_base)
+                seen_nums.add(fnum)
+
+                wire_name = info.name or dc_f.name
+                raw_tp = hints.get(dc_f.name, dc_f.type)
+                unwrapped_opt, is_opt = _unwrap_optional(raw_tp)
+                base_tp, ann_wire = _unwrap_annotated(unwrapped_opt)
+                origin = typing.get_origin(base_tp)
+
+                def_val = None if dc_f.default is MISSING else dc_f.default
+                def_fac = None if dc_f.default_factory is MISSING else dc_f.default_factory
+
+                if origin is list:
+                    args = typing.get_args(base_tp)
+                    if len(args) != 1:
+                        raise OmniBufEncodeError(
+                            f"omnibuf: list field {dc_f.name} requires element type"
+                        )
+                    elem_raw = args[0]
+                    elem_no_opt, elem_is_opt = _unwrap_optional(elem_raw)
+                    if elem_is_opt or elem_no_opt is type(None):
+                        raise OmniBufEncodeError(
+                            f"omnibuf: Optional list elements are not supported on {cls.__name__}.{dc_f.name}"
+                        )
+                    elem_base, elem_ann_wire = _unwrap_annotated(elem_no_opt)
+                    if isinstance(elem_base, type) and dataclasses.is_dataclass(elem_base):
+                        sub_sc = _get_struct_codec(elem_base)
+                        fc = _FieldCodec(
+                            index=len(compiled),
+                            attr=dc_f.name,
+                            field_num=fnum,
+                            wire_name=wire_name,
+                            kind="array_submsg",
+                            wire_type=WIRE_ARRAY,
+                            optional=is_opt,
+                            omitempty=info.omitempty,
+                            elem_kind="submsg",
+                            elem_wt=WIRE_SUB_MSG,
+                            sub_type=elem_base,
+                            sub_codec=sub_sc,
+                            default_val=def_val,
+                            default_factory=def_fac,
+                        )
+                    else:
+                        eff_elem_wire = (
+                            info.elem_wire
+                            or (info.wire if info.wire not in (None, "array") else None)
+                            or elem_ann_wire
+                        )
+                        e_kind, e_wt, e_enum = _scalar_spec_ext(elem_base, eff_elem_wire)
+                        fc = _FieldCodec(
+                            index=len(compiled),
+                            attr=dc_f.name,
+                            field_num=fnum,
+                            wire_name=wire_name,
+                            kind="array_scalar",
+                            wire_type=WIRE_ARRAY,
+                            optional=is_opt,
+                            omitempty=info.omitempty,
+                            enum_cls=e_enum,
+                            elem_kind=e_kind,
+                            elem_wt=e_wt,
+                            default_val=def_val,
+                            default_factory=def_fac,
+                        )
+                elif origin is dict:
+                    args = typing.get_args(base_tp)
+                    if len(args) != 2:
+                        raise OmniBufEncodeError(
+                            f"omnibuf: dict field {dc_f.name} requires [K, V] types"
+                        )
+                    k_raw, v_raw = args
+                    k_no_opt, k_is_opt = _unwrap_optional(k_raw)
+                    if k_is_opt or k_no_opt is type(None):
+                        raise OmniBufEncodeError(
+                            f"omnibuf: Optional map keys are not supported on {cls.__name__}.{dc_f.name}"
+                        )
+                    k_base, k_ann = _unwrap_annotated(k_no_opt)
+                    if isinstance(k_base, type) and issubclass(k_base, enum.Enum):
+                        raise OmniBufEncodeError(
+                            f"omnibuf: enum map keys are not supported on {cls.__name__}.{dc_f.name}"
+                        )
+                    k_kind, k_wt, _ = _scalar_spec_ext(k_base, info.key_wire or k_ann)
+                    if k_wt not in (
+                        WIRE_UINT,
+                        WIRE_SINT,
+                        WIRE_BOOL_FALSE,
+                        WIRE_FIXED32,
+                        WIRE_FIXED64,
+                        WIRE_SFIXED32,
+                        WIRE_SFIXED64,
+                        WIRE_STRING,
+                    ):
+                        raise OmniBufEncodeError(
+                            f"omnibuf: invalid map key wire type {k_wt} on {dc_f.name}"
+                        )
+                    v_no_opt, v_is_opt = _unwrap_optional(v_raw)
+                    if v_is_opt or v_no_opt is type(None):
+                        raise OmniBufEncodeError(
+                            f"omnibuf: Optional map values are not supported on {cls.__name__}.{dc_f.name}"
+                        )
+                    v_base, v_ann = _unwrap_annotated(v_no_opt)
+                    if isinstance(v_base, type) and dataclasses.is_dataclass(v_base):
+                        sub_sc = _get_struct_codec(v_base)
+                        fc = _FieldCodec(
+                            index=len(compiled),
+                            attr=dc_f.name,
+                            field_num=fnum,
+                            wire_name=wire_name,
+                            kind="map",
+                            wire_type=WIRE_MAP,
+                            optional=is_opt,
+                            omitempty=info.omitempty,
+                            key_kind=k_kind,
+                            key_wt=k_wt,
+                            val_kind="submsg",
+                            val_wt=WIRE_SUB_MSG,
+                            sub_type=v_base,
+                            sub_codec=sub_sc,
+                            default_val=def_val,
+                            default_factory=def_fac,
+                        )
+                    else:
+                        eff_val_wire = (
+                            info.val_wire
+                            or (info.wire if info.wire not in (None, "map") else None)
+                            or v_ann
+                        )
+                        v_kind, v_wt, v_enum = _scalar_spec_ext(v_base, eff_val_wire)
+                        fc = _FieldCodec(
+                            index=len(compiled),
+                            attr=dc_f.name,
+                            field_num=fnum,
+                            wire_name=wire_name,
+                            kind="map",
+                            wire_type=WIRE_MAP,
+                            optional=is_opt,
+                            omitempty=info.omitempty,
+                            enum_cls=v_enum,
+                            key_kind=k_kind,
+                            key_wt=k_wt,
+                            val_kind=v_kind,
+                            val_wt=v_wt,
+                            default_val=def_val,
+                            default_factory=def_fac,
+                        )
+                elif isinstance(base_tp, type) and dataclasses.is_dataclass(base_tp):
+                    sub_sc = _get_struct_codec(base_tp)
                     fc = _FieldCodec(
                         index=len(compiled),
                         attr=dc_f.name,
                         field_num=fnum,
                         wire_name=wire_name,
-                        kind="array_submsg",
-                        wire_type=WIRE_ARRAY,
+                        kind="submsg",
+                        wire_type=WIRE_SUB_MSG,
                         optional=is_opt,
                         omitempty=info.omitempty,
-                        elem_kind="submsg",
-                        elem_wt=WIRE_SUB_MSG,
-                        elem_optional=elem_is_opt,
-                        sub_type=elem_base,
+                        sub_type=base_tp,
                         sub_codec=sub_sc,
                         default_val=def_val,
                         default_factory=def_fac,
                     )
                 else:
-                    eff_elem_wire = (
-                        info.elem_wire
-                        or (info.wire if info.wire not in (None, "array") else None)
-                        or elem_ann_wire
-                    )
-                    e_kind, e_wt = _scalar_spec(elem_base, eff_elem_wire)
-                    fc = _FieldCodec(
-                        index=len(compiled),
-                        attr=dc_f.name,
-                        field_num=fnum,
-                        wire_name=wire_name,
-                        kind="array_scalar",
-                        wire_type=WIRE_ARRAY,
-                        optional=is_opt,
-                        omitempty=info.omitempty,
-                        elem_kind=e_kind,
-                        elem_wt=e_wt,
-                        default_val=def_val,
-                        default_factory=def_fac,
-                    )
-            elif origin is dict:
-                args = typing.get_args(base_tp)
-                if len(args) != 2:
-                    raise OmniBufEncodeError(
-                        f"omnibuf: dict field {dc_f.name} requires [K, V] types"
-                    )
-                k_raw, v_raw = args
-                k_base, k_ann = _unwrap_annotated(k_raw)
-                k_kind, k_wt = _scalar_spec(k_base, info.key_wire or k_ann)
-                if k_wt not in (
-                    WIRE_UINT,
-                    WIRE_SINT,
-                    WIRE_BOOL_FALSE,
-                    WIRE_FIXED32,
-                    WIRE_FIXED64,
-                    WIRE_SFIXED32,
-                    WIRE_SFIXED64,
-                    WIRE_STRING,
-                ):
-                    raise OmniBufEncodeError(
-                        f"omnibuf: invalid map key wire type {k_wt} on {dc_f.name}"
-                    )
-                v_no_opt, v_is_opt = _unwrap_optional(v_raw)
-                v_base, v_ann = _unwrap_annotated(v_no_opt)
-                if isinstance(v_base, type) and dataclasses.is_dataclass(v_base):
-                    sub_sc = _get_struct_codec(v_base)
-                    fc = _FieldCodec(
-                        index=len(compiled),
-                        attr=dc_f.name,
-                        field_num=fnum,
-                        wire_name=wire_name,
-                        kind="map",
-                        wire_type=WIRE_MAP,
-                        optional=is_opt,
-                        omitempty=info.omitempty,
-                        key_kind=k_kind,
-                        key_wt=k_wt,
-                        val_kind="submsg",
-                        val_wt=WIRE_SUB_MSG,
-                        val_optional=v_is_opt,
-                        sub_type=v_base,
-                        sub_codec=sub_sc,
-                        default_val=def_val,
-                        default_factory=def_fac,
-                    )
-                else:
-                    eff_val_wire = (
-                        info.val_wire
-                        or (info.wire if info.wire not in (None, "map") else None)
-                        or v_ann
-                    )
-                    v_kind, v_wt = _scalar_spec(v_base, eff_val_wire)
-                    fc = _FieldCodec(
-                        index=len(compiled),
-                        attr=dc_f.name,
-                        field_num=fnum,
-                        wire_name=wire_name,
-                        kind="map",
-                        wire_type=WIRE_MAP,
-                        optional=is_opt,
-                        omitempty=info.omitempty,
-                        key_kind=k_kind,
-                        key_wt=k_wt,
-                        val_kind=v_kind,
-                        val_wt=v_wt,
-                        default_val=def_val,
-                        default_factory=def_fac,
-                    )
-            elif isinstance(base_tp, type) and dataclasses.is_dataclass(base_tp):
-                sub_sc = _get_struct_codec(base_tp)
-                fc = _FieldCodec(
-                    index=len(compiled),
-                    attr=dc_f.name,
-                    field_num=fnum,
-                    wire_name=wire_name,
-                    kind="submsg",
-                    wire_type=WIRE_SUB_MSG,
-                    optional=is_opt,
-                    omitempty=info.omitempty,
-                    sub_type=base_tp,
-                    sub_codec=sub_sc,
-                    default_val=def_val,
-                    default_factory=def_fac,
-                )
-            else:
-                s_kind, s_wt = _scalar_spec(base_tp, info.wire or ann_wire)
-                if s_kind == "bool":
-                    fc = _FieldCodec(
-                        index=len(compiled),
-                        attr=dc_f.name,
-                        field_num=fnum,
-                        wire_name=wire_name,
-                        kind="bool",
-                        wire_type=WIRE_BOOL_FALSE,
-                        optional=is_opt,
-                        omitempty=info.omitempty,
-                        default_val=False if def_val is None else def_val,
-                        default_factory=def_fac,
-                    )
-                else:
-                    default_scalar: Any = def_val
-                    if default_scalar is None:
-                        if s_kind in ("string", "str_as_bytes"):
-                            default_scalar = ""
-                        elif s_kind in ("bytes", "bytes_as_str"):
-                            default_scalar = b""
-                        elif s_kind in ("float32", "float64"):
-                            default_scalar = 0.0
-                        else:
-                            default_scalar = 0
-                    fc = _FieldCodec(
-                        index=len(compiled),
-                        attr=dc_f.name,
-                        field_num=fnum,
-                        wire_name=wire_name,
-                        kind=s_kind,
-                        wire_type=s_wt,
-                        optional=is_opt,
-                        omitempty=info.omitempty,
-                        default_val=default_scalar,
-                        default_factory=def_fac,
-                    )
-            compiled.append(fc)
+                    s_kind, s_wt, s_enum = _scalar_spec_ext(base_tp, info.wire or ann_wire)
+                    if s_kind == "bool":
+                        fc = _FieldCodec(
+                            index=len(compiled),
+                            attr=dc_f.name,
+                            field_num=fnum,
+                            wire_name=wire_name,
+                            kind="bool",
+                            wire_type=WIRE_BOOL_FALSE,
+                            optional=is_opt,
+                            omitempty=info.omitempty,
+                            default_val=False if def_val is None else def_val,
+                            default_factory=def_fac,
+                        )
+                    else:
+                        default_scalar: Any = def_val
+                        if default_scalar is None:
+                            if s_kind in ("string", "str_as_bytes"):
+                                default_scalar = ""
+                            elif s_kind in ("bytes", "bytes_as_str"):
+                                default_scalar = b""
+                            elif s_kind in ("float32", "float64"):
+                                default_scalar = 0.0
+                            elif s_kind == "enum" and s_enum is not None:
+                                default_scalar = _default_for_enum(s_enum)
+                            else:
+                                default_scalar = 0
+                        fc = _FieldCodec(
+                            index=len(compiled),
+                            attr=dc_f.name,
+                            field_num=fnum,
+                            wire_name=wire_name,
+                            kind=s_kind,
+                            wire_type=s_wt,
+                            optional=is_opt,
+                            omitempty=info.omitempty,
+                            enum_cls=s_enum,
+                            default_val=default_scalar,
+                            default_factory=def_fac,
+                        )
+                compiled.append(fc)
 
-        compiled.sort(key=lambda item: item.field_num)
-        for idx, fc in enumerate(compiled):
-            fc.index = idx
-        sc.fields = compiled
-        _PENDING_FINALIZE.append(sc)
+            compiled.sort(key=lambda item: item.field_num)
+            for idx, fc in enumerate(compiled):
+                fc.index = idx
+            sc.fields = compiled
+            _PENDING_FINALIZE.append(sc)
 
-        if is_root:
-            pending = list(_PENDING_FINALIZE)
-            _PENDING_FINALIZE.clear()
-            for p_sc in pending:
-                p_sc.finalize_rust_codec()
-                _CODEC_CACHE[p_sc.cls] = p_sc
-                _RUST_CODEC_CACHE[p_sc.cls] = p_sc.rust_codec
-    except Exception:
-        if is_root:
-            _PENDING_FINALIZE.clear()
-        raise
-    finally:
-        _BUILDING_CODECS.pop(cls, None)
-    return sc
+            if is_root:
+                pending = list(_PENDING_FINALIZE)
+                _PENDING_FINALIZE.clear()
+                for p_sc in pending:
+                    p_sc.finalize_rust_codec()
+                for p_sc in pending:
+                    _CODEC_CACHE[p_sc.cls] = p_sc
+                    _RUST_CODEC_CACHE[p_sc.cls] = p_sc.rust_codec
+        except Exception:
+            if is_root:
+                _PENDING_FINALIZE.clear()
+            raise
+        finally:
+            _BUILDING_CODECS.pop(cls, None)
+        return sc
 
 
 def marshal(

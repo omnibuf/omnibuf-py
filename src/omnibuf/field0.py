@@ -19,7 +19,6 @@ from .wire import (
     OmniBufEncodeError,
     decode_utf8_strict,
     decode_varint,
-    fast_skip_value,
     parse_map_header,
     read_len_slice,
     validate_value,
@@ -70,6 +69,10 @@ def write_schema_meta_body(enc: Encoder, meta: SchemaMeta, depth: int = 1) -> No
     if meta.type_name:
         enc.write_string(1, meta.type_name)
     if meta.fields:
+        if depth + 1 > MAX_NESTING_DEPTH:
+            raise OmniBufEncodeError(
+                f"omnibuf: SchemaMeta fields depth {depth + 1} exceeds {MAX_NESTING_DEPTH}"
+            )
         enc.begin_map(2, WIRE_UINT, WIRE_STRING, len(meta.fields))
         for fnum in sorted(meta.fields):
             if fnum <= 0 or fnum > MAX_FIELD_NUMBER:
@@ -88,7 +91,7 @@ def write_schema_meta_body(enc: Encoder, meta: SchemaMeta, depth: int = 1) -> No
                 raise OmniBufEncodeError(f"omnibuf: invalid SchemaMeta child field number {fnum}")
             enc.write_elem_uint(fnum)
             enc.begin_container()
-            write_schema_meta_body(enc, meta.children[fnum], depth + 1)
+            write_schema_meta_body(enc, meta.children[fnum], depth + 2)
             enc.end_container()
         enc.end_map()
 
@@ -180,6 +183,7 @@ def decode_schema_meta(
             if not ok or key_wt != WIRE_UINT or val_wt != WIRE_SUB_MSG:
                 raise OmniBufDecodeError("omnibuf: invalid SchemaMeta children map header")
             body_len = len(body)
+            local_children: dict[int, SchemaMeta] = {}
             for _ in range(count):
                 k64, kn = decode_varint(body, p, body_len)
                 if kn == 0 or k64 == 0 or k64 > MAX_FIELD_NUMBER:
@@ -188,12 +192,13 @@ def decode_schema_meta(
                     )
                 p += kn
                 child_slice, p = read_len_slice(body, p, 0, body_len)
-                child_meta = decode_schema_meta(child_slice, depth + 1, max_depth)
+                local_children[k64] = decode_schema_meta(child_slice, depth + 2, max_depth)
+            if p != body_len:
+                raise OmniBufDecodeError("omnibuf: trailing bytes in SchemaMeta children map")
+            for k64, child_meta in local_children.items():
                 merged = merge_schema_meta(meta.children.get(k64), child_meta)
                 if merged is not None:
                     meta.children[k64] = merged
-            if p != body_len:
-                raise OmniBufDecodeError("omnibuf: trailing bytes in SchemaMeta children map")
         else:
             pos = validate_value(mv, pos, wt, depth, max_depth, n)
 
@@ -202,34 +207,7 @@ def decode_schema_meta(
 
 def read_field0_schema_meta(packet: Buffer) -> SchemaMeta | None:
     """Scans top-level fields of packet and returns merged Field #0 SchemaMeta, if present."""
-    if not _omnibuf_ext.has_field0_py(packet):
-        return None
-    mv = memoryview(packet)
-    n = len(mv)
-    pos = 0
-    merged: SchemaMeta | None = None
-    while pos < n:
-        tag, width = decode_varint(mv, pos, n)
-        if width == 0 or (tag >> 4) > MAX_FIELD_NUMBER:
-            return None
-        pos += width
-        fnum = tag >> 4
-        wt = tag & 0x0F
-        if fnum == 0:
-            if wt != WIRE_SUB_MSG:
-                return None
-            try:
-                body, pos = read_len_slice(mv, pos, 0, n)
-                meta = decode_schema_meta(body, 1, MAX_NESTING_DEPTH)
-            except OmniBufDecodeError:
-                return None
-            merged = merge_schema_meta(merged, meta)
-        else:
-            next_pos = fast_skip_value(mv, pos, wt, n)
-            if next_pos < 0:
-                return None
-            pos = next_pos
-    return merged
+    return _omnibuf_ext.read_field0_py(packet, SchemaMeta)
 
 
 __all__ = [
