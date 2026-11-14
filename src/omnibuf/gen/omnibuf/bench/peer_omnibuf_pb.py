@@ -340,74 +340,68 @@ def unmarshal_location(data: Buffer, out: Location | None = None) -> Location:
     return _decode_location(data, out, 0, False)
 
 class OpaqueLocation:
-    __slots__ = ('_raw', '_dirty_nums', '_d_region', '_d_datacenter', '_d_city', '_d_rack', '_d_latitude', '_d_longitude',)
+    __slots__ = ('_raw', '_dirty_mask', '_d_region', '_d_datacenter', '_d_city', '_d_rack', '_d_latitude', '_d_longitude',)
 
     def __init__(self, raw: Buffer) -> None:
         self._raw: Buffer = raw
-        self._dirty_nums: set[int] = set()
-        self._d_region: Any = None
-        self._d_datacenter: Any = None
-        self._d_city: Any = None
-        self._d_rack: Any = None
-        self._d_latitude: Any = None
-        self._d_longitude: Any = None
+        self._dirty_mask: int = 0
 
     def raw(self) -> Buffer:
         return self._raw
 
     def get_region(self) -> str:
-        if 1 in self._dirty_nums:
-            return self._d_region  # type: ignore[no-any-return]
+        if self._dirty_mask & 2:
+            return self._d_region  # type: ignore[no-any-return, attr-defined]
         return opaque_get_string(self._raw, 1)
 
     def set_region(self, val: str) -> None:
-        self._d_region = val
-        self._dirty_nums.add(1)
+        self._d_region: Any = val
+        self._dirty_mask |= 2
 
     def get_datacenter(self) -> str:
-        if 2 in self._dirty_nums:
-            return self._d_datacenter  # type: ignore[no-any-return]
+        if self._dirty_mask & 4:
+            return self._d_datacenter  # type: ignore[no-any-return, attr-defined]
         return opaque_get_string(self._raw, 2)
 
     def set_datacenter(self, val: str) -> None:
-        self._d_datacenter = val
-        self._dirty_nums.add(2)
+        self._d_datacenter: Any = val
+        self._dirty_mask |= 4
 
     def get_city(self) -> str:
-        if 3 in self._dirty_nums:
-            return self._d_city  # type: ignore[no-any-return]
+        if self._dirty_mask & 8:
+            return self._d_city  # type: ignore[no-any-return, attr-defined]
         return opaque_get_string(self._raw, 3)
 
     def set_city(self, val: str) -> None:
-        self._d_city = val
-        self._dirty_nums.add(3)
+        self._d_city: Any = val
+        self._dirty_mask |= 8
 
     def get_rack(self) -> int:
-        if 4 in self._dirty_nums:
-            return self._d_rack  # type: ignore[no-any-return]
+        if self._dirty_mask & 16:
+            return self._d_rack  # type: ignore[no-any-return, attr-defined]
         return opaque_get_uint32(self._raw, 4)
 
     def set_rack(self, val: int) -> None:
-        self._d_rack = val
-        self._dirty_nums.add(4)
+        self._d_rack: Any = val
+        self._dirty_mask |= 16
 
     def get_latitude(self) -> float:
-        if 5 in self._dirty_nums:
-            return self._d_latitude  # type: ignore[no-any-return]
+        if self._dirty_mask & 32:
+            return self._d_latitude  # type: ignore[no-any-return, attr-defined]
         return opaque_get_float32(self._raw, 5)
 
     def set_latitude(self, val: float) -> None:
-        self._d_latitude = val
-        self._dirty_nums.add(5)
+        self._d_latitude: Any = val
+        self._dirty_mask |= 32
 
     def get_longitude(self) -> float:
-        if 6 in self._dirty_nums:
-            return self._d_longitude  # type: ignore[no-any-return]
+        if self._dirty_mask & 64:
+            return self._d_longitude  # type: ignore[no-any-return, attr-defined]
         return opaque_get_float32(self._raw, 6)
 
     def set_longitude(self, val: float) -> None:
-        self._d_longitude = val
-        self._dirty_nums.add(6)
+        self._d_longitude: Any = val
+        self._dirty_mask |= 64
 
     def _encode_dirty(self, dst: bytearray, fnum: int) -> None:
         if fnum == 1:
@@ -435,16 +429,18 @@ class OpaqueLocation:
         dst_prefix: Buffer | None = None,
         self_describing: bool = False,
     ) -> bytes:
-        if self._dirty_nums:
+        if self._dirty_mask:
             try:
-                spliced = splice_dirty_fields(None, self._raw, self._dirty_nums, self._encode_dirty)
+                spliced = splice_dirty_fields(None, self._raw, self._dirty_mask, self._encode_dirty)
             except UnicodeEncodeError as exc:
                 raise OmniBufEncodeError(str(exc)) from exc
             self._raw = spliced
-            self._dirty_nums.clear()
+            self._dirty_mask = 0
         else:
             validate_message(self._raw)
             spliced = bytes(self._raw)
+        if dst_prefix is None and not self_describing:
+            return spliced
         prefix = bytearray(dst_prefix) if dst_prefix is not None else bytearray()
         if self_describing and read_field0_schema_meta(spliced) is None:
             prefix.extend(_FIELD0_LOCATION)
@@ -662,54 +658,50 @@ def unmarshal_neighbor(data: Buffer, out: Neighbor | None = None) -> Neighbor:
     return _decode_neighbor(data, out, 0, False)
 
 class OpaqueNeighbor:
-    __slots__ = ('_raw', '_dirty_nums', '_d_peer_asn', '_d_router', '_d_latency_us', '_d_established',)
+    __slots__ = ('_raw', '_dirty_mask', '_d_peer_asn', '_d_router', '_d_latency_us', '_d_established',)
 
     def __init__(self, raw: Buffer) -> None:
         self._raw: Buffer = raw
-        self._dirty_nums: set[int] = set()
-        self._d_peer_asn: Any = None
-        self._d_router: Any = None
-        self._d_latency_us: Any = None
-        self._d_established: Any = None
+        self._dirty_mask: int = 0
 
     def raw(self) -> Buffer:
         return self._raw
 
     def get_peer_asn(self) -> int:
-        if 1 in self._dirty_nums:
-            return self._d_peer_asn  # type: ignore[no-any-return]
+        if self._dirty_mask & 2:
+            return self._d_peer_asn  # type: ignore[no-any-return, attr-defined]
         return opaque_get_uint32(self._raw, 1)
 
     def set_peer_asn(self, val: int) -> None:
-        self._d_peer_asn = val
-        self._dirty_nums.add(1)
+        self._d_peer_asn: Any = val
+        self._dirty_mask |= 2
 
     def get_router(self) -> str:
-        if 2 in self._dirty_nums:
-            return self._d_router  # type: ignore[no-any-return]
+        if self._dirty_mask & 4:
+            return self._d_router  # type: ignore[no-any-return, attr-defined]
         return opaque_get_string(self._raw, 2)
 
     def set_router(self, val: str) -> None:
-        self._d_router = val
-        self._dirty_nums.add(2)
+        self._d_router: Any = val
+        self._dirty_mask |= 4
 
     def get_latency_us(self) -> int:
-        if 3 in self._dirty_nums:
-            return self._d_latency_us  # type: ignore[no-any-return]
+        if self._dirty_mask & 8:
+            return self._d_latency_us  # type: ignore[no-any-return, attr-defined]
         return opaque_get_uint32(self._raw, 3)
 
     def set_latency_us(self, val: int) -> None:
-        self._d_latency_us = val
-        self._dirty_nums.add(3)
+        self._d_latency_us: Any = val
+        self._dirty_mask |= 8
 
     def get_established(self) -> bool:
-        if 4 in self._dirty_nums:
-            return self._d_established  # type: ignore[no-any-return]
+        if self._dirty_mask & 16:
+            return self._d_established  # type: ignore[no-any-return, attr-defined]
         return opaque_get_bool(self._raw, 4)
 
     def set_established(self, val: bool) -> None:
-        self._d_established = val
-        self._dirty_nums.add(4)
+        self._d_established: Any = val
+        self._dirty_mask |= 16
 
     def _encode_dirty(self, dst: bytearray, fnum: int) -> None:
         if fnum == 1:
@@ -731,16 +723,18 @@ class OpaqueNeighbor:
         dst_prefix: Buffer | None = None,
         self_describing: bool = False,
     ) -> bytes:
-        if self._dirty_nums:
+        if self._dirty_mask:
             try:
-                spliced = splice_dirty_fields(None, self._raw, self._dirty_nums, self._encode_dirty)
+                spliced = splice_dirty_fields(None, self._raw, self._dirty_mask, self._encode_dirty)
             except UnicodeEncodeError as exc:
                 raise OmniBufEncodeError(str(exc)) from exc
             self._raw = spliced
-            self._dirty_nums.clear()
+            self._dirty_mask = 0
         else:
             validate_message(self._raw)
             spliced = bytes(self._raw)
+        if dst_prefix is None and not self_describing:
+            return spliced
         prefix = bytearray(dst_prefix) if dst_prefix is not None else bytearray()
         if self_describing and read_field0_schema_meta(spliced) is None:
             prefix.extend(_FIELD0_NEIGHBOR)
@@ -1253,106 +1247,95 @@ def unmarshal_peer_update(data: Buffer, out: PeerUpdate | None = None) -> PeerUp
     return _decode_peer_update(data, out, 0, False)
 
 class OpaquePeerUpdate:
-    __slots__ = ('_raw', '_dirty_nums', '_d_asn', '_d_router_id', '_d_active', '_d_uptime_sec', '_d_rssi_dbm', '_d_cpu_load', '_d_tags', '_d_prefixes', '_d_location', '_d_neighbors', '_d_sequence',)
+    __slots__ = ('_raw', '_dirty_mask', '_d_asn', '_d_router_id', '_d_active', '_d_uptime_sec', '_d_rssi_dbm', '_d_cpu_load', '_d_tags', '_d_prefixes', '_d_location', '_d_neighbors', '_d_sequence',)
 
     def __init__(self, raw: Buffer) -> None:
         self._raw: Buffer = raw
-        self._dirty_nums: set[int] = set()
-        self._d_asn: Any = None
-        self._d_router_id: Any = None
-        self._d_active: Any = None
-        self._d_uptime_sec: Any = None
-        self._d_rssi_dbm: Any = None
-        self._d_cpu_load: Any = None
-        self._d_tags: Any = None
-        self._d_prefixes: Any = None
-        self._d_location: Any = None
-        self._d_neighbors: Any = None
-        self._d_sequence: Any = None
+        self._dirty_mask: int = 0
 
     def raw(self) -> Buffer:
         return self._raw
 
     def get_asn(self) -> int:
-        if 1 in self._dirty_nums:
-            return self._d_asn  # type: ignore[no-any-return]
+        if self._dirty_mask & 2:
+            return self._d_asn  # type: ignore[no-any-return, attr-defined]
         return opaque_get_uint32(self._raw, 1)
 
     def set_asn(self, val: int) -> None:
-        self._d_asn = val
-        self._dirty_nums.add(1)
+        self._d_asn: Any = val
+        self._dirty_mask |= 2
 
     def get_router_id(self) -> str:
-        if 2 in self._dirty_nums:
-            return self._d_router_id  # type: ignore[no-any-return]
+        if self._dirty_mask & 4:
+            return self._d_router_id  # type: ignore[no-any-return, attr-defined]
         return opaque_get_string(self._raw, 2)
 
     def set_router_id(self, val: str) -> None:
-        self._d_router_id = val
-        self._dirty_nums.add(2)
+        self._d_router_id: Any = val
+        self._dirty_mask |= 4
 
     def get_active(self) -> bool:
-        if 3 in self._dirty_nums:
-            return self._d_active  # type: ignore[no-any-return]
+        if self._dirty_mask & 8:
+            return self._d_active  # type: ignore[no-any-return, attr-defined]
         return opaque_get_bool(self._raw, 3)
 
     def set_active(self, val: bool) -> None:
-        self._d_active = val
-        self._dirty_nums.add(3)
+        self._d_active: Any = val
+        self._dirty_mask |= 8
 
     def get_uptime_sec(self) -> int:
-        if 4 in self._dirty_nums:
-            return self._d_uptime_sec  # type: ignore[no-any-return]
+        if self._dirty_mask & 16:
+            return self._d_uptime_sec  # type: ignore[no-any-return, attr-defined]
         return opaque_get_uint64(self._raw, 4)
 
     def set_uptime_sec(self, val: int) -> None:
-        self._d_uptime_sec = val
-        self._dirty_nums.add(4)
+        self._d_uptime_sec: Any = val
+        self._dirty_mask |= 16
 
     def get_rssi_dbm(self) -> int:
-        if 5 in self._dirty_nums:
-            return self._d_rssi_dbm  # type: ignore[no-any-return]
+        if self._dirty_mask & 32:
+            return self._d_rssi_dbm  # type: ignore[no-any-return, attr-defined]
         return opaque_get_sint32(self._raw, 5)
 
     def set_rssi_dbm(self, val: int) -> None:
-        self._d_rssi_dbm = val
-        self._dirty_nums.add(5)
+        self._d_rssi_dbm: Any = val
+        self._dirty_mask |= 32
 
     def get_cpu_load(self) -> float:
-        if 6 in self._dirty_nums:
-            return self._d_cpu_load  # type: ignore[no-any-return]
+        if self._dirty_mask & 64:
+            return self._d_cpu_load  # type: ignore[no-any-return, attr-defined]
         return opaque_get_float64(self._raw, 6)
 
     def set_cpu_load(self, val: float) -> None:
-        self._d_cpu_load = val
-        self._dirty_nums.add(6)
+        self._d_cpu_load: Any = val
+        self._dirty_mask |= 64
 
     def get_tags(self) -> list[str]:
-        if 7 in self._dirty_nums:
-            return self._d_tags  # type: ignore[no-any-return]
+        if self._dirty_mask & 128:
+            return self._d_tags  # type: ignore[no-any-return, attr-defined]
         return opaque_get_scalar_array(self._raw, 7, 10, 'string')
 
     def set_tags(self, val: list[str]) -> None:
-        self._d_tags = val
-        self._dirty_nums.add(7)
+        self._d_tags: Any = val
+        self._dirty_mask |= 128
 
     def get_prefixes(self) -> list[int]:
-        if 8 in self._dirty_nums:
-            return self._d_prefixes  # type: ignore[no-any-return]
+        if self._dirty_mask & 256:
+            return self._d_prefixes  # type: ignore[no-any-return, attr-defined]
         return opaque_get_scalar_array(self._raw, 8, 0, 'uint32')
 
     def set_prefixes(self, val: list[int]) -> None:
-        self._d_prefixes = val
-        self._dirty_nums.add(8)
+        self._d_prefixes: Any = val
+        self._dirty_mask |= 256
 
     def get_location(self) -> Location | None:
-        if 9 in self._dirty_nums:
-            return self._d_location  # type: ignore[no-any-return]
+        if self._dirty_mask & 512:
+            return self._d_location  # type: ignore[no-any-return, attr-defined]
         return opaque_get_submsg(self._raw, 9, _decode_location)
 
     def opaque_location(self) -> OpaqueLocation | None:
-        if 9 in self._dirty_nums:
-            _cur = self._d_location
+        if self._dirty_mask & 512:
+            _cur = self._d_location  # type: ignore[attr-defined]
             if _cur is None:
                 return None
             return OpaqueLocation(_cur.marshal_omnibuf())
@@ -1362,26 +1345,26 @@ class OpaquePeerUpdate:
         return OpaqueLocation(_sub)
 
     def set_location(self, val: Any) -> None:
-        self._d_location = val
-        self._dirty_nums.add(9)
+        self._d_location: Any = val
+        self._dirty_mask |= 512
 
     def get_neighbors(self) -> list[Neighbor]:
-        if 10 in self._dirty_nums:
-            return self._d_neighbors  # type: ignore[no-any-return]
+        if self._dirty_mask & 1024:
+            return self._d_neighbors  # type: ignore[no-any-return, attr-defined]
         return opaque_get_submsg_array(self._raw, 10, _decode_neighbor)
 
     def set_neighbors(self, val: list[Neighbor]) -> None:
-        self._d_neighbors = val
-        self._dirty_nums.add(10)
+        self._d_neighbors: Any = val
+        self._dirty_mask |= 1024
 
     def get_sequence(self) -> int:
-        if 11 in self._dirty_nums:
-            return self._d_sequence  # type: ignore[no-any-return]
+        if self._dirty_mask & 2048:
+            return self._d_sequence  # type: ignore[no-any-return, attr-defined]
         return opaque_get_uint64(self._raw, 11)
 
     def set_sequence(self, val: int) -> None:
-        self._d_sequence = val
-        self._dirty_nums.add(11)
+        self._d_sequence: Any = val
+        self._dirty_mask |= 2048
 
     def _encode_dirty(self, dst: bytearray, fnum: int) -> None:
         if fnum == 1:
@@ -1425,16 +1408,18 @@ class OpaquePeerUpdate:
         dst_prefix: Buffer | None = None,
         self_describing: bool = False,
     ) -> bytes:
-        if self._dirty_nums:
+        if self._dirty_mask:
             try:
-                spliced = splice_dirty_fields(None, self._raw, self._dirty_nums, self._encode_dirty)
+                spliced = splice_dirty_fields(None, self._raw, self._dirty_mask, self._encode_dirty)
             except UnicodeEncodeError as exc:
                 raise OmniBufEncodeError(str(exc)) from exc
             self._raw = spliced
-            self._dirty_nums.clear()
+            self._dirty_mask = 0
         else:
             validate_message(self._raw)
             spliced = bytes(self._raw)
+        if dst_prefix is None and not self_describing:
+            return spliced
         prefix = bytearray(dst_prefix) if dst_prefix is not None else bytearray()
         if self_describing and read_field0_schema_meta(spliced) is None:
             prefix.extend(_FIELD0_PEER_UPDATE)

@@ -850,7 +850,9 @@ def _generate_file(
         )
 
         # 5. Lazy Opaque<Message> View
-        slot_names = ["_raw", "_dirty_nums"] + [f"_d_{rf.attr_name}" for rf in m_spec.fields]
+        use_bitmask = all(rf.number <= 4096 for rf in m_spec.fields)
+        dirty_slot = "_dirty_mask" if use_bitmask else "_dirty_nums"
+        slot_names = ["_raw", dirty_slot] + [f"_d_{rf.attr_name}" for rf in m_spec.fields]
         slots_tuple = ", ".join(repr(s) for s in slot_names)
         lines.extend(
             [
@@ -859,13 +861,11 @@ def _generate_file(
                 "",
                 "    def __init__(self, raw: Buffer) -> None:",
                 "        self._raw: Buffer = raw",
-                "        self._dirty_nums: set[int] = set()",
-            ]
-        )
-        for rf in m_spec.fields:
-            lines.append(f"        self._d_{rf.attr_name}: Any = None")
-        lines.extend(
-            [
+                (
+                    "        self._dirty_mask: int = 0"
+                    if use_bitmask
+                    else "        self._dirty_nums: set[int] = set()"
+                ),
                 "",
                 "    def raw(self) -> Buffer:",
                 "        return self._raw",
@@ -874,7 +874,7 @@ def _generate_file(
         )
 
         for rf in m_spec.fields:
-            lines.extend(_emit_opaque_methods(rf, _ref_decode_fn, _ref_opaque_cls))
+            lines.extend(_emit_opaque_methods(rf, _ref_decode_fn, _ref_opaque_cls, use_bitmask))
 
         lines.extend(
             [
@@ -902,6 +902,12 @@ def _generate_file(
                         f"            _encode_{snake_msg}_field(dst, {rf.number}, _v, True)"
                     )
 
+        dirty_attr = "self._dirty_mask" if use_bitmask else "self._dirty_nums"
+        clear_stmt = (
+            "            self._dirty_mask = 0"
+            if use_bitmask
+            else "            self._dirty_nums.clear()"
+        )
         lines.extend(
             [
                 "",
@@ -911,16 +917,18 @@ def _generate_file(
                 "        dst_prefix: Buffer | None = None,",
                 "        self_describing: bool = False,",
                 "    ) -> bytes:",
-                "        if self._dirty_nums:",
+                f"        if {dirty_attr}:",
                 "            try:",
-                "                spliced = splice_dirty_fields(None, self._raw, self._dirty_nums, self._encode_dirty)",
+                f"                spliced = splice_dirty_fields(None, self._raw, {dirty_attr}, self._encode_dirty)",
                 "            except UnicodeEncodeError as exc:",
                 "                raise OmniBufEncodeError(str(exc)) from exc",
                 "            self._raw = spliced",
-                "            self._dirty_nums.clear()",
+                clear_stmt,
                 "        else:",
                 "            validate_message(self._raw)",
                 "            spliced = bytes(self._raw)",
+                "        if dst_prefix is None and not self_describing:",
+                "            return spliced",
                 "        prefix = bytearray(dst_prefix) if dst_prefix is not None else bytearray()",
                 "        if self_describing and read_field0_schema_meta(spliced) is None:",
                 f"            prefix.extend(_FIELD0_{snake_msg.upper()})",
@@ -1211,10 +1219,15 @@ def _emit_opaque_methods(
     rf: _ResolvedField,
     ref_decode_fn: Any,
     ref_opaque_cls: Any,
+    use_bitmask: bool = True,
 ) -> list[str]:
     lines: list[str] = []
     attr = rf.attr_name
     num = rf.number
+    dirty_check = f"self._dirty_mask & {1 << num}" if use_bitmask else f"{num} in self._dirty_nums"
+    dirty_mark = (
+        f"self._dirty_mask |= {1 << num}" if use_bitmask else f"self._dirty_nums.add({num})"
+    )
 
     if rf.is_map:
         k_kind, k_wt, k_py, _ = _PROTO_SCALAR_INFO[rf.map_key_type]
@@ -1228,13 +1241,13 @@ def _emit_opaque_methods(
         lines.extend(
             [
                 f"    def get_{attr}(self) -> {ret_tp}:",
-                f"        if {num} in self._dirty_nums:",
-                f"            return self._d_{attr}  # type: ignore[no-any-return]",
+                f"        if {dirty_check}:",
+                f"            return self._d_{attr}  # type: ignore[no-any-return, attr-defined]",
                 f"        return opaque_get_map(self._raw, {num}, {k_wt}, {k_kind!r}, {v_wt}, {v_kind!r}, {sub_dec})",
                 "",
                 f"    def set_{attr}(self, val: {ret_tp}) -> None:",
-                f"        self._d_{attr} = val",
-                f"        self._dirty_nums.add({num})",
+                f"        self._d_{attr}: Any = val",
+                f"        {dirty_mark}",
                 "",
             ]
         )
@@ -1247,13 +1260,13 @@ def _emit_opaque_methods(
             lines.extend(
                 [
                     f"    def get_{attr}(self) -> {ret_tp}:",
-                    f"        if {num} in self._dirty_nums:",
-                    f"            return self._d_{attr}  # type: ignore[no-any-return]",
+                    f"        if {dirty_check}:",
+                    f"            return self._d_{attr}  # type: ignore[no-any-return, attr-defined]",
                     f"        return opaque_get_submsg_array(self._raw, {num}, {dec_fn})",
                     "",
                     f"    def set_{attr}(self, val: {ret_tp}) -> None:",
-                    f"        self._d_{attr} = val",
-                    f"        self._dirty_nums.add({num})",
+                    f"        self._d_{attr}: Any = val",
+                    f"        {dirty_mark}",
                     "",
                 ]
             )
@@ -1263,13 +1276,13 @@ def _emit_opaque_methods(
             lines.extend(
                 [
                     f"    def get_{attr}(self) -> {ret_tp}:",
-                    f"        if {num} in self._dirty_nums:",
-                    f"            return self._d_{attr}  # type: ignore[no-any-return]",
+                    f"        if {dirty_check}:",
+                    f"            return self._d_{attr}  # type: ignore[no-any-return, attr-defined]",
                     f"        return opaque_get_scalar_array(self._raw, {num}, {e_wt}, {e_kind!r})",
                     "",
                     f"    def set_{attr}(self, val: {ret_tp}) -> None:",
-                    f"        self._d_{attr} = val",
-                    f"        self._dirty_nums.add({num})",
+                    f"        self._d_{attr}: Any = val",
+                    f"        {dirty_mark}",
                     "",
                 ]
             )
@@ -1282,13 +1295,13 @@ def _emit_opaque_methods(
         lines.extend(
             [
                 f"    def get_{attr}(self) -> {ret_tp}:",
-                f"        if {num} in self._dirty_nums:",
-                f"            return self._d_{attr}  # type: ignore[no-any-return]",
+                f"        if {dirty_check}:",
+                f"            return self._d_{attr}  # type: ignore[no-any-return, attr-defined]",
                 f"        return opaque_get_submsg(self._raw, {num}, {dec_fn})",
                 "",
                 f"    def opaque_{attr}(self) -> {op_cls} | None:",
-                f"        if {num} in self._dirty_nums:",
-                f"            _cur = self._d_{attr}",
+                f"        if {dirty_check}:",
+                f"            _cur = self._d_{attr}  # type: ignore[attr-defined]",
                 "            if _cur is None:",
                 "                return None",
                 f"            return {op_cls}(_cur.marshal_omnibuf())",
@@ -1298,8 +1311,8 @@ def _emit_opaque_methods(
                 f"        return {op_cls}(_sub)",
                 "",
                 f"    def set_{attr}(self, val: Any) -> None:",
-                f"        self._d_{attr} = val",
-                f"        self._dirty_nums.add({num})",
+                f"        self._d_{attr}: Any = val",
+                f"        {dirty_mark}",
                 "",
             ]
         )
@@ -1310,13 +1323,13 @@ def _emit_opaque_methods(
     lines.extend(
         [
             f"    def get_{attr}(self) -> {s_py}:",
-            f"        if {num} in self._dirty_nums:",
-            f"            return self._d_{attr}  # type: ignore[no-any-return]",
+            f"        if {dirty_check}:",
+            f"            return self._d_{attr}  # type: ignore[no-any-return, attr-defined]",
             f"        return {helper}(self._raw, {num})",
             "",
             f"    def set_{attr}(self, val: {s_py}) -> None:",
-            f"        self._d_{attr} = val",
-            f"        self._dirty_nums.add({num})",
+            f"        self._d_{attr}: Any = val",
+            f"        {dirty_mark}",
             "",
         ]
     )

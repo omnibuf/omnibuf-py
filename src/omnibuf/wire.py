@@ -818,53 +818,98 @@ _EMPTY_MV = memoryview(b"")
 _NOT_FOUND = LocateFieldResult(val_slice=_EMPTY_MV, val_pos=0, wire_type=0, ok=False)
 
 
-def locate_field(
+def locate_field_offset(
     packet: Buffer,
     target_field: int,
     exp_mask: int = 0xFFFF,
-) -> LocateFieldResult:
-    """Locates the last matching occurrence of target_field by hopping across headers in O(1) time."""
-    mv = memoryview(packet)
-    n = len(mv)
+) -> tuple[int, int]:
+    """Locates the last matching occurrence of target_field without allocating memoryviews.
+
+    Returns (val_pos, wire_type), or (-1, 0) if missing or malformed.
+    """
+    n = len(packet)
     pos = 0
     last_pos = -1
     last_wt = 0
+    tz_widths = TZCNT_WIDTH_TABLE
 
     while pos < n:
-        b0 = mv[pos]
+        b0 = packet[pos]
         if b0 & 1:
             fnum = b0 >> 5
             wt = (b0 >> 1) & 0x0F
             pos += 1
         elif b0 & 2:
             if pos + 2 > n:
-                return _NOT_FOUND
-            u16 = (b0 | (mv[pos + 1] << 8)) >> 2
+                return -1, 0
+            u16 = (b0 | (packet[pos + 1] << 8)) >> 2
             fnum = u16 >> 4
             wt = u16 & 0x0F
             pos += 2
         else:
-            tag, tn = decode_varint(mv, pos, n)
+            tag, tn = decode_varint(packet, pos, n)
             if tn == 0 or (tag >> 4) > MAX_FIELD_NUMBER:
-                return _NOT_FOUND
+                return -1, 0
             fnum = tag >> 4
             wt = tag & 0x0F
             pos += tn
 
         if fnum == 0 and wt != WIRE_SUB_MSG:
-            return _NOT_FOUND
+            return -1, 0
 
         if fnum == target_field and ((exp_mask >> wt) & 1) != 0:
             last_pos = pos
             last_wt = wt
 
-        next_pos = skip_validated_value(mv, pos, wt, n)
-        if next_pos < 0:
-            return _NOT_FOUND
-        pos = next_pos
+        if wt <= 1:
+            if pos >= n:
+                return -1, 0
+            w = tz_widths[packet[pos]]
+            if w == 0 or pos + w > n:
+                return -1, 0
+            pos += w
+        elif wt <= 3:
+            pass
+        elif wt <= 9:
+            pos += 4 << (wt & 1)
+            if pos > n:
+                return -1, 0
+        elif wt <= 12:
+            if pos >= n:
+                return -1, 0
+            lb0 = packet[pos]
+            if lb0 & 1:
+                pos += 1 + (lb0 >> 1)
+            elif lb0 & 2:
+                if pos + 2 > n:
+                    return -1, 0
+                pos += 2 + ((lb0 | (packet[pos + 1] << 8)) >> 2)
+            else:
+                b_len, bn = decode_varint(packet, pos, n)
+                if bn == 0:
+                    return -1, 0
+                pos += bn + b_len
+            if pos > n:
+                return -1, 0
+        else:
+            next_pos = skip_validated_value(packet, pos, wt, n)
+            if next_pos < 0:
+                return -1, 0
+            pos = next_pos
 
+    return last_pos, last_wt
+
+
+def locate_field(
+    packet: Buffer,
+    target_field: int,
+    exp_mask: int = 0xFFFF,
+) -> LocateFieldResult:
+    """Locates the last matching occurrence of target_field by hopping across headers in O(1) time."""
+    last_pos, last_wt = locate_field_offset(packet, target_field, exp_mask)
     if last_pos < 0:
         return _NOT_FOUND
+    mv = memoryview(packet)
     return LocateFieldResult(
         val_slice=mv[last_pos:],
         val_pos=last_pos,
@@ -883,6 +928,106 @@ class NextContainerResult:
     valid: bool
 
 
+def next_container_span(
+    packet: Buffer,
+    pos: int,
+    target_field: int,
+    exp_wt: int,
+    min_len: int = 0,
+) -> tuple[int, int, int]:
+    """Scans packet starting at pos for the next container occurrence without memoryview slicing.
+
+    Returns (body_start, body_end, next_pos):
+    - (body_start, body_end, next_pos) with body_start >= 0 when matched;
+    - (-1, n, n) when end of packet is reached cleanly without match;
+    - (-2, 0, 0) when packet is malformed/truncated.
+    """
+    n = len(packet)
+    tz_widths = TZCNT_WIDTH_TABLE
+    while pos < n:
+        b0 = packet[pos]
+        if b0 & 1:
+            fnum = b0 >> 5
+            wt = (b0 >> 1) & 0x0F
+            pos += 1
+        elif b0 & 2:
+            if pos + 2 > n:
+                return -2, 0, 0
+            u16 = (b0 | (packet[pos + 1] << 8)) >> 2
+            fnum = u16 >> 4
+            wt = u16 & 0x0F
+            pos += 2
+        else:
+            tag, tn = decode_varint(packet, pos, n)
+            if tn == 0 or (tag >> 4) > MAX_FIELD_NUMBER:
+                return -2, 0, 0
+            fnum = tag >> 4
+            wt = tag & 0x0F
+            pos += tn
+
+        if fnum == 0 and wt != WIRE_SUB_MSG:
+            return -2, 0, 0
+
+        if fnum == target_field and wt == exp_wt:
+            if pos >= n:
+                return -2, 0, 0
+            lb0 = packet[pos]
+            if lb0 & 1:
+                b_len = lb0 >> 1
+                bn = 1
+            elif lb0 & 2:
+                if pos + 2 > n:
+                    return -2, 0, 0
+                b_len = (lb0 | (packet[pos + 1] << 8)) >> 2
+                bn = 2
+            else:
+                b_len, bn = decode_varint(packet, pos, n)
+                if bn == 0:
+                    return -2, 0, 0
+            end_pos = pos + bn + b_len
+            if b_len < min_len or end_pos > n:
+                return -2, 0, 0
+            return pos + bn, end_pos, end_pos
+
+        if wt <= 1:
+            if pos >= n:
+                return -2, 0, 0
+            w = tz_widths[packet[pos]]
+            if w == 0 or pos + w > n:
+                return -2, 0, 0
+            pos += w
+        elif wt <= 3:
+            pass
+        elif wt <= 9:
+            pos += 4 << (wt & 1)
+            if pos > n:
+                return -2, 0, 0
+        elif wt <= 12:
+            if pos >= n:
+                return -2, 0, 0
+            lb0 = packet[pos]
+            if lb0 & 1:
+                pos += 1 + (lb0 >> 1)
+            elif lb0 & 2:
+                if pos + 2 > n:
+                    return -2, 0, 0
+                pos += 2 + ((lb0 | (packet[pos + 1] << 8)) >> 2)
+            else:
+                b_len, bn = decode_varint(packet, pos, n)
+                if bn == 0:
+                    return -2, 0, 0
+                pos += bn + b_len
+            if pos > n:
+                return -2, 0, 0
+        else:
+            next_pos = skip_validated_value(packet, pos, wt, n)
+            if next_pos < 0:
+                return -2, 0, 0
+            pos = next_pos
+
+    return -1, n, n
+
+
 def next_container_field(
     packet: Buffer,
     pos: int,
@@ -891,47 +1036,13 @@ def next_container_field(
     min_len: int = 0,
 ) -> NextContainerResult:
     """Scans packet starting at pos for the next container occurrence of target_field."""
+    b_start, b_end, next_pos = next_container_span(packet, pos, target_field, exp_wt, min_len)
+    if b_start == -2:
+        return NextContainerResult(_EMPTY_MV, 0, False, False)
+    if b_start == -1:
+        return NextContainerResult(_EMPTY_MV, next_pos, False, True)
     mv = memoryview(packet)
-    n = len(mv)
-    while pos < n:
-        b0 = mv[pos]
-        if b0 & 1:
-            fnum = b0 >> 5
-            wt = (b0 >> 1) & 0x0F
-            pos += 1
-        elif b0 & 2:
-            if pos + 2 > n:
-                return NextContainerResult(_EMPTY_MV, 0, False, False)
-            u16 = (b0 | (mv[pos + 1] << 8)) >> 2
-            fnum = u16 >> 4
-            wt = u16 & 0x0F
-            pos += 2
-        else:
-            tag, tn = decode_varint(mv, pos, n)
-            if tn == 0 or (tag >> 4) > MAX_FIELD_NUMBER:
-                return NextContainerResult(_EMPTY_MV, 0, False, False)
-            fnum = tag >> 4
-            wt = tag & 0x0F
-            pos += tn
-
-        if fnum == 0 and wt != WIRE_SUB_MSG:
-            return NextContainerResult(_EMPTY_MV, 0, False, False)
-
-        if fnum == target_field and wt == exp_wt:
-            if pos >= n:
-                return NextContainerResult(_EMPTY_MV, 0, False, False)
-            b_len, bn = decode_varint(mv, pos, n)
-            if bn == 0 or b_len < min_len or pos + bn + b_len > n:
-                return NextContainerResult(_EMPTY_MV, 0, False, False)
-            pos += bn
-            return NextContainerResult(mv[pos : pos + b_len], pos + b_len, True, True)
-
-        next_pos = skip_validated_value(mv, pos, wt, n)
-        if next_pos < 0:
-            return NextContainerResult(_EMPTY_MV, 0, False, False)
-        pos = next_pos
-
-    return NextContainerResult(_EMPTY_MV, n, False, True)
+    return NextContainerResult(mv[b_start:b_end], next_pos, True, True)
 
 
 @dataclass(slots=True, frozen=True)

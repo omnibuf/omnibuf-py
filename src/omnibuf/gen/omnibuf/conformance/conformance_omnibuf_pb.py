@@ -412,104 +412,95 @@ def unmarshal_conformance_request(data: Buffer, out: ConformanceRequest | None =
     return _decode_conformance_request(data, out, 0, False)
 
 class OpaqueConformanceRequest:
-    __slots__ = ('_raw', '_dirty_nums', '_d_test_name', '_d_message_type', '_d_tier', '_d_requested_output_format', '_d_omnibuf_payload', '_d_json_payload', '_d_self_describing', '_d_test_opaque_splice', '_d_test_opaque_splice_shrink',)
+    __slots__ = ('_raw', '_dirty_mask', '_d_test_name', '_d_message_type', '_d_tier', '_d_requested_output_format', '_d_omnibuf_payload', '_d_json_payload', '_d_self_describing', '_d_test_opaque_splice', '_d_test_opaque_splice_shrink',)
 
     def __init__(self, raw: Buffer) -> None:
         self._raw: Buffer = raw
-        self._dirty_nums: set[int] = set()
-        self._d_test_name: Any = None
-        self._d_message_type: Any = None
-        self._d_tier: Any = None
-        self._d_requested_output_format: Any = None
-        self._d_omnibuf_payload: Any = None
-        self._d_json_payload: Any = None
-        self._d_self_describing: Any = None
-        self._d_test_opaque_splice: Any = None
-        self._d_test_opaque_splice_shrink: Any = None
+        self._dirty_mask: int = 0
 
     def raw(self) -> Buffer:
         return self._raw
 
     def get_test_name(self) -> str:
-        if 1 in self._dirty_nums:
-            return self._d_test_name  # type: ignore[no-any-return]
+        if self._dirty_mask & 2:
+            return self._d_test_name  # type: ignore[no-any-return, attr-defined]
         return opaque_get_string(self._raw, 1)
 
     def set_test_name(self, val: str) -> None:
-        self._d_test_name = val
-        self._dirty_nums.add(1)
+        self._d_test_name: Any = val
+        self._dirty_mask |= 2
 
     def get_message_type(self) -> str:
-        if 2 in self._dirty_nums:
-            return self._d_message_type  # type: ignore[no-any-return]
+        if self._dirty_mask & 4:
+            return self._d_message_type  # type: ignore[no-any-return, attr-defined]
         return opaque_get_string(self._raw, 2)
 
     def set_message_type(self, val: str) -> None:
-        self._d_message_type = val
-        self._dirty_nums.add(2)
+        self._d_message_type: Any = val
+        self._dirty_mask |= 4
 
     def get_tier(self) -> int:
-        if 3 in self._dirty_nums:
-            return self._d_tier  # type: ignore[no-any-return]
+        if self._dirty_mask & 8:
+            return self._d_tier  # type: ignore[no-any-return, attr-defined]
         return opaque_get_sint32(self._raw, 3)
 
     def set_tier(self, val: int) -> None:
-        self._d_tier = val
-        self._dirty_nums.add(3)
+        self._d_tier: Any = val
+        self._dirty_mask |= 8
 
     def get_requested_output_format(self) -> int:
-        if 4 in self._dirty_nums:
-            return self._d_requested_output_format  # type: ignore[no-any-return]
+        if self._dirty_mask & 16:
+            return self._d_requested_output_format  # type: ignore[no-any-return, attr-defined]
         return opaque_get_sint32(self._raw, 4)
 
     def set_requested_output_format(self, val: int) -> None:
-        self._d_requested_output_format = val
-        self._dirty_nums.add(4)
+        self._d_requested_output_format: Any = val
+        self._dirty_mask |= 16
 
     def get_omnibuf_payload(self) -> bytes:
-        if 5 in self._dirty_nums:
-            return self._d_omnibuf_payload  # type: ignore[no-any-return]
+        if self._dirty_mask & 32:
+            return self._d_omnibuf_payload  # type: ignore[no-any-return, attr-defined]
         return opaque_get_bytes(self._raw, 5)
 
     def set_omnibuf_payload(self, val: bytes) -> None:
-        self._d_omnibuf_payload = val
-        self._dirty_nums.add(5)
+        self._d_omnibuf_payload: Any = val
+        self._dirty_mask |= 32
 
     def get_json_payload(self) -> str:
-        if 6 in self._dirty_nums:
-            return self._d_json_payload  # type: ignore[no-any-return]
+        if self._dirty_mask & 64:
+            return self._d_json_payload  # type: ignore[no-any-return, attr-defined]
         return opaque_get_string(self._raw, 6)
 
     def set_json_payload(self, val: str) -> None:
-        self._d_json_payload = val
-        self._dirty_nums.add(6)
+        self._d_json_payload: Any = val
+        self._dirty_mask |= 64
 
     def get_self_describing(self) -> bool:
-        if 7 in self._dirty_nums:
-            return self._d_self_describing  # type: ignore[no-any-return]
+        if self._dirty_mask & 128:
+            return self._d_self_describing  # type: ignore[no-any-return, attr-defined]
         return opaque_get_bool(self._raw, 7)
 
     def set_self_describing(self, val: bool) -> None:
-        self._d_self_describing = val
-        self._dirty_nums.add(7)
+        self._d_self_describing: Any = val
+        self._dirty_mask |= 128
 
     def get_test_opaque_splice(self) -> bool:
-        if 8 in self._dirty_nums:
-            return self._d_test_opaque_splice  # type: ignore[no-any-return]
+        if self._dirty_mask & 256:
+            return self._d_test_opaque_splice  # type: ignore[no-any-return, attr-defined]
         return opaque_get_bool(self._raw, 8)
 
     def set_test_opaque_splice(self, val: bool) -> None:
-        self._d_test_opaque_splice = val
-        self._dirty_nums.add(8)
+        self._d_test_opaque_splice: Any = val
+        self._dirty_mask |= 256
 
     def get_test_opaque_splice_shrink(self) -> bool:
-        if 9 in self._dirty_nums:
-            return self._d_test_opaque_splice_shrink  # type: ignore[no-any-return]
+        if self._dirty_mask & 512:
+            return self._d_test_opaque_splice_shrink  # type: ignore[no-any-return, attr-defined]
         return opaque_get_bool(self._raw, 9)
 
     def set_test_opaque_splice_shrink(self, val: bool) -> None:
-        self._d_test_opaque_splice_shrink = val
-        self._dirty_nums.add(9)
+        self._d_test_opaque_splice_shrink: Any = val
+        self._dirty_mask |= 512
 
     def _encode_dirty(self, dst: bytearray, fnum: int) -> None:
         if fnum == 1:
@@ -546,16 +537,18 @@ class OpaqueConformanceRequest:
         dst_prefix: Buffer | None = None,
         self_describing: bool = False,
     ) -> bytes:
-        if self._dirty_nums:
+        if self._dirty_mask:
             try:
-                spliced = splice_dirty_fields(None, self._raw, self._dirty_nums, self._encode_dirty)
+                spliced = splice_dirty_fields(None, self._raw, self._dirty_mask, self._encode_dirty)
             except UnicodeEncodeError as exc:
                 raise OmniBufEncodeError(str(exc)) from exc
             self._raw = spliced
-            self._dirty_nums.clear()
+            self._dirty_mask = 0
         else:
             validate_message(self._raw)
             spliced = bytes(self._raw)
+        if dst_prefix is None and not self_describing:
+            return spliced
         prefix = bytearray(dst_prefix) if dst_prefix is not None else bytearray()
         if self_describing and read_field0_schema_meta(spliced) is None:
             prefix.extend(_FIELD0_CONFORMANCE_REQUEST)
@@ -866,74 +859,68 @@ def unmarshal_conformance_response(data: Buffer, out: ConformanceResponse | None
     return _decode_conformance_response(data, out, 0, False)
 
 class OpaqueConformanceResponse:
-    __slots__ = ('_raw', '_dirty_nums', '_d_parse_error', '_d_serialize_error', '_d_runtime_error', '_d_skipped', '_d_omnibuf_payload', '_d_json_payload',)
+    __slots__ = ('_raw', '_dirty_mask', '_d_parse_error', '_d_serialize_error', '_d_runtime_error', '_d_skipped', '_d_omnibuf_payload', '_d_json_payload',)
 
     def __init__(self, raw: Buffer) -> None:
         self._raw: Buffer = raw
-        self._dirty_nums: set[int] = set()
-        self._d_parse_error: Any = None
-        self._d_serialize_error: Any = None
-        self._d_runtime_error: Any = None
-        self._d_skipped: Any = None
-        self._d_omnibuf_payload: Any = None
-        self._d_json_payload: Any = None
+        self._dirty_mask: int = 0
 
     def raw(self) -> Buffer:
         return self._raw
 
     def get_parse_error(self) -> str:
-        if 1 in self._dirty_nums:
-            return self._d_parse_error  # type: ignore[no-any-return]
+        if self._dirty_mask & 2:
+            return self._d_parse_error  # type: ignore[no-any-return, attr-defined]
         return opaque_get_string(self._raw, 1)
 
     def set_parse_error(self, val: str) -> None:
-        self._d_parse_error = val
-        self._dirty_nums.add(1)
+        self._d_parse_error: Any = val
+        self._dirty_mask |= 2
 
     def get_serialize_error(self) -> str:
-        if 2 in self._dirty_nums:
-            return self._d_serialize_error  # type: ignore[no-any-return]
+        if self._dirty_mask & 4:
+            return self._d_serialize_error  # type: ignore[no-any-return, attr-defined]
         return opaque_get_string(self._raw, 2)
 
     def set_serialize_error(self, val: str) -> None:
-        self._d_serialize_error = val
-        self._dirty_nums.add(2)
+        self._d_serialize_error: Any = val
+        self._dirty_mask |= 4
 
     def get_runtime_error(self) -> str:
-        if 3 in self._dirty_nums:
-            return self._d_runtime_error  # type: ignore[no-any-return]
+        if self._dirty_mask & 8:
+            return self._d_runtime_error  # type: ignore[no-any-return, attr-defined]
         return opaque_get_string(self._raw, 3)
 
     def set_runtime_error(self, val: str) -> None:
-        self._d_runtime_error = val
-        self._dirty_nums.add(3)
+        self._d_runtime_error: Any = val
+        self._dirty_mask |= 8
 
     def get_skipped(self) -> str:
-        if 4 in self._dirty_nums:
-            return self._d_skipped  # type: ignore[no-any-return]
+        if self._dirty_mask & 16:
+            return self._d_skipped  # type: ignore[no-any-return, attr-defined]
         return opaque_get_string(self._raw, 4)
 
     def set_skipped(self, val: str) -> None:
-        self._d_skipped = val
-        self._dirty_nums.add(4)
+        self._d_skipped: Any = val
+        self._dirty_mask |= 16
 
     def get_omnibuf_payload(self) -> bytes:
-        if 5 in self._dirty_nums:
-            return self._d_omnibuf_payload  # type: ignore[no-any-return]
+        if self._dirty_mask & 32:
+            return self._d_omnibuf_payload  # type: ignore[no-any-return, attr-defined]
         return opaque_get_bytes(self._raw, 5)
 
     def set_omnibuf_payload(self, val: bytes) -> None:
-        self._d_omnibuf_payload = val
-        self._dirty_nums.add(5)
+        self._d_omnibuf_payload: Any = val
+        self._dirty_mask |= 32
 
     def get_json_payload(self) -> str:
-        if 6 in self._dirty_nums:
-            return self._d_json_payload  # type: ignore[no-any-return]
+        if self._dirty_mask & 64:
+            return self._d_json_payload  # type: ignore[no-any-return, attr-defined]
         return opaque_get_string(self._raw, 6)
 
     def set_json_payload(self, val: str) -> None:
-        self._d_json_payload = val
-        self._dirty_nums.add(6)
+        self._d_json_payload: Any = val
+        self._dirty_mask |= 64
 
     def _encode_dirty(self, dst: bytearray, fnum: int) -> None:
         if fnum == 1:
@@ -961,16 +948,18 @@ class OpaqueConformanceResponse:
         dst_prefix: Buffer | None = None,
         self_describing: bool = False,
     ) -> bytes:
-        if self._dirty_nums:
+        if self._dirty_mask:
             try:
-                spliced = splice_dirty_fields(None, self._raw, self._dirty_nums, self._encode_dirty)
+                spliced = splice_dirty_fields(None, self._raw, self._dirty_mask, self._encode_dirty)
             except UnicodeEncodeError as exc:
                 raise OmniBufEncodeError(str(exc)) from exc
             self._raw = spliced
-            self._dirty_nums.clear()
+            self._dirty_mask = 0
         else:
             validate_message(self._raw)
             spliced = bytes(self._raw)
+        if dst_prefix is None and not self_describing:
+            return spliced
         prefix = bytearray(dst_prefix) if dst_prefix is not None else bytearray()
         if self_describing and read_field0_schema_meta(spliced) is None:
             prefix.extend(_FIELD0_CONFORMANCE_RESPONSE)
@@ -1185,54 +1174,50 @@ def unmarshal_all_types_sub_msg(data: Buffer, out: AllTypesSubMsg | None = None)
     return _decode_all_types_sub_msg(data, out, 0, False)
 
 class OpaqueAllTypesSubMsg:
-    __slots__ = ('_raw', '_dirty_nums', '_d_id', '_d_label', '_d_flag', '_d_score',)
+    __slots__ = ('_raw', '_dirty_mask', '_d_id', '_d_label', '_d_flag', '_d_score',)
 
     def __init__(self, raw: Buffer) -> None:
         self._raw: Buffer = raw
-        self._dirty_nums: set[int] = set()
-        self._d_id: Any = None
-        self._d_label: Any = None
-        self._d_flag: Any = None
-        self._d_score: Any = None
+        self._dirty_mask: int = 0
 
     def raw(self) -> Buffer:
         return self._raw
 
     def get_id(self) -> int:
-        if 1 in self._dirty_nums:
-            return self._d_id  # type: ignore[no-any-return]
+        if self._dirty_mask & 2:
+            return self._d_id  # type: ignore[no-any-return, attr-defined]
         return opaque_get_uint32(self._raw, 1)
 
     def set_id(self, val: int) -> None:
-        self._d_id = val
-        self._dirty_nums.add(1)
+        self._d_id: Any = val
+        self._dirty_mask |= 2
 
     def get_label(self) -> str:
-        if 2 in self._dirty_nums:
-            return self._d_label  # type: ignore[no-any-return]
+        if self._dirty_mask & 4:
+            return self._d_label  # type: ignore[no-any-return, attr-defined]
         return opaque_get_string(self._raw, 2)
 
     def set_label(self, val: str) -> None:
-        self._d_label = val
-        self._dirty_nums.add(2)
+        self._d_label: Any = val
+        self._dirty_mask |= 4
 
     def get_flag(self) -> bool:
-        if 3 in self._dirty_nums:
-            return self._d_flag  # type: ignore[no-any-return]
+        if self._dirty_mask & 8:
+            return self._d_flag  # type: ignore[no-any-return, attr-defined]
         return opaque_get_bool(self._raw, 3)
 
     def set_flag(self, val: bool) -> None:
-        self._d_flag = val
-        self._dirty_nums.add(3)
+        self._d_flag: Any = val
+        self._dirty_mask |= 8
 
     def get_score(self) -> int:
-        if 4 in self._dirty_nums:
-            return self._d_score  # type: ignore[no-any-return]
+        if self._dirty_mask & 16:
+            return self._d_score  # type: ignore[no-any-return, attr-defined]
         return opaque_get_sint64(self._raw, 4)
 
     def set_score(self, val: int) -> None:
-        self._d_score = val
-        self._dirty_nums.add(4)
+        self._d_score: Any = val
+        self._dirty_mask |= 16
 
     def _encode_dirty(self, dst: bytearray, fnum: int) -> None:
         if fnum == 1:
@@ -1254,16 +1239,18 @@ class OpaqueAllTypesSubMsg:
         dst_prefix: Buffer | None = None,
         self_describing: bool = False,
     ) -> bytes:
-        if self._dirty_nums:
+        if self._dirty_mask:
             try:
-                spliced = splice_dirty_fields(None, self._raw, self._dirty_nums, self._encode_dirty)
+                spliced = splice_dirty_fields(None, self._raw, self._dirty_mask, self._encode_dirty)
             except UnicodeEncodeError as exc:
                 raise OmniBufEncodeError(str(exc)) from exc
             self._raw = spliced
-            self._dirty_nums.clear()
+            self._dirty_mask = 0
         else:
             validate_message(self._raw)
             spliced = bytes(self._raw)
+        if dst_prefix is None and not self_describing:
+            return spliced
         prefix = bytearray(dst_prefix) if dst_prefix is not None else bytearray()
         if self_describing and read_field0_schema_meta(spliced) is None:
             prefix.extend(_FIELD0_ALL_TYPES_SUB_MSG)
@@ -1987,103 +1974,86 @@ def unmarshal_test_all_types(data: Buffer, out: TestAllTypes | None = None) -> T
     return _decode_test_all_types(data, out, 0, False)
 
 class OpaqueTestAllTypes:
-    __slots__ = ('_raw', '_dirty_nums', '_d_f1_uint32', '_d_f2_uint64', '_d_f3_sint32', '_d_f4_sint64', '_d_f5_bool', '_d_f6_string', '_d_f7_bytes', '_d_f8_sub_msg', '_d_f9_string_arr', '_d_f10_uint32_arr', '_d_f11_sub_msg_arr', '_d_f12_map_str_uint', '_d_f13_float32', '_d_f14_float64', '_d_f15_fixed32', '_d_f16_fixed64', '_d_f20_overflow_str',)
+    __slots__ = ('_raw', '_dirty_mask', '_d_f1_uint32', '_d_f2_uint64', '_d_f3_sint32', '_d_f4_sint64', '_d_f5_bool', '_d_f6_string', '_d_f7_bytes', '_d_f8_sub_msg', '_d_f9_string_arr', '_d_f10_uint32_arr', '_d_f11_sub_msg_arr', '_d_f12_map_str_uint', '_d_f13_float32', '_d_f14_float64', '_d_f15_fixed32', '_d_f16_fixed64', '_d_f20_overflow_str',)
 
     def __init__(self, raw: Buffer) -> None:
         self._raw: Buffer = raw
-        self._dirty_nums: set[int] = set()
-        self._d_f1_uint32: Any = None
-        self._d_f2_uint64: Any = None
-        self._d_f3_sint32: Any = None
-        self._d_f4_sint64: Any = None
-        self._d_f5_bool: Any = None
-        self._d_f6_string: Any = None
-        self._d_f7_bytes: Any = None
-        self._d_f8_sub_msg: Any = None
-        self._d_f9_string_arr: Any = None
-        self._d_f10_uint32_arr: Any = None
-        self._d_f11_sub_msg_arr: Any = None
-        self._d_f12_map_str_uint: Any = None
-        self._d_f13_float32: Any = None
-        self._d_f14_float64: Any = None
-        self._d_f15_fixed32: Any = None
-        self._d_f16_fixed64: Any = None
-        self._d_f20_overflow_str: Any = None
+        self._dirty_mask: int = 0
 
     def raw(self) -> Buffer:
         return self._raw
 
     def get_f1_uint32(self) -> int:
-        if 1 in self._dirty_nums:
-            return self._d_f1_uint32  # type: ignore[no-any-return]
+        if self._dirty_mask & 2:
+            return self._d_f1_uint32  # type: ignore[no-any-return, attr-defined]
         return opaque_get_uint32(self._raw, 1)
 
     def set_f1_uint32(self, val: int) -> None:
-        self._d_f1_uint32 = val
-        self._dirty_nums.add(1)
+        self._d_f1_uint32: Any = val
+        self._dirty_mask |= 2
 
     def get_f2_uint64(self) -> int:
-        if 2 in self._dirty_nums:
-            return self._d_f2_uint64  # type: ignore[no-any-return]
+        if self._dirty_mask & 4:
+            return self._d_f2_uint64  # type: ignore[no-any-return, attr-defined]
         return opaque_get_uint64(self._raw, 2)
 
     def set_f2_uint64(self, val: int) -> None:
-        self._d_f2_uint64 = val
-        self._dirty_nums.add(2)
+        self._d_f2_uint64: Any = val
+        self._dirty_mask |= 4
 
     def get_f3_sint32(self) -> int:
-        if 3 in self._dirty_nums:
-            return self._d_f3_sint32  # type: ignore[no-any-return]
+        if self._dirty_mask & 8:
+            return self._d_f3_sint32  # type: ignore[no-any-return, attr-defined]
         return opaque_get_sint32(self._raw, 3)
 
     def set_f3_sint32(self, val: int) -> None:
-        self._d_f3_sint32 = val
-        self._dirty_nums.add(3)
+        self._d_f3_sint32: Any = val
+        self._dirty_mask |= 8
 
     def get_f4_sint64(self) -> int:
-        if 4 in self._dirty_nums:
-            return self._d_f4_sint64  # type: ignore[no-any-return]
+        if self._dirty_mask & 16:
+            return self._d_f4_sint64  # type: ignore[no-any-return, attr-defined]
         return opaque_get_sint64(self._raw, 4)
 
     def set_f4_sint64(self, val: int) -> None:
-        self._d_f4_sint64 = val
-        self._dirty_nums.add(4)
+        self._d_f4_sint64: Any = val
+        self._dirty_mask |= 16
 
     def get_f5_bool(self) -> bool:
-        if 5 in self._dirty_nums:
-            return self._d_f5_bool  # type: ignore[no-any-return]
+        if self._dirty_mask & 32:
+            return self._d_f5_bool  # type: ignore[no-any-return, attr-defined]
         return opaque_get_bool(self._raw, 5)
 
     def set_f5_bool(self, val: bool) -> None:
-        self._d_f5_bool = val
-        self._dirty_nums.add(5)
+        self._d_f5_bool: Any = val
+        self._dirty_mask |= 32
 
     def get_f6_string(self) -> str:
-        if 6 in self._dirty_nums:
-            return self._d_f6_string  # type: ignore[no-any-return]
+        if self._dirty_mask & 64:
+            return self._d_f6_string  # type: ignore[no-any-return, attr-defined]
         return opaque_get_string(self._raw, 6)
 
     def set_f6_string(self, val: str) -> None:
-        self._d_f6_string = val
-        self._dirty_nums.add(6)
+        self._d_f6_string: Any = val
+        self._dirty_mask |= 64
 
     def get_f7_bytes(self) -> bytes:
-        if 7 in self._dirty_nums:
-            return self._d_f7_bytes  # type: ignore[no-any-return]
+        if self._dirty_mask & 128:
+            return self._d_f7_bytes  # type: ignore[no-any-return, attr-defined]
         return opaque_get_bytes(self._raw, 7)
 
     def set_f7_bytes(self, val: bytes) -> None:
-        self._d_f7_bytes = val
-        self._dirty_nums.add(7)
+        self._d_f7_bytes: Any = val
+        self._dirty_mask |= 128
 
     def get_f8_sub_msg(self) -> AllTypesSubMsg | None:
-        if 8 in self._dirty_nums:
-            return self._d_f8_sub_msg  # type: ignore[no-any-return]
+        if self._dirty_mask & 256:
+            return self._d_f8_sub_msg  # type: ignore[no-any-return, attr-defined]
         return opaque_get_submsg(self._raw, 8, _decode_all_types_sub_msg)
 
     def opaque_f8_sub_msg(self) -> OpaqueAllTypesSubMsg | None:
-        if 8 in self._dirty_nums:
-            _cur = self._d_f8_sub_msg
+        if self._dirty_mask & 256:
+            _cur = self._d_f8_sub_msg  # type: ignore[attr-defined]
             if _cur is None:
                 return None
             return OpaqueAllTypesSubMsg(_cur.marshal_omnibuf())
@@ -2093,89 +2063,89 @@ class OpaqueTestAllTypes:
         return OpaqueAllTypesSubMsg(_sub)
 
     def set_f8_sub_msg(self, val: Any) -> None:
-        self._d_f8_sub_msg = val
-        self._dirty_nums.add(8)
+        self._d_f8_sub_msg: Any = val
+        self._dirty_mask |= 256
 
     def get_f9_string_arr(self) -> list[str]:
-        if 9 in self._dirty_nums:
-            return self._d_f9_string_arr  # type: ignore[no-any-return]
+        if self._dirty_mask & 512:
+            return self._d_f9_string_arr  # type: ignore[no-any-return, attr-defined]
         return opaque_get_scalar_array(self._raw, 9, 10, 'string')
 
     def set_f9_string_arr(self, val: list[str]) -> None:
-        self._d_f9_string_arr = val
-        self._dirty_nums.add(9)
+        self._d_f9_string_arr: Any = val
+        self._dirty_mask |= 512
 
     def get_f10_uint32_arr(self) -> list[int]:
-        if 10 in self._dirty_nums:
-            return self._d_f10_uint32_arr  # type: ignore[no-any-return]
+        if self._dirty_mask & 1024:
+            return self._d_f10_uint32_arr  # type: ignore[no-any-return, attr-defined]
         return opaque_get_scalar_array(self._raw, 10, 0, 'uint32')
 
     def set_f10_uint32_arr(self, val: list[int]) -> None:
-        self._d_f10_uint32_arr = val
-        self._dirty_nums.add(10)
+        self._d_f10_uint32_arr: Any = val
+        self._dirty_mask |= 1024
 
     def get_f11_sub_msg_arr(self) -> list[AllTypesSubMsg]:
-        if 11 in self._dirty_nums:
-            return self._d_f11_sub_msg_arr  # type: ignore[no-any-return]
+        if self._dirty_mask & 2048:
+            return self._d_f11_sub_msg_arr  # type: ignore[no-any-return, attr-defined]
         return opaque_get_submsg_array(self._raw, 11, _decode_all_types_sub_msg)
 
     def set_f11_sub_msg_arr(self, val: list[AllTypesSubMsg]) -> None:
-        self._d_f11_sub_msg_arr = val
-        self._dirty_nums.add(11)
+        self._d_f11_sub_msg_arr: Any = val
+        self._dirty_mask |= 2048
 
     def get_f12_map_str_uint(self) -> dict[str, int]:
-        if 12 in self._dirty_nums:
-            return self._d_f12_map_str_uint  # type: ignore[no-any-return]
+        if self._dirty_mask & 4096:
+            return self._d_f12_map_str_uint  # type: ignore[no-any-return, attr-defined]
         return opaque_get_map(self._raw, 12, 10, 'string', 0, 'uint64', None)
 
     def set_f12_map_str_uint(self, val: dict[str, int]) -> None:
-        self._d_f12_map_str_uint = val
-        self._dirty_nums.add(12)
+        self._d_f12_map_str_uint: Any = val
+        self._dirty_mask |= 4096
 
     def get_f13_float32(self) -> float:
-        if 13 in self._dirty_nums:
-            return self._d_f13_float32  # type: ignore[no-any-return]
+        if self._dirty_mask & 8192:
+            return self._d_f13_float32  # type: ignore[no-any-return, attr-defined]
         return opaque_get_float32(self._raw, 13)
 
     def set_f13_float32(self, val: float) -> None:
-        self._d_f13_float32 = val
-        self._dirty_nums.add(13)
+        self._d_f13_float32: Any = val
+        self._dirty_mask |= 8192
 
     def get_f14_float64(self) -> float:
-        if 14 in self._dirty_nums:
-            return self._d_f14_float64  # type: ignore[no-any-return]
+        if self._dirty_mask & 16384:
+            return self._d_f14_float64  # type: ignore[no-any-return, attr-defined]
         return opaque_get_float64(self._raw, 14)
 
     def set_f14_float64(self, val: float) -> None:
-        self._d_f14_float64 = val
-        self._dirty_nums.add(14)
+        self._d_f14_float64: Any = val
+        self._dirty_mask |= 16384
 
     def get_f15_fixed32(self) -> int:
-        if 15 in self._dirty_nums:
-            return self._d_f15_fixed32  # type: ignore[no-any-return]
+        if self._dirty_mask & 32768:
+            return self._d_f15_fixed32  # type: ignore[no-any-return, attr-defined]
         return opaque_get_fixed32(self._raw, 15)
 
     def set_f15_fixed32(self, val: int) -> None:
-        self._d_f15_fixed32 = val
-        self._dirty_nums.add(15)
+        self._d_f15_fixed32: Any = val
+        self._dirty_mask |= 32768
 
     def get_f16_fixed64(self) -> int:
-        if 16 in self._dirty_nums:
-            return self._d_f16_fixed64  # type: ignore[no-any-return]
+        if self._dirty_mask & 65536:
+            return self._d_f16_fixed64  # type: ignore[no-any-return, attr-defined]
         return opaque_get_fixed64(self._raw, 16)
 
     def set_f16_fixed64(self, val: int) -> None:
-        self._d_f16_fixed64 = val
-        self._dirty_nums.add(16)
+        self._d_f16_fixed64: Any = val
+        self._dirty_mask |= 65536
 
     def get_f20_overflow_str(self) -> str:
-        if 20 in self._dirty_nums:
-            return self._d_f20_overflow_str  # type: ignore[no-any-return]
+        if self._dirty_mask & 1048576:
+            return self._d_f20_overflow_str  # type: ignore[no-any-return, attr-defined]
         return opaque_get_string(self._raw, 20)
 
     def set_f20_overflow_str(self, val: str) -> None:
-        self._d_f20_overflow_str = val
-        self._dirty_nums.add(20)
+        self._d_f20_overflow_str: Any = val
+        self._dirty_mask |= 1048576
 
     def _encode_dirty(self, dst: bytearray, fnum: int) -> None:
         if fnum == 1:
@@ -2237,16 +2207,18 @@ class OpaqueTestAllTypes:
         dst_prefix: Buffer | None = None,
         self_describing: bool = False,
     ) -> bytes:
-        if self._dirty_nums:
+        if self._dirty_mask:
             try:
-                spliced = splice_dirty_fields(None, self._raw, self._dirty_nums, self._encode_dirty)
+                spliced = splice_dirty_fields(None, self._raw, self._dirty_mask, self._encode_dirty)
             except UnicodeEncodeError as exc:
                 raise OmniBufEncodeError(str(exc)) from exc
             self._raw = spliced
-            self._dirty_nums.clear()
+            self._dirty_mask = 0
         else:
             validate_message(self._raw)
             spliced = bytes(self._raw)
+        if dst_prefix is None and not self_describing:
+            return spliced
         prefix = bytearray(dst_prefix) if dst_prefix is not None else bytearray()
         if self_describing and read_field0_schema_meta(spliced) is None:
             prefix.extend(_FIELD0_TEST_ALL_TYPES)
