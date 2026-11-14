@@ -1,5 +1,7 @@
 # omnibuf
 
+[![CI](https://github.com/omnibuf/omnibuf-py/actions/workflows/ci.yml/badge.svg)](https://github.com/omnibuf/omnibuf-py/actions/workflows/ci.yml)
+
 Explicit-typed, header-hop binary wire codec for Python (`v0.1`).
 
 `omnibuf` implements the OmniBuf v0.1 wire format for Python 3.11+ backed by a compiled Rust extension. Every package distribution ships strict type annotations (`py.typed`), `buf` CLI code generation, native [`protobuf-py`](https://github.com/bufbuild/protobuf-py) support, `@omnibuf_message` dataclasses, lazy `Opaque` views, and schema-less `Field #0` inspection.
