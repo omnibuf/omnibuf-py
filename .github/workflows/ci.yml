@@ -24,6 +24,9 @@ jobs:
         with:
           install: true
 
+      - name: Install rustfmt and clippy components
+        run: rustup component add rustfmt clippy
+
       - name: Sync uv environment and build PyO3 extension
         run: just install
 
