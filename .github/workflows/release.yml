@@ -1,0 +1,187 @@
+name: Release & Publish to PyPI
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Format, Lint, Mypy, Pytest & Conformance
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install tools via mise
+        uses: jdx/mise-action@v5
+        with:
+          install: true
+
+      - name: Install rustfmt and clippy components
+        run: rustup component add rustfmt clippy
+
+      - name: Sync uv environment and build PyO3 extension
+        run: just install
+
+      - name: Install conformance-runner
+        run: |
+          mise use -g go@1.27
+          GOBIN="$HOME/.local/bin" mise exec -- go install github.com/omnibuf/omnibuf-go/cmd/conformance-runner@71dad83aadd7dc65401d662521d34cfaeb1011ab
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Run full CI suite
+        run: just ci
+
+  linux:
+    name: Wheels (manylinux ${{ matrix.platform.target }})
+    needs: verify
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      matrix:
+        platform:
+          - runner: ubuntu-24.04
+            target: x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Build manylinux wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.platform.target }}
+          args: --release --out dist --find-interpreter
+          manylinux: auto
+      - uses: actions/upload-artifact@v6
+        with:
+          name: wheels-linux-${{ matrix.platform.target }}
+          path: dist
+
+  musllinux:
+    name: Wheels (musllinux ${{ matrix.platform.target }})
+    needs: verify
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      matrix:
+        platform:
+          - runner: ubuntu-24.04
+            target: x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Build musllinux wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.platform.target }}
+          args: --release --out dist --find-interpreter
+          manylinux: musllinux_1_2
+      - uses: actions/upload-artifact@v6
+        with:
+          name: wheels-musllinux-${{ matrix.platform.target }}
+          path: dist
+
+  macos:
+    name: Wheels (macOS ${{ matrix.platform.target }})
+    needs: verify
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      matrix:
+        platform:
+          - runner: macos-15-intel
+            target: x86_64
+          - runner: macos-latest
+            target: aarch64
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: |
+            3.11
+            3.12
+            3.13
+            3.14
+      - name: Build macOS wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.platform.target }}
+          args: --release --out dist --find-interpreter
+      - uses: actions/upload-artifact@v6
+        with:
+          name: wheels-macos-${{ matrix.platform.target }}
+          path: dist
+
+  windows:
+    name: Wheels (Windows x64)
+    needs: verify
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: |
+            3.11
+            3.12
+            3.13
+            3.14
+          architecture: x64
+      - name: Build Windows x64 wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x64
+          args: --release --out dist --find-interpreter
+      - uses: actions/upload-artifact@v6
+        with:
+          name: wheels-windows-x64
+          path: dist
+
+  sdist:
+    name: Source Distribution (sdist)
+    needs: verify
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v6
+        with:
+          name: wheels-sdist
+          path: dist
+
+  publish:
+    name: Publish to PyPI via OIDC
+    needs: [linux, musllinux, macos, windows, sdist]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download built wheels and sdist
+        uses: actions/download-artifact@v7
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          skip-existing: true
