@@ -13,7 +13,13 @@ from collections.abc import Callable
 from dataclasses import MISSING, Field, dataclass
 from typing import Annotated, Any, Literal, Union, dataclass_transform, overload
 
-from ._omnibuf_ext import CompiledCodec
+from ._omnibuf_ext import (
+    CompiledCodec,
+    marshal_dataclass_py,
+    register_dataclass_codec_py,
+    set_dataclass_resolver_py,
+    unmarshal_dataclass_py,
+)
 from .encoder import Encoder
 from .field0 import SchemaMeta, encode_field0_schema_meta
 from .wire import (
@@ -32,7 +38,6 @@ from .wire import (
     WIRE_STRING,
     WIRE_SUB_MSG,
     WIRE_UINT,
-    Buffer,
     OmniBufEncodeError,
 )
 
@@ -899,6 +904,7 @@ def _get_struct_codec(cls: type[Any]) -> _StructCodec:
                 for p_sc in pending:
                     _CODEC_CACHE[p_sc.cls] = p_sc
                     _RUST_CODEC_CACHE[p_sc.cls] = p_sc.rust_codec
+                    register_dataclass_codec_py(p_sc.cls, p_sc.rust_codec)
         except Exception:
             if is_root:
                 _PENDING_FINALIZE.clear()
@@ -908,38 +914,17 @@ def _get_struct_codec(cls: type[Any]) -> _StructCodec:
         return sc
 
 
-def marshal(
-    msg: Any,
-    *,
-    deterministic: bool = False,
-    self_describing: bool = False,
-) -> bytes:
-    """Serializes an @omnibuf_message dataclass instance into OmniBuf wire bytes."""
-    rc = _RUST_CODEC_CACHE.get(type(msg))
-    if rc is None:
-        rc = _get_struct_codec(type(msg)).rust_codec
-    return rc.marshal(msg, deterministic=deterministic, self_describing=self_describing)
+def _resolve_rust_codec_for_type(cls: type[Any]) -> CompiledCodec[Any]:
+    rc = _RUST_CODEC_CACHE.get(cls)
+    if rc is not None:
+        return rc
+    return _get_struct_codec(cls).rust_codec
 
 
-@overload
-def unmarshal[T](packet: Buffer, target: type[T]) -> T: ...
+set_dataclass_resolver_py(_resolve_rust_codec_for_type)
 
-
-@overload
-def unmarshal[T](packet: Buffer, target: T) -> T: ...
-
-
-def unmarshal(packet: Buffer, target: Any) -> Any:
-    """Decodes OmniBuf wire bytes into an @omnibuf_message class or existing instance."""
-    if isinstance(target, type):
-        rc = _RUST_CODEC_CACHE.get(target)
-        if rc is None:
-            rc = _get_struct_codec(target).rust_codec
-        return rc.unmarshal(packet)
-    rc = _RUST_CODEC_CACHE.get(type(target))
-    if rc is None:
-        rc = _get_struct_codec(type(target)).rust_codec
-    return rc.unmarshal(packet, target)
+marshal = marshal_dataclass_py
+unmarshal = unmarshal_dataclass_py
 
 
 def schema_meta_for(target: Any) -> SchemaMeta:

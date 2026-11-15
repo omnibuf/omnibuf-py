@@ -18,7 +18,10 @@ mod codec;
 mod opaque;
 
 use blind::{decode_blind_json_py, decode_blind_py};
-use codec::CompiledCodec;
+use codec::{
+    CompiledCodec, marshal_dataclass_py, register_dataclass_codec_py, set_dataclass_resolver_py,
+    unmarshal_dataclass_py,
+};
 use opaque::{
     OpaqueView, opaque_get_bool_py, opaque_get_bytes_py, opaque_get_fixed32_py,
     opaque_get_fixed64_py, opaque_get_float32_py, opaque_get_float64_py, opaque_get_sfixed32_py,
@@ -523,6 +526,10 @@ fn _omnibuf_ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(splice_fields_py, m)?)?;
     m.add_function(wrap_pyfunction!(decode_blind_py, m)?)?;
     m.add_function(wrap_pyfunction!(decode_blind_json_py, m)?)?;
+    m.add_function(wrap_pyfunction!(register_dataclass_codec_py, m)?)?;
+    m.add_function(wrap_pyfunction!(set_dataclass_resolver_py, m)?)?;
+    m.add_function(wrap_pyfunction!(marshal_dataclass_py, m)?)?;
+    m.add_function(wrap_pyfunction!(unmarshal_dataclass_py, m)?)?;
     m.add_function(wrap_pyfunction!(opaque_get_uint32_py, m)?)?;
     m.add_function(wrap_pyfunction!(opaque_get_uint64_py, m)?)?;
     m.add_function(wrap_pyfunction!(opaque_get_sint32_py, m)?)?;
