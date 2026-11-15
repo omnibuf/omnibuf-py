@@ -176,7 +176,7 @@ just ci           # Run fmt-check, lint, test, and conformance
 
 ## License
 
-MIT
+Released under the [Apache 2.0 License](./LICENSE).
 
 ## Runtime safety and ownership
 
