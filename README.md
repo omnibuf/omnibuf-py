@@ -1,10 +1,12 @@
 # omnibuf
 
 [![CI](https://github.com/omnibuf/omnibuf-py/actions/workflows/ci.yml/badge.svg)](https://github.com/omnibuf/omnibuf-py/actions/workflows/ci.yml)
+[![Wire Spec: v0.1](https://img.shields.io/badge/spec-v0.1-111111?style=flat&labelColor=111111&color=FF4F18)](https://omnibuf.com/spec)
+[![Website](https://img.shields.io/badge/website-omnibuf.com-111111?style=flat&labelColor=111111&color=D4FF33)](https://omnibuf.com/py)
 
-Explicit-typed, header-hop binary wire codec for Python (`v0.1`).
+Explicit-typed, header-hop binary wire codec for Python.
 
-`omnibuf` implements the OmniBuf v0.1 wire format for Python 3.11+ backed by a compiled Rust extension. Every package distribution ships strict type annotations (`py.typed`), `buf` CLI code generation, native [`protobuf-py`](https://github.com/bufbuild/protobuf-py) support, `@omnibuf_message` dataclasses, lazy `Opaque` views, and schema-less `Field #0` inspection.
+`omnibuf` implements **[OmniBuf Wire Specification v0.1](https://omnibuf.com/spec)** for Python 3.11+ backed by a compiled Rust extension. Every package distribution ships strict type annotations (`py.typed`), `buf` CLI code generation, native [`protobuf-py`](https://github.com/bufbuild/protobuf-py) support, `@omnibuf_message` dataclasses, lazy `Opaque` views, and schema-less `Field #0` inspection.
 
 ## Highlights
 
