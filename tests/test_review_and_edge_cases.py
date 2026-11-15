@@ -826,3 +826,108 @@ assert peer_omnibuf_pb.OpaquePeerUpdate(pb_wire).get_sequence() == 99
         check=False,
     )
     assert proc.returncode == 0, f"stderr:\n{proc.stderr}"
+
+
+@pytest.mark.parametrize("number", [33_554_431, 33_554_432, 268_435_457, 536_870_911])
+@pytest.mark.parametrize("slots", [False, True])
+@pytest.mark.parametrize(
+    ("field_type", "value", "wire"),
+    [
+        (int, 42, None),
+        (bool, True, None),
+        (float, 1.5, None),
+        (str, "hello", None),
+        (bytes, b"hello", None),
+        (int, 42, "fixed32"),
+        (int, 42, "fixed64"),
+        (list[int], [1, 42], None),
+    ],
+)
+def test_large_field_tags(number: int, slots: bool, field_type: Any, value: Any, wire: Any) -> None:
+    from dataclasses import make_dataclass
+
+    from omnibuf import marshal, omnibuf_field, omnibuf_message, unmarshal
+
+    cls: Any = omnibuf_message(
+        make_dataclass(
+            f"LargeTags{number}{slots}",
+            [
+                (
+                    "value",
+                    field_type,
+                    omnibuf_field(number, default_factory=lambda: value, wire=wire),
+                ),
+            ],
+            slots=slots,
+        )
+    )
+    raw = marshal(cls())
+    assert f"field_{number}" in decode_blind(raw)
+    assert unmarshal(raw, cls).value == value
+
+
+def test_foreign_slot_descriptor_rejected() -> None:
+    from omnibuf import CompiledCodec
+
+    class Other:
+        __slots__ = ("value",)
+
+    class Victim:
+        __slots__ = ("actual",)
+
+    setattr(Victim, "value", Other.__dict__["value"])  # noqa: B010
+    codec = CompiledCodec(Victim, "Victim")
+    with pytest.raises(OmniBufEncodeError, match="unrelated class"):
+        codec.set_fields([dict(number=1, attr="value", kind="uint64", wire_type=WIRE_UINT)], b"")
+
+
+def test_optional_getter_error_propagates() -> None:
+    from omnibuf import CompiledCodec
+
+    class Message:
+        @property
+        def values(self) -> list[int]:
+            raise RuntimeError("getter failed")
+
+        @values.setter
+        def values(self, value: list[int]) -> None:
+            raise AssertionError("must not replace a failed getter")
+
+    codec = CompiledCodec(Message, "Message", fast_alloc=False)
+    codec.set_fields(
+        [
+            dict(
+                number=1,
+                attr="values",
+                kind="array_scalar",
+                wire_type=WIRE_ARRAY,
+                elem_kind="uint64",
+                elem_wt=WIRE_UINT,
+            )
+        ],
+        b"",
+    )
+    # Field 1: array<uint>, one element with value 42.
+    with pytest.raises(RuntimeError, match="getter failed"):
+        codec.decode_at(bytes([0x3B, 0x07, WIRE_UINT, 0x03, 0x55]), Message(), merge=True)
+
+
+def test_extension_codec_cache_releases_evicted_classes() -> None:
+    import gc
+    import weakref
+
+    from omnibuf import CompiledCodec
+    from omnibuf._omnibuf_ext import register_dataclass_codec_py
+
+    def register(index: int) -> weakref.ReferenceType[type[Any]]:
+        cls = type(f"EvictedCodec{index}", (), {})
+        codec: CompiledCodec[Any] = CompiledCodec(cls, cls.__name__)
+        codec.set_fields([], b"")
+        register_dataclass_codec_py(cls, codec)
+        return weakref.ref(cls)
+
+    first = register(0)
+    for index in range(1, 130):
+        register(index)
+    gc.collect()
+    assert first() is None

@@ -231,7 +231,7 @@ pub fn decode_blind_py<'py>(
     packet: &Bound<'py, PyAny>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let map = {
-        let borrowed = LeafBytes::extract(py, packet.as_ptr())?;
+        let borrowed = LeafBytes::extract(py, packet)?;
         decode_blind(borrowed.as_slice()).map_err(|e| decode_err(py, e.to_string()))?
     };
     blind_map_to_py_dict(py, &map)
@@ -247,7 +247,7 @@ pub fn decode_blind_json_py(
     indent: Option<usize>,
 ) -> PyResult<String> {
     let map = {
-        let borrowed = LeafBytes::extract(py, packet.as_ptr())?;
+        let borrowed = LeafBytes::extract(py, packet)?;
         decode_blind(borrowed.as_slice()).map_err(|e| decode_err(py, e.to_string()))?
     };
     if map_has_non_finite(&map) {

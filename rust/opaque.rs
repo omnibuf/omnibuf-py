@@ -41,7 +41,7 @@ impl RawBacking {
                 });
             }
         }
-        let borrowed = LeafBytes::extract(py, raw.as_ptr())?;
+        let borrowed = LeafBytes::extract(py, raw)?;
         let vec = borrowed.as_slice().to_vec();
         drop(borrowed);
         Ok(Self::Owned(vec))
@@ -1856,7 +1856,7 @@ impl OpaqueView {
             }
             return Err(encode_err(py, "omnibuf: bytes value cannot be None"));
         }
-        let leaf = LeafBytes::extract(py, val.as_ptr())
+        let leaf = LeafBytes::extract(py, val)
             .map_err(|e| encode_err(py, format!("omnibuf: invalid bytes buffer: {e}")))?;
         let vec = leaf.as_slice().to_vec();
         drop(leaf);
@@ -1903,7 +1903,7 @@ impl OpaqueView {
             }
             let mut out = Vec::with_capacity(src.len() + 64);
             if let Some(p_obj) = dst_prefix {
-                let pb = LeafBytes::extract(py, p_obj.as_ptr())?;
+                let pb = LeafBytes::extract(py, p_obj)?;
                 out.extend_from_slice(pb.as_slice());
             }
             if self_describing && read_field0_schema_meta(src).is_none() {
@@ -2005,7 +2005,7 @@ impl OpaqueView {
 
         let mut prefix_out = Vec::with_capacity(spliced_vec.len() + 64);
         if let Some(p_obj) = dst_prefix {
-            let pb = LeafBytes::extract(py, p_obj.as_ptr())?;
+            let pb = LeafBytes::extract(py, p_obj)?;
             prefix_out.extend_from_slice(pb.as_slice());
         }
         if self_describing && read_field0_schema_meta(&spliced_vec).is_none() {
@@ -2034,7 +2034,7 @@ pub fn opaque_get_uint32_py(
     if field_num <= 0 || field_num > MAX_FIELD_NUMBER as i64 {
         return Ok(default);
     }
-    let b = LeafBytes::extract(py, raw.as_ptr())?;
+    let b = LeafBytes::extract(py, raw)?;
     Ok(slice_read_uint(b.as_slice(), field_num as u32).map_or(default, |v| v as u32))
 }
 
@@ -2049,7 +2049,7 @@ pub fn opaque_get_uint64_py(
     if field_num <= 0 || field_num > MAX_FIELD_NUMBER as i64 {
         return Ok(default);
     }
-    let b = LeafBytes::extract(py, raw.as_ptr())?;
+    let b = LeafBytes::extract(py, raw)?;
     Ok(slice_read_uint(b.as_slice(), field_num as u32).unwrap_or(default))
 }
 
@@ -2064,7 +2064,7 @@ pub fn opaque_get_sint32_py(
     if field_num <= 0 || field_num > MAX_FIELD_NUMBER as i64 {
         return Ok(default);
     }
-    let b = LeafBytes::extract(py, raw.as_ptr())?;
+    let b = LeafBytes::extract(py, raw)?;
     Ok(slice_read_sint(b.as_slice(), field_num as u32).map_or(default, |v| v as i32))
 }
 
@@ -2079,7 +2079,7 @@ pub fn opaque_get_sint64_py(
     if field_num <= 0 || field_num > MAX_FIELD_NUMBER as i64 {
         return Ok(default);
     }
-    let b = LeafBytes::extract(py, raw.as_ptr())?;
+    let b = LeafBytes::extract(py, raw)?;
     Ok(slice_read_sint(b.as_slice(), field_num as u32).unwrap_or(default))
 }
 
@@ -2094,7 +2094,7 @@ pub fn opaque_get_bool_py(
     if field_num <= 0 || field_num > MAX_FIELD_NUMBER as i64 {
         return Ok(default);
     }
-    let b = LeafBytes::extract(py, raw.as_ptr())?;
+    let b = LeafBytes::extract(py, raw)?;
     Ok(slice_read_bool(b.as_slice(), field_num as u32).unwrap_or(default))
 }
 
@@ -2109,7 +2109,7 @@ pub fn opaque_get_fixed32_py(
     if field_num <= 0 || field_num > MAX_FIELD_NUMBER as i64 {
         return Ok(default);
     }
-    let b = LeafBytes::extract(py, raw.as_ptr())?;
+    let b = LeafBytes::extract(py, raw)?;
     Ok(slice_read_fixed32(b.as_slice(), field_num as u32).unwrap_or(default))
 }
 
@@ -2124,7 +2124,7 @@ pub fn opaque_get_sfixed32_py(
     if field_num <= 0 || field_num > MAX_FIELD_NUMBER as i64 {
         return Ok(default);
     }
-    let b = LeafBytes::extract(py, raw.as_ptr())?;
+    let b = LeafBytes::extract(py, raw)?;
     Ok(slice_read_sfixed32(b.as_slice(), field_num as u32).unwrap_or(default))
 }
 
@@ -2139,7 +2139,7 @@ pub fn opaque_get_fixed64_py(
     if field_num <= 0 || field_num > MAX_FIELD_NUMBER as i64 {
         return Ok(default);
     }
-    let b = LeafBytes::extract(py, raw.as_ptr())?;
+    let b = LeafBytes::extract(py, raw)?;
     Ok(slice_read_fixed64(b.as_slice(), field_num as u32).unwrap_or(default))
 }
 
@@ -2154,7 +2154,7 @@ pub fn opaque_get_sfixed64_py(
     if field_num <= 0 || field_num > MAX_FIELD_NUMBER as i64 {
         return Ok(default);
     }
-    let b = LeafBytes::extract(py, raw.as_ptr())?;
+    let b = LeafBytes::extract(py, raw)?;
     Ok(slice_read_sfixed64(b.as_slice(), field_num as u32).unwrap_or(default))
 }
 
@@ -2169,7 +2169,7 @@ pub fn opaque_get_float32_py(
     if field_num <= 0 || field_num > MAX_FIELD_NUMBER as i64 {
         return Ok(default);
     }
-    let b = LeafBytes::extract(py, raw.as_ptr())?;
+    let b = LeafBytes::extract(py, raw)?;
     Ok(slice_read_float32(b.as_slice(), field_num as u32).map_or(default, f64::from))
 }
 
@@ -2184,7 +2184,7 @@ pub fn opaque_get_float64_py(
     if field_num <= 0 || field_num > MAX_FIELD_NUMBER as i64 {
         return Ok(default);
     }
-    let b = LeafBytes::extract(py, raw.as_ptr())?;
+    let b = LeafBytes::extract(py, raw)?;
     Ok(slice_read_float64(b.as_slice(), field_num as u32).unwrap_or(default))
 }
 
@@ -2200,7 +2200,7 @@ pub fn opaque_get_string_py<'py>(
         return Ok(PyString::new(py, default));
     }
     let out_opt = {
-        let b = LeafBytes::extract(py, raw.as_ptr())?;
+        let b = LeafBytes::extract(py, raw)?;
         slice_read_str(b.as_slice(), field_num as u32).map(str::to_owned)
     };
     if let Some(s) = out_opt {
@@ -2220,7 +2220,7 @@ pub fn opaque_get_bytes_py<'py>(
 ) -> PyResult<Bound<'py, PyBytes>> {
     let make_default = || -> PyResult<Bound<'py, PyBytes>> {
         if let Some(d) = default {
-            let db = LeafBytes::extract(py, d.as_ptr())?;
+            let db = LeafBytes::extract(py, d)?;
             let vec = db.as_slice().to_vec();
             drop(db);
             Ok(PyBytes::new(py, &vec))
@@ -2232,7 +2232,7 @@ pub fn opaque_get_bytes_py<'py>(
         return make_default();
     }
     let out_opt = {
-        let b = LeafBytes::extract(py, raw.as_ptr())?;
+        let b = LeafBytes::extract(py, raw)?;
         slice_read_bytes(b.as_slice(), field_num as u32).map(|s| s.to_vec())
     };
     if let Some(found) = out_opt {
@@ -2252,7 +2252,7 @@ pub fn opaque_get_submsg_slice_py<'py>(
         return Ok(None);
     }
     let found_vec: Option<Vec<u8>> = {
-        let b = LeafBytes::extract(py, raw.as_ptr())?;
+        let b = LeafBytes::extract(py, raw)?;
         let slice = b.as_slice();
         if let Ok(f16) = u16::try_from(field_num as u32) {
             read_sub_msg(slice, f16).map(|cow| cow.into_owned())

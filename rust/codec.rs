@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use omnibuf_core::field0::SchemaMeta as CoreSchemaMeta;
@@ -8,7 +9,7 @@ use omnibuf_core::wire::{
     append_varint, backpatch_container_len, decode_varint, decode_zigzag, encode_zigzag,
     parse_array_header, parse_map_header, read_len_slice, read_str_slice, validate_utf8,
 };
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyAttributeError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{
@@ -19,17 +20,16 @@ use crate::{InputBytes, LeafBytes, decode_err, encode_err, validate_unknown_valu
 
 thread_local! {
     static TLS_ENCODER: RefCell<Encoder> = RefCell::new(Encoder::new(4096));
-    // Stores Copy `(cls_ptr, codec_ptr)` pairs for zero-overhead dataclass lookup;
-    // every entry inserted here is permanently pinned in `PINNED_DATACLASS_CODECS`
-    // so neither pointer can ever dangle or alias a newly created class, and `Cell`
-    // over `Copy` integers registers zero TLS destructor at `Py_FinalizeEx`.
-    static TLS_DC_CACHE: Cell<[(usize, usize); 4]> = const { Cell::new([(0, 0); 4]) };
+    // Stores Copy `(cls_ptr, codec_obj_ptr, epoch)` tuples for GIL-protected lookup.
+    // Entries carry no owning Python reference and are invalidated whenever
+    // `DATACLASS_CODECS` evicts an entry by advancing `DATACLASS_CACHE_EPOCH`.
+    static TLS_DC_CACHE: Cell<[(usize, usize, u64); 4]> = const { Cell::new([(0, 0, 0); 4]) };
 }
 
 const HAS_GIL: bool = core::mem::size_of::<ffi::PyObject>() == 2 * core::mem::size_of::<usize>();
 
-static PINNED_DATACLASS_CODECS: Mutex<Vec<(Py<PyType>, Py<CompiledCodec>)>> =
-    Mutex::new(Vec::new());
+static DATACLASS_CODECS: Mutex<Vec<(Py<PyType>, Py<CompiledCodec>)>> = Mutex::new(Vec::new());
+static DATACLASS_CACHE_EPOCH: AtomicU64 = AtomicU64::new(1);
 static DATACLASS_RESOLVER: OnceLock<Py<PyAny>> = OnceLock::new();
 
 #[inline(always)]
@@ -68,84 +68,85 @@ fn backpatch_container_fast(dst: &mut Vec<u8>, len_pos: usize) {
 }
 
 #[inline(always)]
-fn write_raw_tag(dst: &mut Vec<u8>, tag_u64: u64, tag_len: u8) {
-    let tlen = usize::from(tag_len);
-    dst.reserve(8);
+fn write_raw_tag(dst: &mut Vec<u8>, tag_bytes: [u8; 9], tag_len: u8) {
+    let tlen = usize::from(tag_len).min(9);
+    dst.reserve(9);
     unsafe {
         let len = dst.len();
-        core::ptr::write_unaligned(dst.as_mut_ptr().add(len).cast::<u64>(), tag_u64);
+        core::ptr::copy_nonoverlapping(tag_bytes.as_ptr(), dst.as_mut_ptr().add(len), 9);
         dst.set_len(len + tlen);
     }
 }
 
 #[inline(always)]
-fn write_raw_tag_and_len_placeholder(dst: &mut Vec<u8>, tag_u64: u64, tag_len: u8) -> usize {
-    let tlen = usize::from(tag_len);
-    dst.reserve(8);
+fn write_raw_tag_and_len_placeholder(dst: &mut Vec<u8>, tag_bytes: [u8; 9], tag_len: u8) -> usize {
+    let tlen = usize::from(tag_len).min(9);
+    dst.reserve(11);
     unsafe {
         let len = dst.len();
-        // `tag_u64` carries zero bytes in positions `tlen..8` (`tlen <= 5`), so a single
-        // 8-byte store writes both the tag and the 2-byte `[0, 0]` container placeholder.
-        core::ptr::write_unaligned(dst.as_mut_ptr().add(len).cast::<u64>(), tag_u64);
+        let ptr = dst.as_mut_ptr().add(len);
+        core::ptr::copy_nonoverlapping(tag_bytes.as_ptr(), ptr, 9);
         let len_pos = len + tlen;
+        core::ptr::write_unaligned(ptr.add(tlen).cast::<u16>(), 0);
         dst.set_len(len_pos + 2);
         len_pos
     }
 }
 
 #[inline(always)]
-fn write_raw_tagged_varint(dst: &mut Vec<u8>, tag_u64: u64, tag_len: u8, v: u64) {
-    let tlen = usize::from(tag_len);
-    dst.reserve(17);
+fn write_raw_tagged_varint(dst: &mut Vec<u8>, tag_bytes: [u8; 9], tag_len: u8, v: u64) {
+    let tlen = usize::from(tag_len).min(9);
+    dst.reserve(18);
     unsafe {
         let len = dst.len();
         let ptr = dst.as_mut_ptr().add(len);
-        core::ptr::write_unaligned(ptr.cast::<u64>(), tag_u64);
+        core::ptr::copy_nonoverlapping(tag_bytes.as_ptr(), ptr, 9);
         let vn = put_varint_inline(ptr.add(tlen), v);
         dst.set_len(len + tlen + vn);
     }
 }
 
 #[inline(always)]
-fn write_raw_tagged_fixed4(dst: &mut Vec<u8>, tag_u64: u64, tag_len: u8, val: [u8; 4]) {
-    let tlen = usize::from(tag_len);
-    dst.reserve(12);
+fn write_raw_tagged_fixed4(dst: &mut Vec<u8>, tag_bytes: [u8; 9], tag_len: u8, val: [u8; 4]) {
+    let tlen = usize::from(tag_len).min(9);
+    dst.reserve(13);
     unsafe {
         let len = dst.len();
         let ptr = dst.as_mut_ptr().add(len);
-        core::ptr::write_unaligned(ptr.cast::<u64>(), tag_u64);
+        core::ptr::copy_nonoverlapping(tag_bytes.as_ptr(), ptr, 9);
         core::ptr::copy_nonoverlapping(val.as_ptr(), ptr.add(tlen), 4);
         dst.set_len(len + tlen + 4);
     }
 }
 
 #[inline(always)]
-fn write_raw_tagged_fixed8(dst: &mut Vec<u8>, tag_u64: u64, tag_len: u8, val: [u8; 8]) {
-    let tlen = usize::from(tag_len);
-    dst.reserve(16);
+fn write_raw_tagged_fixed8(dst: &mut Vec<u8>, tag_bytes: [u8; 9], tag_len: u8, val: [u8; 8]) {
+    let tlen = usize::from(tag_len).min(9);
+    dst.reserve(17);
     unsafe {
         let len = dst.len();
         let ptr = dst.as_mut_ptr().add(len);
-        core::ptr::write_unaligned(ptr.cast::<u64>(), tag_u64);
+        core::ptr::copy_nonoverlapping(tag_bytes.as_ptr(), ptr, 9);
         core::ptr::copy_nonoverlapping(val.as_ptr(), ptr.add(tlen), 8);
         dst.set_len(len + tlen + 8);
     }
 }
 
+// SAFETY: src_ptr must remain valid for blen bytes and must not alias dst.
 #[inline(always)]
 unsafe fn write_raw_tagged_bytes(
     dst: &mut Vec<u8>,
-    tag_u64: u64,
+    tag_bytes: [u8; 9],
     tag_len: u8,
     src_ptr: *const u8,
     blen: usize,
 ) {
-    let tlen = usize::from(tag_len);
-    dst.reserve(blen + 17);
+    let tlen = usize::from(tag_len).min(9);
+    dst.reserve(blen.checked_add(18).expect("omnibuf: buffer size overflow"));
     unsafe {
         let len = dst.len();
         let ptr = dst.as_mut_ptr().add(len);
-        core::ptr::write_unaligned(ptr.cast::<u64>(), tag_u64);
+        core::ptr::copy_nonoverlapping(tag_bytes.as_ptr(), ptr, 9);
         let vn = put_varint_inline(ptr.add(tlen), blen as u64);
         if blen > 0 {
             core::ptr::copy_nonoverlapping(src_ptr, ptr.add(tlen + vn), blen);
@@ -156,7 +157,7 @@ unsafe fn write_raw_tagged_bytes(
 
 #[inline(always)]
 unsafe fn write_raw_bytes_elem(dst: &mut Vec<u8>, src_ptr: *const u8, blen: usize) {
-    dst.reserve(blen + 9);
+    dst.reserve(blen.checked_add(9).expect("omnibuf: buffer size overflow"));
     unsafe {
         let len = dst.len();
         let ptr = dst.as_mut_ptr().add(len);
@@ -329,8 +330,11 @@ impl FieldAccess {
                     }
                     let ptr = (sb.get_fn)(sb.descr.as_ptr(), obj_ptr, sb.cls_ptr);
                     if ptr.is_null() {
-                        ffi::PyErr_Clear();
-                        return Ok(None);
+                        let err = PyErr::fetch(py);
+                        if err.is_instance_of::<PyAttributeError>(py) {
+                            return Ok(None);
+                        }
+                        return Err(err);
                     }
                     if ptr == ffi::Py_None() {
                         ffi::Py_DECREF(ptr);
@@ -341,8 +345,11 @@ impl FieldAccess {
                 Self::Attr(attr) => {
                     let ptr = ffi::PyObject_GetAttr(obj_ptr, attr.as_ptr());
                     if ptr.is_null() {
-                        ffi::PyErr_Clear();
-                        return Ok(None);
+                        let err = PyErr::fetch(py);
+                        if err.is_instance_of::<PyAttributeError>(py) {
+                            return Ok(None);
+                        }
+                        return Err(err);
                     }
                     if ptr == ffi::Py_None() {
                         ffi::Py_DECREF(ptr);
@@ -461,11 +468,11 @@ struct FieldPlan {
     access: FieldAccess,
     slot_offset: usize,
     wire_type: u8,
-    tag_u64: u64,
+    tag_bytes: [u8; 9],
     tag_len: u8,
-    tag_false_u64: u64,
+    tag_false_bytes: [u8; 9],
     tag_false_len: u8,
-    tag_true_u64: u64,
+    tag_true_bytes: [u8; 9],
     tag_true_len: u8,
     skip_if_none: bool,
     pbpy_presence: bool,
@@ -478,15 +485,15 @@ struct FieldPlan {
 impl FieldPlan {
     #[inline(always)]
     fn write_tag_to(&self, dst: &mut Vec<u8>) {
-        write_raw_tag(dst, self.tag_u64, self.tag_len);
+        write_raw_tag(dst, self.tag_bytes, self.tag_len);
     }
 
     #[inline(always)]
     fn write_bool_tag_to(&self, dst: &mut Vec<u8>, is_true: bool) {
         if is_true {
-            write_raw_tag(dst, self.tag_true_u64, self.tag_true_len);
+            write_raw_tag(dst, self.tag_true_bytes, self.tag_true_len);
         } else {
-            write_raw_tag(dst, self.tag_false_u64, self.tag_false_len);
+            write_raw_tag(dst, self.tag_false_bytes, self.tag_false_len);
         }
     }
 
@@ -524,13 +531,13 @@ pub struct CompiledCodec {
     recursive: OnceLock<bool>,
 }
 
-fn encode_tag_inline(fnum: u32, wt: u8) -> (u64, u8) {
+fn encode_tag_inline(fnum: u32, wt: u8) -> ([u8; 9], u8) {
     let mut v = Vec::with_capacity(5);
     append_tag(&mut v, fnum, wt);
-    let mut arr = [0u8; 8];
+    let mut arr = [0u8; 9];
     let len = v.len();
     arr[..len].copy_from_slice(&v);
-    (u64::from_le_bytes(arr), len as u8)
+    (arr, len as u8)
 }
 
 #[inline]
@@ -810,7 +817,8 @@ pub(crate) fn write_scalar_payload(
             write_raw_bytes_elem(dst, utf8_ptr.cast::<u8>(), size as usize);
         },
         ScalarKind::Bytes => {
-            let borrowed = LeafBytes::extract(py, ptr)
+            let obj = unsafe { Borrowed::from_ptr(py, ptr) };
+            let borrowed = LeafBytes::extract(py, &obj)
                 .map_err(|err| encode_err(py, format!("omnibuf: field {field_name}: {err}")))?;
             let slice = borrowed.as_slice();
             unsafe {
@@ -818,7 +826,8 @@ pub(crate) fn write_scalar_payload(
             }
         }
         ScalarKind::BytesAsStr => {
-            let borrowed = LeafBytes::extract(py, ptr)
+            let obj = unsafe { Borrowed::from_ptr(py, ptr) };
+            let borrowed = LeafBytes::extract(py, &obj)
                 .map_err(|err| encode_err(py, format!("omnibuf: field {field_name}: {err}")))?;
             let slice = borrowed.as_slice();
             validate_utf8(slice).map_err(|e| encode_err(py, e.to_string()))?;
@@ -1461,15 +1470,21 @@ impl CompiledCodec {
                         }
                         DefaultPlan::EmptyList => match &fp.kind {
                             FieldPlanKind::ArrayScalar { elem_wt, .. } => {
-                                let lp =
-                                    write_raw_tag_and_len_placeholder(buf, fp.tag_u64, fp.tag_len);
+                                let lp = write_raw_tag_and_len_placeholder(
+                                    buf,
+                                    fp.tag_bytes,
+                                    fp.tag_len,
+                                );
                                 buf.extend_from_slice(&[*elem_wt, 0x01]);
                                 backpatch_container_fast(buf, lp);
                                 continue;
                             }
                             FieldPlanKind::ArraySubMsg { .. } => {
-                                let lp =
-                                    write_raw_tag_and_len_placeholder(buf, fp.tag_u64, fp.tag_len);
+                                let lp = write_raw_tag_and_len_placeholder(
+                                    buf,
+                                    fp.tag_bytes,
+                                    fp.tag_len,
+                                );
                                 buf.extend_from_slice(&[WIRE_SUB_MSG, 0x01]);
                                 backpatch_container_fast(buf, lp);
                                 continue;
@@ -1505,7 +1520,7 @@ impl CompiledCodec {
                             return None;
                         };
                         let len_pos =
-                            write_raw_tag_and_len_placeholder(buf, fp.tag_u64, fp.tag_len);
+                            write_raw_tag_and_len_placeholder(buf, fp.tag_bytes, fp.tag_len);
                         match sub.try_encode_pure_fast_slots(py, buf, sub_inner, val_ptr) {
                             Some(Ok(())) => backpatch_container_fast(buf, len_pos),
                             Some(Err(e)) => return Some(Err(e)),
@@ -1523,16 +1538,10 @@ impl CompiledCodec {
                             return None;
                         }
                         let n = ffi::PyList_GET_SIZE(val_ptr) as usize;
-                        buf.reserve(20);
-                        let start = buf.len();
-                        let tlen = usize::from(fp.tag_len);
-                        let p0 = buf.as_mut_ptr().add(start);
-                        core::ptr::write_unaligned(p0.cast::<u64>(), fp.tag_u64);
-                        let len_pos = start + tlen;
-                        let p = p0.add(tlen);
-                        *p.add(2) = *elem_wt;
-                        let vn = put_varint_inline(p.add(3), n as u64);
-                        buf.set_len(len_pos + 3 + vn);
+                        let len_pos =
+                            write_raw_tag_and_len_placeholder(buf, fp.tag_bytes, fp.tag_len);
+                        buf.push(*elem_wt);
+                        append_varint(buf, n as u64);
 
                         match *elem_kind {
                             ScalarKind::String | ScalarKind::StrAsBytes => {
@@ -1620,16 +1629,10 @@ impl CompiledCodec {
                             return None;
                         };
                         let n = ffi::PyList_GET_SIZE(val_ptr) as usize;
-                        buf.reserve(20);
-                        let start = buf.len();
-                        let tlen = usize::from(fp.tag_len);
-                        let p0 = buf.as_mut_ptr().add(start);
-                        core::ptr::write_unaligned(p0.cast::<u64>(), fp.tag_u64);
-                        let len_pos = start + tlen;
-                        let p = p0.add(tlen);
-                        *p.add(2) = WIRE_SUB_MSG;
-                        let vn = put_varint_inline(p.add(3), n as u64);
-                        buf.set_len(len_pos + 3 + vn);
+                        let len_pos =
+                            write_raw_tag_and_len_placeholder(buf, fp.tag_bytes, fp.tag_len);
+                        buf.push(WIRE_SUB_MSG);
+                        append_varint(buf, n as u64);
 
                         for i in 0..n {
                             let item_ptr = ffi::PyList_GET_ITEM(val_ptr, i as ffi::Py_ssize_t);
@@ -1687,7 +1690,7 @@ impl CompiledCodec {
                         let mut overflow: std::os::raw::c_int = 0;
                         let v = ffi::PyLong_AsLongLongAndOverflow(val_ptr, &mut overflow);
                         if overflow == 0 && (v as u64) <= u64::from(u32::MAX) {
-                            write_raw_tagged_varint(dst, fp.tag_u64, fp.tag_len, v as u64);
+                            write_raw_tagged_varint(dst, fp.tag_bytes, fp.tag_len, v as u64);
                             return Some(Ok(()));
                         }
                         return Some(Err(encode_err(
@@ -1700,7 +1703,7 @@ impl CompiledCodec {
                 ScalarKind::Uint64 => {
                     if ffi::PyLong_CheckExact(val_ptr) != 0 {
                         return Some(extract_u64(py, val_ptr, &fp.wire_name).map(|u| {
-                            write_raw_tagged_varint(dst, fp.tag_u64, fp.tag_len, u);
+                            write_raw_tagged_varint(dst, fp.tag_bytes, fp.tag_len, u);
                         }));
                     }
                     None
@@ -1713,7 +1716,7 @@ impl CompiledCodec {
                             && let Ok(v32) = i32::try_from(v)
                         {
                             let zz32 = u64::from(((v32 << 1) ^ (v32 >> 31)) as u32);
-                            write_raw_tagged_varint(dst, fp.tag_u64, fp.tag_len, zz32);
+                            write_raw_tagged_varint(dst, fp.tag_bytes, fp.tag_len, zz32);
                             return Some(Ok(()));
                         }
                         return Some(Err(encode_err(
@@ -1728,7 +1731,12 @@ impl CompiledCodec {
                         let mut overflow: std::os::raw::c_int = 0;
                         let v = ffi::PyLong_AsLongLongAndOverflow(val_ptr, &mut overflow);
                         if overflow == 0 {
-                            write_raw_tagged_varint(dst, fp.tag_u64, fp.tag_len, encode_zigzag(v));
+                            write_raw_tagged_varint(
+                                dst,
+                                fp.tag_bytes,
+                                fp.tag_len,
+                                encode_zigzag(v),
+                            );
                             return Some(Ok(()));
                         }
                         return Some(Err(encode_err(
@@ -1745,7 +1753,7 @@ impl CompiledCodec {
                         if overflow == 0
                             && let Ok(u) = u32::try_from(v)
                         {
-                            write_raw_tagged_fixed4(dst, fp.tag_u64, fp.tag_len, u.to_le_bytes());
+                            write_raw_tagged_fixed4(dst, fp.tag_bytes, fp.tag_len, u.to_le_bytes());
                             return Some(Ok(()));
                         }
                         return Some(Err(encode_err(
@@ -1762,7 +1770,7 @@ impl CompiledCodec {
                         if overflow == 0
                             && let Ok(i) = i32::try_from(v)
                         {
-                            write_raw_tagged_fixed4(dst, fp.tag_u64, fp.tag_len, i.to_le_bytes());
+                            write_raw_tagged_fixed4(dst, fp.tag_bytes, fp.tag_len, i.to_le_bytes());
                             return Some(Ok(()));
                         }
                         return Some(Err(encode_err(
@@ -1775,7 +1783,7 @@ impl CompiledCodec {
                 ScalarKind::Fixed64 => {
                     if ffi::PyLong_CheckExact(val_ptr) != 0 {
                         return Some(extract_u64(py, val_ptr, &fp.wire_name).map(|u| {
-                            write_raw_tagged_fixed8(dst, fp.tag_u64, fp.tag_len, u.to_le_bytes());
+                            write_raw_tagged_fixed8(dst, fp.tag_bytes, fp.tag_len, u.to_le_bytes());
                         }));
                     }
                     None
@@ -1785,7 +1793,7 @@ impl CompiledCodec {
                         let mut overflow: std::os::raw::c_int = 0;
                         let v = ffi::PyLong_AsLongLongAndOverflow(val_ptr, &mut overflow);
                         if overflow == 0 {
-                            write_raw_tagged_fixed8(dst, fp.tag_u64, fp.tag_len, v.to_le_bytes());
+                            write_raw_tagged_fixed8(dst, fp.tag_bytes, fp.tag_len, v.to_le_bytes());
                             return Some(Ok(()));
                         }
                         return Some(Err(encode_err(
@@ -1807,7 +1815,7 @@ impl CompiledCodec {
                         }
                         write_raw_tagged_fixed4(
                             dst,
-                            fp.tag_u64,
+                            fp.tag_bytes,
                             fp.tag_len,
                             f.to_bits().to_le_bytes(),
                         );
@@ -1820,7 +1828,7 @@ impl CompiledCodec {
                         let v = ffi::PyFloat_AS_DOUBLE(val_ptr);
                         write_raw_tagged_fixed8(
                             dst,
-                            fp.tag_u64,
+                            fp.tag_bytes,
                             fp.tag_len,
                             v.to_bits().to_le_bytes(),
                         );
@@ -1841,7 +1849,7 @@ impl CompiledCodec {
                         }
                         write_raw_tagged_bytes(
                             dst,
-                            fp.tag_u64,
+                            fp.tag_bytes,
                             fp.tag_len,
                             utf8_ptr.cast::<u8>(),
                             size as usize,
@@ -1858,7 +1866,7 @@ impl CompiledCodec {
                         } else {
                             ffi::PyBytes_AS_STRING(val_ptr).cast::<u8>()
                         };
-                        write_raw_tagged_bytes(dst, fp.tag_u64, fp.tag_len, src, len);
+                        write_raw_tagged_bytes(dst, fp.tag_bytes, fp.tag_len, src, len);
                         return Some(Ok(()));
                     }
                     None
@@ -1879,7 +1887,7 @@ impl CompiledCodec {
                         }
                         write_raw_tagged_bytes(
                             dst,
-                            fp.tag_u64,
+                            fp.tag_bytes,
                             fp.tag_len,
                             slice.as_ptr(),
                             slice.len(),
@@ -3085,6 +3093,13 @@ impl CompiledCodec {
                         && let Some(set_fn) = (*descr_type).tp_descr_set
                     {
                         let member_descr = descr_obj.as_ptr().cast::<ffi::PyMemberDescrObject>();
+                        let owner = (*member_descr).d_common.d_type;
+                        if ffi::PyType_IsSubtype(cls_bound.as_ptr().cast(), owner) == 0 {
+                            return Err(encode_err(
+                                py,
+                                format!("omnibuf: slot {attr} belongs to an unrelated class"),
+                            ));
+                        }
                         let d_member = (*member_descr).d_member;
                         let (direct_offset, direct_writable) = if !d_member.is_null()
                             && (*d_member).type_code == ffi::Py_T_OBJECT_EX
@@ -3237,9 +3252,9 @@ impl CompiledCodec {
                 }
             };
 
-            let (tag_u64, tag_len) = encode_tag_inline(field_num, wire_type);
-            let (tag_false_u64, tag_false_len) = encode_tag_inline(field_num, WIRE_BOOL_FALSE);
-            let (tag_true_u64, tag_true_len) = encode_tag_inline(field_num, WIRE_BOOL_TRUE);
+            let (tag_bytes, tag_len) = encode_tag_inline(field_num, wire_type);
+            let (tag_false_bytes, tag_false_len) = encode_tag_inline(field_num, WIRE_BOOL_FALSE);
+            let (tag_true_bytes, tag_true_len) = encode_tag_inline(field_num, WIRE_BOOL_TRUE);
 
             fields.push(FieldPlan {
                 index: i,
@@ -3249,11 +3264,11 @@ impl CompiledCodec {
                 access,
                 slot_offset,
                 wire_type,
-                tag_u64,
+                tag_bytes,
                 tag_len,
-                tag_false_u64,
+                tag_false_bytes,
                 tag_false_len,
-                tag_true_u64,
+                tag_true_bytes,
                 tag_true_len,
                 skip_if_none,
                 pbpy_presence,
@@ -3361,7 +3376,7 @@ impl CompiledCodec {
         data: &Bound<'py, PyAny>,
         out: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let input = InputBytes::extract(py, data.as_ptr())?;
+        let input = InputBytes::extract(py, data)?;
         self.decode_slice(py, input.as_slice(), out, 0, false)
     }
 
@@ -3374,25 +3389,46 @@ impl CompiledCodec {
         depth: usize,
         merge: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let input = InputBytes::extract(py, data.as_ptr())?;
+        let input = InputBytes::extract(py, data)?;
         self.decode_slice(py, input.as_slice(), out, depth, merge)
     }
 }
 
-fn pin_dataclass_codec_entry(cls: &Bound<'_, PyType>, codec: &Bound<'_, CompiledCodec>) -> usize {
-    let key = cls.as_ptr() as usize;
-    let mut guard = PINNED_DATACLASS_CODECS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    for (c_py, codec_py) in guard.iter() {
-        if c_py.as_ptr() as usize == key {
-            return std::ptr::from_ref::<CompiledCodec>(codec_py.get()) as usize;
-        }
+// Keep a bounded cache of owning references. Callers retain their own reference
+// while invoking Python, so eviction and reentrant registration cannot invalidate it.
+const MAX_CACHED_DATACLASS_CODECS: usize = 128;
+
+fn cache_dataclass_codec(
+    _py: Python<'_>,
+    cls: &Bound<'_, PyType>,
+    codec: &Bound<'_, CompiledCodec>,
+) {
+    let mut guard = DATACLASS_CODECS.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.iter().any(|(c, _)| c.as_ptr() == cls.as_ptr()) {
+        return;
     }
-    let codec_owned = codec.clone().unbind();
-    let raw_ptr = std::ptr::from_ref::<CompiledCodec>(codec_owned.get()) as usize;
-    guard.push((cls.clone().unbind(), codec_owned));
-    raw_ptr
+    let evicted = if guard.len() == MAX_CACHED_DATACLASS_CODECS {
+        let removed = guard.remove(0);
+        DATACLASS_CACHE_EPOCH.fetch_add(1, Ordering::AcqRel);
+        Some(removed)
+    } else {
+        None
+    };
+    guard.push((cls.clone().unbind(), codec.clone().unbind()));
+    drop(guard);
+    // Dropping Python objects can run finalizers and reenter this cache.
+    drop(evicted);
+}
+
+#[inline]
+fn tls_put_dataclass_codec(cls_key: usize, codec_ptr: usize, epoch: u64) {
+    if !HAS_GIL {
+        return;
+    }
+    TLS_DC_CACHE.with(|cell| {
+        let cur = cell.get();
+        cell.set([(cls_key, codec_ptr, epoch), cur[0], cur[1], cur[2]]);
+    });
 }
 
 #[cold]
@@ -3400,90 +3436,91 @@ fn pin_dataclass_codec_entry(cls: &Bound<'_, PyType>, codec: &Bound<'_, Compiled
 fn resolve_dataclass_codec_slow<'py>(
     py: Python<'py>,
     cls_ptr: *mut ffi::PyTypeObject,
-) -> PyResult<&'py CompiledCodec> {
+) -> PyResult<Bound<'py, CompiledCodec>> {
     let key = cls_ptr as usize;
-    let found_ptr = {
-        let guard = PINNED_DATACLASS_CODECS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        guard.iter().find_map(|(c_py, codec_py)| {
-            (c_py.as_ptr() as usize == key)
-                .then(|| std::ptr::from_ref::<CompiledCodec>(codec_py.get()) as usize)
-        })
-    };
-
-    let raw_codec_ptr = if let Some(p) = found_ptr {
-        p
-    } else {
-        let resolver = DATACLASS_RESOLVER
-            .get()
-            .ok_or_else(|| encode_err(py, "omnibuf: dataclass codec resolver not initialized"))?;
-        let cls_bound =
-            unsafe { Borrowed::from_ptr(py, cls_ptr.cast()).cast_unchecked::<PyType>() };
-        let resolved_any = resolver.bind(py).call1((&*cls_bound,))?;
-        let resolved_codec = resolved_any.cast::<CompiledCodec>()?;
-        pin_dataclass_codec_entry(&cls_bound, resolved_codec)
-    };
-
-    let codec_ref = unsafe { &*(raw_codec_ptr as *const CompiledCodec) };
-    if codec_ref.inner.get().is_some() {
-        TLS_DC_CACHE.with(|cell| {
-            let cur = cell.get();
-            cell.set([(key, raw_codec_ptr), cur[0], cur[1], cur[2]]);
-        });
+    let cls_obj_ptr = cls_ptr.cast::<ffi::PyObject>();
+    {
+        let guard = DATACLASS_CODECS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, codec)) = guard.iter().rev().find(|(c, _)| c.as_ptr() == cls_obj_ptr) {
+            let epoch = DATACLASS_CACHE_EPOCH.load(Ordering::Acquire);
+            let bound = codec.bind(py).clone();
+            tls_put_dataclass_codec(key, bound.as_ptr() as usize, epoch);
+            return Ok(bound);
+        }
     }
-    Ok(codec_ref)
+    let resolver = DATACLASS_RESOLVER
+        .get()
+        .ok_or_else(|| encode_err(py, "omnibuf: dataclass codec resolver not initialized"))?;
+    let cls_bound = unsafe { Borrowed::from_ptr(py, cls_obj_ptr).cast_unchecked::<PyType>() };
+    let resolved = resolver.bind(py).call1((&*cls_bound,))?;
+    let codec = resolved.cast::<CompiledCodec>()?.clone();
+    cache_dataclass_codec(py, &cls_bound, &codec);
+    {
+        let guard = DATACLASS_CODECS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, cached)) = guard.iter().rev().find(|(c, _)| c.as_ptr() == cls_obj_ptr) {
+            let epoch = DATACLASS_CACHE_EPOCH.load(Ordering::Acquire);
+            tls_put_dataclass_codec(key, cached.as_ptr() as usize, epoch);
+        }
+    }
+    Ok(codec)
 }
 
 #[inline(always)]
 fn lookup_or_resolve_dataclass_codec<'py>(
     py: Python<'py>,
     cls_ptr: *mut ffi::PyTypeObject,
-) -> PyResult<&'py CompiledCodec> {
-    let key = cls_ptr as usize;
-    let raw_codec_ptr = TLS_DC_CACHE.with(|cell| {
-        let entries = cell.get();
-        if entries[0].0 == key {
-            return entries[0].1;
+) -> PyResult<Bound<'py, CompiledCodec>> {
+    if HAS_GIL {
+        let key = cls_ptr as usize;
+        let epoch = DATACLASS_CACHE_EPOCH.load(Ordering::Acquire);
+        let codec_ptr = TLS_DC_CACHE.with(|cell| {
+            let entries = cell.get();
+            if entries[0].0 == key && entries[0].2 == epoch {
+                return entries[0].1;
+            }
+            if entries[1].0 == key && entries[1].2 == epoch {
+                let mut next = entries;
+                next.swap(0, 1);
+                cell.set(next);
+                return entries[1].1;
+            }
+            if entries[2].0 == key && entries[2].2 == epoch {
+                let mut next = entries;
+                next.swap(0, 2);
+                cell.set(next);
+                return entries[2].1;
+            }
+            if entries[3].0 == key && entries[3].2 == epoch {
+                let mut next = entries;
+                next.swap(0, 3);
+                cell.set(next);
+                return entries[3].1;
+            }
+            0
+        });
+        if codec_ptr != 0 {
+            // SAFETY: Under the GIL, no thread can mutate `DATACLASS_CODECS` or advance
+            // `DATACLASS_CACHE_EPOCH` while `py` is held here, so the matching epoch proves
+            // `DATACLASS_CODECS` still owns both `cls_ptr` and `codec_ptr`. Cloning into an
+            // owning `Bound` keeps the codec alive across subsequent Python callbacks or eviction.
+            let bound = unsafe {
+                Borrowed::from_ptr(py, codec_ptr as *mut ffi::PyObject)
+                    .cast_unchecked::<CompiledCodec>()
+                    .to_owned()
+            };
+            return Ok(bound);
         }
-        if entries[1].0 == key {
-            let mut next = entries;
-            next.swap(0, 1);
-            cell.set(next);
-            return entries[1].1;
-        }
-        if entries[2].0 == key {
-            let mut next = entries;
-            next.swap(0, 2);
-            cell.set(next);
-            return entries[2].1;
-        }
-        if entries[3].0 == key {
-            let mut next = entries;
-            next.swap(0, 3);
-            cell.set(next);
-            return entries[3].1;
-        }
-        0
-    });
-    if raw_codec_ptr != 0 {
-        return Ok(unsafe { &*(raw_codec_ptr as *const CompiledCodec) });
     }
     resolve_dataclass_codec_slow(py, cls_ptr)
 }
 
 #[pyfunction]
-pub fn register_dataclass_codec_py(cls: &Bound<'_, PyType>, codec: &Bound<'_, CompiledCodec>) {
-    let key = cls.as_ptr() as usize;
-    let raw_ptr = pin_dataclass_codec_entry(cls, codec);
-    if codec.get().inner.get().is_some() {
-        TLS_DC_CACHE.with(|cell| {
-            let cur = cell.get();
-            if cur.iter().all(|&(k, _)| k != key) {
-                cell.set([(key, raw_ptr), cur[0], cur[1], cur[2]]);
-            }
-        });
-    }
+pub fn register_dataclass_codec_py<'py>(
+    py: Python<'py>,
+    cls: &Bound<'py, PyType>,
+    codec: &Bound<'py, CompiledCodec>,
+) {
+    cache_dataclass_codec(py, cls, codec);
 }
 
 #[pyfunction]
@@ -3502,7 +3539,9 @@ pub fn marshal_dataclass_py<'py>(
     let msg_ptr = msg.as_ptr();
     let cls_ptr = unsafe { ffi::Py_TYPE(msg_ptr) };
     let codec = lookup_or_resolve_dataclass_codec(py, cls_ptr)?;
-    codec.marshal_raw(py, msg_ptr, deterministic, self_describing)
+    codec
+        .get()
+        .marshal_raw(py, msg_ptr, deterministic, self_describing)
 }
 
 #[pyfunction]
@@ -3512,14 +3551,16 @@ pub fn unmarshal_dataclass_py<'py>(
     target: &Bound<'py, PyAny>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let target_ptr = target.as_ptr();
-    let is_type = unsafe { ffi::PyType_Check(target_ptr) != 0 };
+    let is_type = target.is_instance_of::<PyType>();
     let cls_ptr = if is_type {
         target_ptr.cast::<ffi::PyTypeObject>()
     } else {
         unsafe { ffi::Py_TYPE(target_ptr) }
     };
     let codec = lookup_or_resolve_dataclass_codec(py, cls_ptr)?;
-    let input = InputBytes::extract(py, packet.as_ptr())?;
+    let input = InputBytes::extract(py, packet)?;
     let out_inst = if is_type { None } else { Some(target) };
-    codec.decode_slice(py, input.as_slice(), out_inst, 0, false)
+    codec
+        .get()
+        .decode_slice(py, input.as_slice(), out_inst, 0, false)
 }

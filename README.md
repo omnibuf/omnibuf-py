@@ -177,3 +177,17 @@ just ci           # Run fmt-check, lint, test, and conformance
 ## License
 
 MIT
+
+## Runtime safety and ownership
+
+The Rust extension retains immutable input bytes and snapshots mutable inputs
+before decoding that can invoke Python callbacks. Direct slot access validates
+the descriptor's declaring class. Optional attribute access suppresses only
+`AttributeError`; other getter failures propagate.
+
+The extension's dataclass lookup cache holds at most 128 owning entries. An
+active operation retains its codec across cache eviction and Python callbacks.
+Python schema metadata caches still retain registered classes for recursive
+type resolution. Avoid generating unbounded distinct message classes in a
+long-running process. Schema classes and type annotations are trusted code;
+resolving annotations and calling factories can execute Python.

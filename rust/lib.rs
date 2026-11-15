@@ -65,12 +65,14 @@ pub(crate) struct LeafBytes<'py> {
     ptr: *const u8,
     len: usize,
     view: Option<ffi::Py_buffer>,
+    _owner: Option<Py<PyAny>>,
     _marker: std::marker::PhantomData<&'py [u8]>,
 }
 
 impl<'py> LeafBytes<'py> {
     #[inline]
-    pub(crate) fn extract(py: Python<'py>, obj_ptr: *mut ffi::PyObject) -> PyResult<Self> {
+    pub(crate) fn extract(py: Python<'py>, obj: &Bound<'py, PyAny>) -> PyResult<Self> {
+        let obj_ptr = obj.as_ptr();
         unsafe {
             if ffi::PyBytes_CheckExact(obj_ptr) != 0 {
                 let len = ffi::PyBytes_Size(obj_ptr) as usize;
@@ -83,6 +85,7 @@ impl<'py> LeafBytes<'py> {
                     ptr,
                     len,
                     view: None,
+                    _owner: Some(obj.clone().unbind()),
                     _marker: std::marker::PhantomData,
                 });
             }
@@ -102,6 +105,7 @@ impl<'py> LeafBytes<'py> {
                 ptr,
                 len,
                 view: Some(buf),
+                _owner: None,
                 _marker: std::marker::PhantomData,
             })
         }
@@ -131,25 +135,17 @@ impl Drop for LeafBytes<'_> {
 /// releases the `Py_buffer` export immediately so Python code can freely mutate or resize
 /// the caller's buffer without UAF or mid-parse data races.
 pub(crate) enum InputBytes<'py> {
-    Borrowed(&'py [u8]),
+    Borrowed(LeafBytes<'py>),
     Owned(Vec<u8>),
 }
 
 impl<'py> InputBytes<'py> {
     #[inline]
-    pub(crate) fn extract(py: Python<'py>, obj_ptr: *mut ffi::PyObject) -> PyResult<Self> {
-        unsafe {
-            if ffi::PyBytes_CheckExact(obj_ptr) != 0 {
-                let len = ffi::PyBytes_Size(obj_ptr) as usize;
-                let slice = if len == 0 {
-                    &[]
-                } else {
-                    std::slice::from_raw_parts(ffi::PyBytes_AS_STRING(obj_ptr).cast::<u8>(), len)
-                };
-                return Ok(Self::Borrowed(slice));
-            }
+    pub(crate) fn extract(py: Python<'py>, obj: &Bound<'py, PyAny>) -> PyResult<Self> {
+        let leaf = LeafBytes::extract(py, obj)?;
+        if leaf.view.is_none() {
+            return Ok(Self::Borrowed(leaf));
         }
-        let leaf = LeafBytes::extract(py, obj_ptr)?;
         let vec = leaf.as_slice().to_vec();
         drop(leaf);
         Ok(Self::Owned(vec))
@@ -158,7 +154,7 @@ impl<'py> InputBytes<'py> {
     #[inline]
     pub fn as_slice(&self) -> &[u8] {
         match self {
-            Self::Borrowed(s) => s,
+            Self::Borrowed(s) => s.as_slice(),
             Self::Owned(v) => v.as_slice(),
         }
     }
@@ -349,13 +345,13 @@ fn init_exceptions(encode_cls: Bound<'_, PyType>, decode_cls: Bound<'_, PyType>)
 
 #[pyfunction]
 fn validate_message_py(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
-    let borrowed = LeafBytes::extract(py, data.as_ptr())?;
+    let borrowed = LeafBytes::extract(py, data)?;
     validate_message_slice(borrowed.as_slice(), 0).map_err(|m| decode_err(py, m))
 }
 
 #[pyfunction]
 fn has_field0_py(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<bool> {
-    let borrowed = LeafBytes::extract(py, data.as_ptr())?;
+    let borrowed = LeafBytes::extract(py, data)?;
     Ok(read_field0_schema_meta(borrowed.as_slice()).is_some())
 }
 
@@ -366,7 +362,7 @@ fn read_field0_py<'py>(
     schema_meta_cls: &Bound<'py, PyAny>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let parsed = {
-        let borrowed = LeafBytes::extract(py, data.as_ptr())?;
+        let borrowed = LeafBytes::extract(py, data)?;
         read_field0_schema_meta(borrowed.as_slice())
     };
     match parsed {
@@ -384,7 +380,7 @@ fn splice_fields_py<'py>(
     replacements: &Bound<'py, PyAny>,
 ) -> PyResult<Bound<'py, PyBytes>> {
     let mut out = if let Some(prefix_obj) = dst_prefix {
-        let p_bytes = LeafBytes::extract(py, prefix_obj.as_ptr())?;
+        let p_bytes = LeafBytes::extract(py, prefix_obj)?;
         let s = p_bytes.as_slice();
         let mut v = Vec::with_capacity(s.len() + 256);
         v.extend_from_slice(s);
@@ -393,7 +389,7 @@ fn splice_fields_py<'py>(
         Vec::new()
     };
 
-    let src_input = InputBytes::extract(py, src_packet.as_ptr())?;
+    let src_input = InputBytes::extract(py, src_packet)?;
     let src = src_input.as_slice();
 
     let seq = replacements.cast::<PySequence>()?;
@@ -425,7 +421,7 @@ fn splice_fields_py<'py>(
         }
         let fnum = fnum_i64 as u32;
         let enc_attr = item.getattr("encoded_field")?;
-        let enc_leaf = LeafBytes::extract(py, enc_attr.as_ptr())?;
+        let enc_leaf = LeafBytes::extract(py, &enc_attr)?;
         let payload = enc_leaf.as_slice().to_vec();
         drop(enc_leaf);
 
