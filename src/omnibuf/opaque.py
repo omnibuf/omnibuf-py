@@ -24,7 +24,6 @@ from .wire import (
     decode_varint,
     decode_zigzag,
     decode_zigzag32,
-    locate_field_offset,
     next_container_span,
     parse_array_header,
     parse_map_header,
@@ -65,14 +64,23 @@ def opaque_get_bytes_view(raw: Buffer, field_num: int) -> memoryview:
     """Returns a zero-copy read-only memoryview slice over a WireBytes field payload."""
     if isinstance(field_num, bool) or field_num <= 0 or field_num > MAX_FIELD_NUMBER:
         return memoryview(b"")
-    val_pos, _ = locate_field_offset(raw, field_num, 1 << WIRE_BYTES)
-    if val_pos < 0:
+    pos = 0
+    n = len(raw)
+    last_start = -1
+    last_end = 0
+    while pos < n:
+        b_start, b_end, pos = next_container_span(raw, pos, field_num, WIRE_BYTES, 0)
+        if b_start == -2:
+            raise OmniBufDecodeError(
+                f"omnibuf: malformed packet while reading bytes field #{field_num}"
+            )
+        if b_start == -1:
+            break
+        last_start = b_start
+        last_end = b_end
+    if last_start < 0:
         return memoryview(b"")
-    try:
-        mv_slice, _ = read_len_slice(raw, val_pos, 0)
-    except OmniBufDecodeError:
-        return memoryview(b"")
-    return mv_slice.toreadonly()
+    return memoryview(raw)[last_start:last_end].toreadonly()
 
 
 def opaque_get_submsg_slice(raw: Buffer, field_num: int) -> Buffer | None:
@@ -367,7 +375,9 @@ def splice_dirty_fields(
         if fnum == 0:
             next_pos = validate_field0_at(src_packet, pos, wt, 0, MAX_NESTING_DEPTH, n)
         else:
-            next_pos = validate_value(src_packet, pos, wt, 0, MAX_NESTING_DEPTH, n)
+            next_pos = validate_value(
+                src_packet, pos, wt, 0, MAX_NESTING_DEPTH, n, check_utf8=True
+            )
         idx = len(spans)
         spans.append((fnum, f_start, next_pos))
         if fnum in dirty_set:

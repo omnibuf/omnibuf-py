@@ -225,8 +225,18 @@ def _write_proto_scalar(dst: bytearray, kind: str, val: Any, field_name: str) ->
         append_varint(dst, len(raw))
         dst.extend(raw)
     elif kind == "bytes":
-        append_varint(dst, len(val))
-        dst.extend(val)
+        if isinstance(val, (bytes, bytearray)):
+            raw_b: Buffer = val
+        else:
+            mv = val if isinstance(val, memoryview) else memoryview(val)
+            if mv.itemsize == 1 and mv.ndim == 1:
+                raw_b = mv
+            elif mv.c_contiguous:
+                raw_b = mv.cast("B")
+            else:
+                raw_b = mv.tobytes()
+        append_varint(dst, len(raw_b))
+        dst.extend(raw_b)
     else:
         raise OmniBufEncodeError(f"omnibuf: unsupported proto scalar kind {kind!r}")
 
@@ -896,12 +906,12 @@ def _decode_gpb_msg(
             continue
 
         already_seen = (fnum in seen) or merge
-        seen.add(fnum)
 
         if _is_gpb_map_field(fd):
             if wt != WIRE_MAP:
                 pos = validate_value(data, pos, wt, depth, MAX_NESTING_DEPTH, n)
                 continue
+            seen.add(fnum)
             if depth + 1 > MAX_NESTING_DEPTH:
                 raise OmniBufDecodeError(
                     f"omnibuf: map nesting depth {depth + 1} exceeds {MAX_NESTING_DEPTH}"
@@ -937,6 +947,7 @@ def _decode_gpb_msg(
             if wt != WIRE_ARRAY:
                 pos = validate_value(data, pos, wt, depth, MAX_NESTING_DEPTH, n)
                 continue
+            seen.add(fnum)
             if depth + 1 > MAX_NESTING_DEPTH:
                 raise OmniBufDecodeError(
                     f"omnibuf: array nesting depth {depth + 1} exceeds {MAX_NESTING_DEPTH}"
@@ -966,6 +977,7 @@ def _decode_gpb_msg(
             if wt != WIRE_SUB_MSG:
                 pos = validate_value(data, pos, wt, depth, MAX_NESTING_DEPTH, n)
                 continue
+            seen.add(fnum)
             sub_mv, pos = read_len_slice(data, pos, 0, n)
             sub_msg = getattr(dst, fd.name)
             sub_msg.SetInParent()
@@ -974,12 +986,14 @@ def _decode_gpb_msg(
             if wt not in (WIRE_BOOL_FALSE, WIRE_BOOL_TRUE):
                 pos = validate_value(data, pos, wt, depth, MAX_NESTING_DEPTH, n)
                 continue
+            seen.add(fnum)
             setattr(dst, fd.name, wt == WIRE_BOOL_TRUE)
         else:
             s_kind, exp_wt = _GPB_SCALAR_SPEC[fd.type]
             if wt != exp_wt:
                 pos = validate_value(data, pos, wt, depth, MAX_NESTING_DEPTH, n)
                 continue
+            seen.add(fnum)
             val, pos = _read_proto_scalar(data, pos, n, s_kind)
             setattr(dst, fd.name, val)
 

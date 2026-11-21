@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import textwrap
+from collections.abc import Sequence
 from typing import Any
 
 import pytest
@@ -400,7 +401,8 @@ def test_py10b_locate_field_offset_rejects_corrupt_field0() -> None:
     pkt = corrupt_field0 + encode_tag(65536, WIRE_UINT) + encode_varint(42)
 
     assert omnibuf_wire.locate_field_offset(pkt, 65536) == (-1, 0)
-    assert opaque_get_uint32(pkt, 65536, default=0) == 0
+    with pytest.raises(OmniBufDecodeError):
+        opaque_get_uint32(pkt, 65536, default=0)
 
 
 # ---------------------------------------------------------------------------
@@ -463,3 +465,216 @@ def test_py12_encoder_rejects_mismatched_array_element_count() -> None:
     with pytest.raises(OmniBufEncodeError):
         enc.end_array()
         enc.finish()
+
+
+# ---------------------------------------------------------------------------
+# Audit 2026-11: Finding 1 - Fast-slot list[Uint32] >= 2^29 (9-byte varints)
+# ---------------------------------------------------------------------------
+@omnibuf_message
+class _FastSlotU32List:
+    vals: list[Uint32] = omnibuf_field(1, default_factory=list)
+
+
+def test_audit_f1_fast_slot_uint32_list_large_values() -> None:
+    """Encoding list[Uint32] with values >= 2^29 (9-byte Prefix-Varints) must not overflow buffer."""
+    big = [0x2000_0000, 0xFFFF_FFFF, 0x3FFF_FFFF, 0x8000_0000] * 64
+    pkt = omnibuf.marshal(_FastSlotU32List(vals=big))
+    validate_message(pkt)
+    decoded = omnibuf.unmarshal(pkt, _FastSlotU32List)
+    assert decoded.vals == big
+
+
+# ---------------------------------------------------------------------------
+# Audit 2026-11: Finding 2 - Cyclic SubMsg with omitempty=True
+# ---------------------------------------------------------------------------
+@omnibuf_message
+class _CyclicOmitEmpty:
+    child: _CyclicOmitEmpty | None = omnibuf_field(1, default=None, omitempty=True)
+
+
+def test_audit_f2_is_value_empty_depth_limit_on_cycle() -> None:
+    """Cyclic SubMsg with omitempty=True must raise OmniBufEncodeError instead of stack overflow."""
+    node = _CyclicOmitEmpty()
+    node.child = node
+    with pytest.raises(OmniBufEncodeError):
+        omnibuf.marshal(node)
+
+
+# ---------------------------------------------------------------------------
+# Audit 2026-11: Finding 3 - Standalone opaque_get_* propagate decode errors
+# ---------------------------------------------------------------------------
+def test_audit_f3_standalone_opaque_getters_propagate_errors() -> None:
+    """Standalone opaque_get_* helpers must raise OmniBufDecodeError on wire corruption / bad UTF-8."""
+    # Legitimately absent returns default / None / empty view
+    empty = b""
+    assert opaque_get_uint32(empty, 1, 7) == 7
+    assert omnibuf.opaque_get_string(empty, 1, "fallback") == "fallback"
+    assert omnibuf.opaque_get_bytes(empty, 1, b"def") == b"def"
+    assert bytes(omnibuf.opaque_get_bytes_view(empty, 1)) == b""
+    assert omnibuf.opaque_get_submsg_slice(empty, 1) is None
+
+    # Invalid Field #0 wire type (WIRE_UINT instead of WIRE_SUB_MSG)
+    bad_f0 = encode_varint((0 << 4) | WIRE_UINT) + encode_varint(1)
+    with pytest.raises(OmniBufDecodeError):
+        opaque_get_uint32(bad_f0, 1, 7)
+    with pytest.raises(OmniBufDecodeError):
+        omnibuf.opaque_get_string(bad_f0, 1, "fallback")
+    with pytest.raises(OmniBufDecodeError):
+        omnibuf.opaque_get_bytes(bad_f0, 1, b"def")
+    with pytest.raises(OmniBufDecodeError):
+        omnibuf.opaque_get_bytes_view(bad_f0, 1)
+    with pytest.raises(OmniBufDecodeError):
+        omnibuf.opaque_get_submsg_slice(bad_f0, 1)
+
+    # Truncated field payload
+    truncated = encode_tag(1, WIRE_UINT) + b"\x00"  # 9-byte varint header with 0 trailing bytes
+    with pytest.raises(OmniBufDecodeError):
+        opaque_get_uint32(truncated, 1, 7)
+
+    # Invalid UTF-8 in WireString field
+    bad_utf8 = encode_tag(1, omnibuf_wire.WIRE_STRING) + encode_varint(2) + b"\xff\xfe"
+    with pytest.raises(OmniBufDecodeError):
+        omnibuf.opaque_get_string(bad_utf8, 1, "fallback")
+
+
+# ---------------------------------------------------------------------------
+# Audit 2026-11: Finding 4 - Empty unknown WireSubMsg inside Field #0 at depth limit
+# ---------------------------------------------------------------------------
+def test_audit_f4_field0_unknown_empty_submsg_depth_limit() -> None:
+    """Empty unknown WireSubMsg inside Field #0 exceeding MAX_NESTING_DEPTH must be rejected."""
+    # Build 32 nested empty submessages inside unknown field #99 of Field #0 (depth 1 + 32 = 33 > 32)
+    payload = b""
+    for _ in range(omnibuf_wire.MAX_NESTING_DEPTH):
+        payload = encode_tag(99, WIRE_SUB_MSG) + encode_varint(len(payload)) + payload
+    pkt = encode_tag(0, WIRE_SUB_MSG) + encode_varint(len(payload)) + payload
+    with pytest.raises(OmniBufDecodeError):
+        validate_message(pkt)
+
+
+# ---------------------------------------------------------------------------
+# Audit 2026-11: Finding 5 - Python validate_message fallback & splice UTF-8 check
+# ---------------------------------------------------------------------------
+def test_audit_f5_python_validate_message_and_splice_check_utf8() -> None:
+    """Python validate_message fallback and splice_fields_encode must reject invalid UTF-8."""
+    bad_utf8 = encode_tag(1, omnibuf_wire.WIRE_STRING) + encode_varint(2) + b"\xff\xfe"
+    with pytest.raises(OmniBufDecodeError):
+        validate_message(bad_utf8, depth=0, limit_depth=16)
+    with pytest.raises(OmniBufDecodeError):
+        validate_message(bad_utf8, depth=1, limit_depth=omnibuf_wire.MAX_NESTING_DEPTH)
+    with pytest.raises(OmniBufDecodeError):
+        omnibuf.opaque.splice_dirty_fields(None, bad_utf8, {2}, lambda _out, _f: None)
+
+
+# ---------------------------------------------------------------------------
+# Audit 2026-11: Finding 6 - Depth-limit check for None default-empty list in fast-slot encode
+# ---------------------------------------------------------------------------
+@omnibuf_message
+class _DepthLeafList:
+    items: list[Uint32] = omnibuf_field(1, default_factory=list)
+
+
+@omnibuf_message
+class _DepthChain:
+    nxt: _DepthChain | None = omnibuf_field(1, default=None)
+    leaf: _DepthLeafList | None = omnibuf_field(2, default=None)
+
+
+def test_audit_f6_fast_slot_none_empty_list_respects_depth_limit() -> None:
+    """Fast-slot encoder must enforce MAX_NESTING_DEPTH for None default-empty list fields."""
+    leaf = _DepthLeafList(items=None)  # type: ignore[arg-type]
+    cur = _DepthChain(leaf=leaf)
+    # leaf sits at depth = MAX_NESTING_DEPTH, so its array field is at MAX_NESTING_DEPTH + 1
+    for _ in range(omnibuf_wire.MAX_NESTING_DEPTH - 1):
+        cur = _DepthChain(nxt=cur)
+    with pytest.raises(OmniBufEncodeError):
+        omnibuf.marshal(cur)
+
+
+# ---------------------------------------------------------------------------
+# Audit 2026-11: Finding 7 - Non-byte memoryview (itemsize > 1) in Encoder / protobuf_codec
+# ---------------------------------------------------------------------------
+def test_audit_f7_non_byte_memoryview_encoder() -> None:
+    """Encoder must use byte length (nbytes) for non-byte memoryviews (itemsize > 1)."""
+    import array
+
+    arr = array.array("I", [0x11223344, 0x55667788])
+    mv = memoryview(arr)
+    expected = arr.tobytes()
+    assert len(mv) == 2
+    assert mv.nbytes == 8
+
+    enc = Encoder()
+    enc.write_bytes(1, mv)
+    enc.write_extended(2, 0x07, mv)
+    enc.begin_array(3, omnibuf_wire.WIRE_BYTES, 1)
+    enc.write_elem_bytes(mv)
+    enc.end_array()
+    pkt = enc.finish()
+
+    validate_message(pkt)
+    assert omnibuf.opaque_get_bytes(pkt, 1) == expected
+    assert omnibuf.opaque_get_scalar_array(pkt, 3, omnibuf_wire.WIRE_BYTES, "bytes") == [expected]
+
+
+# ---------------------------------------------------------------------------
+# Audit 2026-11: Finding 8 - Hostile non-list PySequence with huge __len__
+# ---------------------------------------------------------------------------
+class _HugeFakeSeq(Sequence[int]):
+    def __len__(self) -> int:
+        return 10**12
+
+    def __getitem__(self, idx: int | slice) -> Any:
+        raise ValueError("hostile sequence")
+
+
+def test_audit_f8_hostile_sequence_huge_len_does_not_abort() -> None:
+    """Encoding a non-list sequence with huge __len__ must raise cleanly without Rust OOM abort."""
+    holder = _FastSlotU32List(vals=_HugeFakeSeq())  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="hostile sequence"):
+        omnibuf.marshal(holder)
+
+
+# ---------------------------------------------------------------------------
+# Audit 2026-11: Finding 9 - 0-D memoryview, splice_fields linear perf, gpb seen.add
+# ---------------------------------------------------------------------------
+def test_audit_f9a_zero_dim_memoryview_safe() -> None:
+    """0-D memoryview backed by bytes must not OOB-read strides in ByteSliceOwner."""
+    # Single-byte packet: field #1 = true ((1 << 4) | WIRE_BOOL_TRUE = 0x13 -> varint 0x27)
+    raw_bool = encode_tag(1, omnibuf_wire.WIRE_BOOL_TRUE)
+    assert len(raw_bool) == 1
+    mv0 = memoryview(raw_bool).cast("B", shape=())
+    assert mv0.ndim == 0
+    view = omnibuf.OpaqueView(mv0)
+    assert view._get_bool(1) is True
+
+
+def test_audit_f9b_splice_fields_many_replacements() -> None:
+    """splice_fields with many replacements must produce exact expected wire output."""
+    enc = Encoder()
+    for i in range(1, 201):
+        enc.write_uint32(i, i)
+    src = enc.finish()
+    reps = [
+        omnibuf.SpliceField(i, encode_tag(i, WIRE_UINT) + encode_varint(i * 10))
+        for i in range(1, 201)
+    ]
+    out = omnibuf.splice_fields(None, src, reps)
+    validate_message(out)
+    assert opaque_get_uint32(out, 1) == 10
+    assert opaque_get_uint32(out, 200) == 2000
+
+
+def test_audit_f9c_gpb_mismatched_wire_type_before_repeated_clears_reused_dst() -> None:
+    """Mismatched wire type on a repeated field must not mark it seen before a valid occurrence."""
+    from omnibuf.protobuf_codec import unmarshal_proto
+
+    # FileDescriptorProto has repeated string dependency = 3
+    dst = descriptor_pb2.FileDescriptorProto(dependency=["stale"])
+    # Wire packet: field #3 with mismatched WIRE_UINT, then field #3 with valid WIRE_ARRAY of strings
+    enc = Encoder()
+    enc.write_uint32(3, 999)
+    enc.write_string_array(3, ["fresh"])
+    pkt = enc.finish()
+
+    unmarshal_proto(pkt, dst)
+    assert list(dst.dependency) == ["fresh"]

@@ -431,21 +431,34 @@ class Encoder:
         append_varint(self._buf, len(raw))
         self._buf.extend(raw)
 
+    @staticmethod
+    def _normalize_bytes(val: Buffer) -> Buffer:
+        if isinstance(val, (bytes, bytearray)):
+            return val
+        mv = val if isinstance(val, memoryview) else memoryview(val)
+        if mv.itemsize == 1 and mv.ndim == 1:
+            return mv
+        if mv.c_contiguous:
+            return mv.cast("B")
+        return mv.tobytes()
+
     def write_bytes(self, field_num: int, val: Buffer) -> None:
         self._check_tagged_context()
+        raw = self._normalize_bytes(val)
         append_tag(self._buf, field_num, WIRE_BYTES)
-        append_varint(self._buf, len(val))
-        self._buf.extend(val)
+        append_varint(self._buf, len(raw))
+        self._buf.extend(raw)
 
     def write_extended(self, field_num: int, ext_type: int, payload: Buffer) -> None:
         self._check_tagged_context()
         ext_iv = _require_int(ext_type, "ext_type")
         if ext_iv < 0 or ext_iv > 0xFF:
             raise OmniBufEncodeError(f"omnibuf: WireExtended subtype {ext_iv} out of 0..255 range")
+        raw = self._normalize_bytes(payload)
         append_tag(self._buf, field_num, WIRE_EXTENDED)
-        append_varint(self._buf, 1 + len(payload))
+        append_varint(self._buf, 1 + len(raw))
         self._buf.append(ext_iv)
-        self._buf.extend(payload)
+        self._buf.extend(raw)
 
     # ------------------------------------------------------------------
     # Untagged element/map-entry payload writers
@@ -525,8 +538,9 @@ class Encoder:
         self._note_elem_written()
 
     def write_elem_bytes(self, val: Buffer) -> None:
-        append_varint(self._buf, len(val))
-        self._buf.extend(val)
+        raw = self._normalize_bytes(val)
+        append_varint(self._buf, len(raw))
+        self._buf.extend(raw)
         self._note_elem_written()
 
     # ------------------------------------------------------------------

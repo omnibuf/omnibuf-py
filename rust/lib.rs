@@ -257,7 +257,7 @@ impl ByteSliceOwner {
                     let ok_layout = view.readonly != 0
                         && view.ndim <= 1
                         && view.itemsize == 1
-                        && (view.strides.is_null() || *view.strides == 1);
+                        && (view.ndim == 0 || view.strides.is_null() || *view.strides == 1);
                     let sub_len = view.len.max(0) as usize;
                     let buf_ptr = view.buf;
                     ffi::PyBuffer_Release(&mut view);
@@ -839,6 +839,12 @@ fn validate_value_no_py(
             Ok(end)
         }
         WIRE_SUB_MSG => {
+            if depth + 1 > MAX_NESTING_DEPTH {
+                return Err(format!(
+                    "omnibuf: nesting depth {} exceeds limit {MAX_NESTING_DEPTH}",
+                    depth + 1
+                ));
+            }
             let (body, end) = read_len_slice(data, pos, 0).map_err(|e| e.to_string())?;
             let mut p = 0usize;
             while p < body.len() {
@@ -1069,7 +1075,8 @@ fn splice_fields_py<'py>(
         return Ok(PyBytes::new(py, &out));
     }
 
-    let mut ordered_nums: Vec<u32> = Vec::with_capacity(rep_len);
+    let mut rep_index: std::collections::HashMap<u32, usize> =
+        std::collections::HashMap::with_capacity(rep_len);
     let mut rep_payloads: Vec<Vec<u8>> = Vec::with_capacity(rep_len);
 
     for i in 0..rep_len {
@@ -1093,17 +1100,18 @@ fn splice_fields_py<'py>(
         let payload = enc_leaf.as_slice().to_vec();
         drop(enc_leaf);
 
-        if let Some(existing_idx) = ordered_nums.iter().position(|&n| n == fnum) {
+        if let Some(&existing_idx) = rep_index.get(&fnum) {
             rep_payloads[existing_idx] = payload;
         } else {
-            ordered_nums.push(fnum);
+            let idx = rep_payloads.len();
+            rep_index.insert(fnum, idx);
             rep_payloads.push(payload);
         }
     }
 
     let n = src.len();
-    let mut spans: Vec<(u32, usize, usize)> = Vec::with_capacity(16);
-    let mut last_occurrence: Vec<Option<usize>> = vec![None; ordered_nums.len()];
+    let mut spans: Vec<(Option<usize>, usize, usize)> = Vec::with_capacity(16);
+    let mut last_occurrence: Vec<Option<usize>> = vec![None; rep_payloads.len()];
     let mut pos = 0usize;
 
     while pos < n {
@@ -1135,19 +1143,20 @@ fn splice_fields_py<'py>(
             validate_strict_value(py, src, pos, wt, 0)?
         };
         let span_idx = spans.len();
-        spans.push((fnum, field_start, next_pos));
-        if let Some(rep_idx) = ordered_nums.iter().position(|&target| target == fnum) {
-            last_occurrence[rep_idx] = Some(span_idx);
+        let rep_idx = rep_index.get(&fnum).copied();
+        spans.push((rep_idx, field_start, next_pos));
+        if let Some(ri) = rep_idx {
+            last_occurrence[ri] = Some(span_idx);
         }
         pos = next_pos;
     }
 
     out.reserve(n + 64);
-    let mut emitted = vec![false; ordered_nums.len()];
+    let mut emitted = vec![false; rep_payloads.len()];
     let mut copy_start = 0usize;
 
-    for (idx, &(fnum, f_start, f_end)) in spans.iter().enumerate() {
-        let Some(rep_idx) = ordered_nums.iter().position(|&target| target == fnum) else {
+    for (idx, &(rep_idx_opt, f_start, f_end)) in spans.iter().enumerate() {
+        let Some(rep_idx) = rep_idx_opt else {
             continue;
         };
         if copy_start < f_start {

@@ -1354,7 +1354,7 @@ impl CompiledCodec {
                     }
                     let raw_val = fp.access.get(py, obj_ptr)?;
                     if raw_val.is_none()
-                        || (fp.omitempty && self.is_value_empty(py, fp, &raw_val)?)
+                        || (fp.omitempty && self.is_value_empty(py, fp, &raw_val, 0)?)
                     {
                         continue;
                     }
@@ -1492,7 +1492,14 @@ impl CompiledCodec {
         py: Python<'_>,
         fp: &FieldPlan,
         val: &Bound<'_, PyAny>,
+        depth: usize,
     ) -> PyResult<bool> {
+        if depth > MAX_NESTING_DEPTH {
+            return Err(encode_err(
+                py,
+                format!("omnibuf: nesting depth {depth} exceeds limit {MAX_NESTING_DEPTH}"),
+            ));
+        }
         if val.is_none() {
             return Ok(true);
         }
@@ -1523,11 +1530,20 @@ impl CompiledCodec {
             | FieldPlanKind::ArraySubMsg { .. }
             | FieldPlanKind::Map { .. } => Ok(val.len()? == 0),
             FieldPlanKind::SubMsg { codec } => {
+                if depth + 1 > MAX_NESTING_DEPTH {
+                    return Err(encode_err(
+                        py,
+                        format!(
+                            "omnibuf: nesting depth {} exceeds limit {MAX_NESTING_DEPTH}",
+                            depth + 1
+                        ),
+                    ));
+                }
                 let sub = codec.get();
                 let sub_inner = sub.inner_plan(py)?;
                 for sub_fp in &sub_inner.fields {
                     let child_val = sub_fp.access.get(py, ptr)?;
-                    if !sub.is_value_empty(py, sub_fp, &child_val)? {
+                    if !sub.is_value_empty(py, sub_fp, &child_val, depth + 1)? {
                         return Ok(false);
                     }
                 }
@@ -1610,32 +1626,43 @@ impl CompiledCodec {
                             }
                             val_ptr = cp;
                         }
-                        DefaultPlan::EmptyList => match &fp.kind {
-                            FieldPlanKind::ArrayScalar { elem_wt, .. } => {
-                                let lp = write_raw_tag_and_len_placeholder(
-                                    buf,
-                                    fp.tag_bytes,
-                                    fp.tag_len,
-                                );
-                                buf.extend_from_slice(&[*elem_wt, 0x01]);
-                                backpatch_container_fast(buf, lp);
-                                continue;
+                        DefaultPlan::EmptyList => {
+                            if depth + 1 > MAX_NESTING_DEPTH {
+                                return Some(Err(encode_err(
+                                    py,
+                                    format!(
+                                        "omnibuf: array nesting depth {} exceeds limit {MAX_NESTING_DEPTH}",
+                                        depth + 1
+                                    ),
+                                )));
                             }
-                            FieldPlanKind::ArraySubMsg { .. } => {
-                                let lp = write_raw_tag_and_len_placeholder(
-                                    buf,
-                                    fp.tag_bytes,
-                                    fp.tag_len,
-                                );
-                                buf.extend_from_slice(&[WIRE_SUB_MSG, 0x01]);
-                                backpatch_container_fast(buf, lp);
-                                continue;
+                            match &fp.kind {
+                                FieldPlanKind::ArrayScalar { elem_wt, .. } => {
+                                    let lp = write_raw_tag_and_len_placeholder(
+                                        buf,
+                                        fp.tag_bytes,
+                                        fp.tag_len,
+                                    );
+                                    buf.extend_from_slice(&[*elem_wt, 0x01]);
+                                    backpatch_container_fast(buf, lp);
+                                    continue;
+                                }
+                                FieldPlanKind::ArraySubMsg { .. } => {
+                                    let lp = write_raw_tag_and_len_placeholder(
+                                        buf,
+                                        fp.tag_bytes,
+                                        fp.tag_len,
+                                    );
+                                    buf.extend_from_slice(&[WIRE_SUB_MSG, 0x01]);
+                                    backpatch_container_fast(buf, lp);
+                                    continue;
+                                }
+                                _ => {
+                                    buf.truncate(checkpoint);
+                                    return None;
+                                }
                             }
-                            _ => {
-                                buf.truncate(checkpoint);
-                                return None;
-                            }
-                        },
+                        }
                         DefaultPlan::PbpySkip => continue,
                         _ => {
                             buf.truncate(checkpoint);
@@ -1754,7 +1781,24 @@ impl CompiledCodec {
                                 }
                             }
                             ScalarKind::Uint32 => {
-                                buf.reserve(n * 5);
+                                let Some(reserve_bytes) = n.checked_mul(9) else {
+                                    return Some(Err(encode_err(
+                                        py,
+                                        format!(
+                                            "omnibuf: field {} array size overflow",
+                                            fp.wire_name
+                                        ),
+                                    )));
+                                };
+                                if buf.try_reserve(reserve_bytes).is_err() {
+                                    return Some(Err(encode_err(
+                                        py,
+                                        format!(
+                                            "omnibuf: field {} allocation failed",
+                                            fp.wire_name
+                                        ),
+                                    )));
+                                }
                                 for i in 0..n {
                                     let item_ptr =
                                         ffi::PyList_GET_ITEM(val_ptr, i as ffi::Py_ssize_t);
@@ -2476,8 +2520,22 @@ impl CompiledCodec {
                     )
                 })?;
                 let n = seq.len()?;
-                let mut items: Vec<Bound<'_, PyAny>> = Vec::with_capacity(n);
+                let mut items: Vec<Bound<'_, PyAny>> = Vec::with_capacity(n.min(4096));
                 for i in 0..n {
+                    if (i & 0xFFF) == 0xFFF {
+                        py.check_signals()?;
+                    }
+                    if items.len() == items.capacity() {
+                        items.try_reserve(1).map_err(|_| {
+                            encode_err(
+                                py,
+                                format!(
+                                    "omnibuf: field {} sequence allocation failed",
+                                    fp.wire_name
+                                ),
+                            )
+                        })?;
+                    }
                     items.push(seq.get_item(i)?);
                 }
                 let use_len4 = 2usize.saturating_add(
@@ -2533,8 +2591,22 @@ impl CompiledCodec {
                     )
                 })?;
                 let n = seq.len()?;
-                let mut items: Vec<Bound<'_, PyAny>> = Vec::with_capacity(n);
+                let mut items: Vec<Bound<'_, PyAny>> = Vec::with_capacity(n.min(4096));
                 for i in 0..n {
+                    if (i & 0xFFF) == 0xFFF {
+                        py.check_signals()?;
+                    }
+                    if items.len() == items.capacity() {
+                        items.try_reserve(1).map_err(|_| {
+                            encode_err(
+                                py,
+                                format!(
+                                    "omnibuf: field {} sequence allocation failed",
+                                    fp.wire_name
+                                ),
+                            )
+                        })?;
+                    }
                     items.push(seq.get_item(i)?);
                 }
                 let use_len4 = 2usize.saturating_add(items.len()) > 16_383;
@@ -2855,7 +2927,7 @@ impl CompiledCodec {
                 raw_val
             };
 
-            if fp.omitempty && self.is_value_empty(py, fp, &val)? {
+            if fp.omitempty && self.is_value_empty(py, fp, &val, depth)? {
                 continue;
             }
 

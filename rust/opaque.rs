@@ -218,29 +218,40 @@ fn locate_in_dir(
 }
 
 #[inline]
-fn locate_field_u32(packet: &[u8], target_field: u32, exp_mask: u16) -> Option<(&[u8], u8)> {
+fn locate_field_u32(
+    packet: &[u8],
+    target_field: u32,
+    exp_mask: u16,
+) -> Result<Option<(&[u8], u8)>, String> {
     let mut pos = 0usize;
     let n = packet.len();
     let mut found: Option<(&[u8], u8)> = None;
     while pos < n {
-        let (fnum, wt, next_pos) = read_tag_at(packet, pos)?;
+        let (fnum, wt, next_pos) = read_tag_at(packet, pos)
+            .ok_or_else(|| format!("omnibuf: invalid or truncated tag at byte {pos}"))?;
         pos = next_pos;
         if fnum == 0 {
             if wt != WIRE_SUB_MSG {
-                return None;
+                return Err(format!(
+                    "omnibuf: Field #0 requires WireSubMsg (12), got {wt}"
+                ));
             }
-            pos = validate_field0_slice(packet, pos, 0).ok()?;
+            pos = validate_field0_slice(packet, pos, 0)?;
             continue;
         }
         if fnum == target_field && (exp_mask & (1u16 << wt)) != 0 {
             found = Some((&packet[pos..], wt));
         }
         pos = match wt {
-            WIRE_ARRAY | WIRE_MAP | WIRE_EXTENDED => skip_value(packet, pos, wt).ok()?,
-            _ => fast_skip_value(packet, pos, wt)?,
+            WIRE_ARRAY | WIRE_MAP | WIRE_EXTENDED => {
+                skip_value(packet, pos, wt).map_err(|e| e.to_string())?
+            }
+            _ => fast_skip_value(packet, pos, wt).ok_or_else(|| {
+                format!("omnibuf: truncated or invalid wire type {wt} at byte {pos}")
+            })?,
         };
     }
-    found
+    Ok(found)
 }
 
 #[inline]
@@ -250,41 +261,35 @@ fn next_container_u32(
     target_field: u32,
     exp_wt: u8,
     min_len: usize,
-) -> (Option<(usize, usize, usize)>, bool) {
+) -> Result<Option<(usize, usize, usize)>, String> {
     let n = packet.len();
     while pos < n {
-        let Some((fnum, wt, after_tag)) = read_tag_at(packet, pos) else {
-            return (None, false);
-        };
+        let (fnum, wt, after_tag) = read_tag_at(packet, pos)
+            .ok_or_else(|| format!("omnibuf: invalid or truncated tag at byte {pos}"))?;
         pos = after_tag;
         if fnum == 0 {
             if wt != WIRE_SUB_MSG {
-                return (None, false);
+                return Err(format!(
+                    "omnibuf: Field #0 requires WireSubMsg (12), got {wt}"
+                ));
             }
-            let Ok(end_f0) = validate_field0_slice(packet, pos, 0) else {
-                return (None, false);
-            };
-            pos = end_f0;
+            pos = validate_field0_slice(packet, pos, 0)?;
             continue;
         }
         if fnum == target_field && wt == exp_wt {
-            let Ok((body, end)) = read_len_slice(packet, pos, min_len) else {
-                return (None, false);
-            };
+            let (body, end) = read_len_slice(packet, pos, min_len).map_err(|e| e.to_string())?;
             let start = end - body.len();
-            return (Some((start, end, end)), true);
+            return Ok(Some((start, end, end)));
         }
-        let next = if matches!(wt, WIRE_ARRAY | WIRE_MAP | WIRE_EXTENDED) {
-            skip_value(packet, pos, wt).ok()
+        pos = if matches!(wt, WIRE_ARRAY | WIRE_MAP | WIRE_EXTENDED) {
+            skip_value(packet, pos, wt).map_err(|e| e.to_string())?
         } else {
-            fast_skip_value(packet, pos, wt)
+            fast_skip_value(packet, pos, wt).ok_or_else(|| {
+                format!("omnibuf: truncated or invalid wire type {wt} at byte {pos}")
+            })?
         };
-        let Some(next_pos) = next else {
-            return (None, false);
-        };
-        pos = next_pos;
     }
-    (None, true)
+    Ok(None)
 }
 
 #[inline]
@@ -478,75 +483,128 @@ fn checked_read_bytes_span(
 }
 
 #[inline]
-fn slice_read_uint(slice: &[u8], fnum: u32) -> Option<u64> {
-    let (s, _) = locate_field_u32(slice, fnum, 1 << WIRE_UINT)?;
-    decode_varint(s).map(|(v, _)| v)
+fn slice_read_uint(slice: &[u8], fnum: u32) -> Result<Option<u64>, String> {
+    let Some((s, _)) = locate_field_u32(slice, fnum, 1 << WIRE_UINT)? else {
+        return Ok(None);
+    };
+    let (v, _) = decode_varint(s).ok_or_else(|| "omnibuf: invalid uint varint".to_owned())?;
+    Ok(Some(v))
 }
 
 #[inline]
-fn slice_read_sint(slice: &[u8], fnum: u32) -> Option<i64> {
-    let (s, _) = locate_field_u32(slice, fnum, 1 << WIRE_SINT)?;
-    decode_varint(s).map(|(v, _)| decode_zigzag(v))
+fn slice_read_sint(slice: &[u8], fnum: u32) -> Result<Option<i64>, String> {
+    let Some((s, _)) = locate_field_u32(slice, fnum, 1 << WIRE_SINT)? else {
+        return Ok(None);
+    };
+    let (v, _) = decode_varint(s).ok_or_else(|| "omnibuf: invalid sint varint".to_owned())?;
+    Ok(Some(decode_zigzag(v)))
 }
 
 #[inline]
-fn slice_read_bool(slice: &[u8], fnum: u32) -> Option<bool> {
-    let (_, wt) = locate_field_u32(slice, fnum, (1 << WIRE_BOOL_FALSE) | (1 << WIRE_BOOL_TRUE))?;
-    Some(wt == WIRE_BOOL_TRUE)
+fn slice_read_bool(slice: &[u8], fnum: u32) -> Result<Option<bool>, String> {
+    let Some((_, wt)) =
+        locate_field_u32(slice, fnum, (1 << WIRE_BOOL_FALSE) | (1 << WIRE_BOOL_TRUE))?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(wt == WIRE_BOOL_TRUE))
 }
 
 #[inline]
-fn slice_read_fixed32(slice: &[u8], fnum: u32) -> Option<u32> {
-    let (s, _) = locate_field_u32(slice, fnum, 1 << WIRE_FIXED32)?;
-    Some(u32::from_le_bytes(s.get(..4)?.try_into().ok()?))
+fn slice_read_fixed32(slice: &[u8], fnum: u32) -> Result<Option<u32>, String> {
+    let Some((s, _)) = locate_field_u32(slice, fnum, 1 << WIRE_FIXED32)? else {
+        return Ok(None);
+    };
+    let raw: [u8; 4] = s
+        .get(..4)
+        .ok_or_else(|| "omnibuf: truncated fixed32".to_owned())?
+        .try_into()
+        .unwrap();
+    Ok(Some(u32::from_le_bytes(raw)))
 }
 
 #[inline]
-fn slice_read_sfixed32(slice: &[u8], fnum: u32) -> Option<i32> {
-    let (s, _) = locate_field_u32(slice, fnum, 1 << WIRE_SFIXED32)?;
-    Some(i32::from_le_bytes(s.get(..4)?.try_into().ok()?))
+fn slice_read_sfixed32(slice: &[u8], fnum: u32) -> Result<Option<i32>, String> {
+    let Some((s, _)) = locate_field_u32(slice, fnum, 1 << WIRE_SFIXED32)? else {
+        return Ok(None);
+    };
+    let raw: [u8; 4] = s
+        .get(..4)
+        .ok_or_else(|| "omnibuf: truncated sfixed32".to_owned())?
+        .try_into()
+        .unwrap();
+    Ok(Some(i32::from_le_bytes(raw)))
 }
 
 #[inline]
-fn slice_read_fixed64(slice: &[u8], fnum: u32) -> Option<u64> {
-    let (s, _) = locate_field_u32(slice, fnum, 1 << WIRE_FIXED64)?;
-    Some(u64::from_le_bytes(s.get(..8)?.try_into().ok()?))
+fn slice_read_fixed64(slice: &[u8], fnum: u32) -> Result<Option<u64>, String> {
+    let Some((s, _)) = locate_field_u32(slice, fnum, 1 << WIRE_FIXED64)? else {
+        return Ok(None);
+    };
+    let raw: [u8; 8] = s
+        .get(..8)
+        .ok_or_else(|| "omnibuf: truncated fixed64".to_owned())?
+        .try_into()
+        .unwrap();
+    Ok(Some(u64::from_le_bytes(raw)))
 }
 
 #[inline]
-fn slice_read_sfixed64(slice: &[u8], fnum: u32) -> Option<i64> {
-    let (s, _) = locate_field_u32(slice, fnum, 1 << WIRE_SFIXED64)?;
-    Some(i64::from_le_bytes(s.get(..8)?.try_into().ok()?))
+fn slice_read_sfixed64(slice: &[u8], fnum: u32) -> Result<Option<i64>, String> {
+    let Some((s, _)) = locate_field_u32(slice, fnum, 1 << WIRE_SFIXED64)? else {
+        return Ok(None);
+    };
+    let raw: [u8; 8] = s
+        .get(..8)
+        .ok_or_else(|| "omnibuf: truncated sfixed64".to_owned())?
+        .try_into()
+        .unwrap();
+    Ok(Some(i64::from_le_bytes(raw)))
 }
 
 #[inline]
-fn slice_read_float32(slice: &[u8], fnum: u32) -> Option<f32> {
-    let (s, _) = locate_field_u32(slice, fnum, 1 << WIRE_FLOAT32)?;
-    Some(f32::from_bits(u32::from_le_bytes(
-        s.get(..4)?.try_into().ok()?,
-    )))
+fn slice_read_float32(slice: &[u8], fnum: u32) -> Result<Option<f32>, String> {
+    let Some((s, _)) = locate_field_u32(slice, fnum, 1 << WIRE_FLOAT32)? else {
+        return Ok(None);
+    };
+    let raw: [u8; 4] = s
+        .get(..4)
+        .ok_or_else(|| "omnibuf: truncated float32".to_owned())?
+        .try_into()
+        .unwrap();
+    Ok(Some(f32::from_bits(u32::from_le_bytes(raw))))
 }
 
 #[inline]
-fn slice_read_float64(slice: &[u8], fnum: u32) -> Option<f64> {
-    let (s, _) = locate_field_u32(slice, fnum, 1 << WIRE_FLOAT64)?;
-    Some(f64::from_bits(u64::from_le_bytes(
-        s.get(..8)?.try_into().ok()?,
-    )))
+fn slice_read_float64(slice: &[u8], fnum: u32) -> Result<Option<f64>, String> {
+    let Some((s, _)) = locate_field_u32(slice, fnum, 1 << WIRE_FLOAT64)? else {
+        return Ok(None);
+    };
+    let raw: [u8; 8] = s
+        .get(..8)
+        .ok_or_else(|| "omnibuf: truncated float64".to_owned())?
+        .try_into()
+        .unwrap();
+    Ok(Some(f64::from_bits(u64::from_le_bytes(raw))))
 }
 
 #[inline]
-fn slice_read_str(slice: &[u8], fnum: u32) -> Option<&str> {
-    let (s, _) = locate_field_u32(slice, fnum, 1 << WIRE_STRING)?;
-    let (bytes, _) = read_len_slice(s, 0, 0).ok()?;
-    validate_utf8(bytes).ok()
+fn slice_read_str(slice: &[u8], fnum: u32) -> Result<Option<&str>, String> {
+    let Some((s, _)) = locate_field_u32(slice, fnum, 1 << WIRE_STRING)? else {
+        return Ok(None);
+    };
+    let (bytes, _) = read_len_slice(s, 0, 0).map_err(|e| e.to_string())?;
+    let valid = validate_utf8(bytes).map_err(|e| e.to_string())?;
+    Ok(Some(valid))
 }
 
 #[inline]
-fn slice_read_bytes(slice: &[u8], fnum: u32) -> Option<&[u8]> {
-    let (s, _) = locate_field_u32(slice, fnum, 1 << WIRE_BYTES)?;
-    let (b, _) = read_len_slice(s, 0, 0).ok()?;
-    Some(b)
+fn slice_read_bytes(slice: &[u8], fnum: u32) -> Result<Option<&[u8]>, String> {
+    let Some((s, _)) = locate_field_u32(slice, fnum, 1 << WIRE_BYTES)? else {
+        return Ok(None);
+    };
+    let (b, _) = read_len_slice(s, 0, 0).map_err(|e| e.to_string())?;
+    Ok(Some(b))
 }
 
 #[pyclass(subclass)]
@@ -2059,7 +2117,8 @@ pub fn opaque_get_uint32_py(
         return Ok(default);
     }
     let b = LeafBytes::extract(py, raw)?;
-    Ok(slice_read_uint(b.as_slice(), field_num as u32).map_or(default, |v| v as u32))
+    let opt = slice_read_uint(b.as_slice(), field_num as u32).map_err(|m| decode_err(py, m))?;
+    Ok(opt.map_or(default, |v| v as u32))
 }
 
 #[pyfunction]
@@ -2074,7 +2133,8 @@ pub fn opaque_get_uint64_py(
         return Ok(default);
     }
     let b = LeafBytes::extract(py, raw)?;
-    Ok(slice_read_uint(b.as_slice(), field_num as u32).unwrap_or(default))
+    let opt = slice_read_uint(b.as_slice(), field_num as u32).map_err(|m| decode_err(py, m))?;
+    Ok(opt.unwrap_or(default))
 }
 
 #[pyfunction]
@@ -2089,7 +2149,8 @@ pub fn opaque_get_sint32_py(
         return Ok(default);
     }
     let b = LeafBytes::extract(py, raw)?;
-    Ok(slice_read_sint(b.as_slice(), field_num as u32).map_or(default, |v| v as i32))
+    let opt = slice_read_sint(b.as_slice(), field_num as u32).map_err(|m| decode_err(py, m))?;
+    Ok(opt.map_or(default, |v| v as i32))
 }
 
 #[pyfunction]
@@ -2104,7 +2165,8 @@ pub fn opaque_get_sint64_py(
         return Ok(default);
     }
     let b = LeafBytes::extract(py, raw)?;
-    Ok(slice_read_sint(b.as_slice(), field_num as u32).unwrap_or(default))
+    let opt = slice_read_sint(b.as_slice(), field_num as u32).map_err(|m| decode_err(py, m))?;
+    Ok(opt.unwrap_or(default))
 }
 
 #[pyfunction]
@@ -2119,7 +2181,8 @@ pub fn opaque_get_bool_py(
         return Ok(default);
     }
     let b = LeafBytes::extract(py, raw)?;
-    Ok(slice_read_bool(b.as_slice(), field_num as u32).unwrap_or(default))
+    let opt = slice_read_bool(b.as_slice(), field_num as u32).map_err(|m| decode_err(py, m))?;
+    Ok(opt.unwrap_or(default))
 }
 
 #[pyfunction]
@@ -2134,7 +2197,8 @@ pub fn opaque_get_fixed32_py(
         return Ok(default);
     }
     let b = LeafBytes::extract(py, raw)?;
-    Ok(slice_read_fixed32(b.as_slice(), field_num as u32).unwrap_or(default))
+    let opt = slice_read_fixed32(b.as_slice(), field_num as u32).map_err(|m| decode_err(py, m))?;
+    Ok(opt.unwrap_or(default))
 }
 
 #[pyfunction]
@@ -2149,7 +2213,8 @@ pub fn opaque_get_sfixed32_py(
         return Ok(default);
     }
     let b = LeafBytes::extract(py, raw)?;
-    Ok(slice_read_sfixed32(b.as_slice(), field_num as u32).unwrap_or(default))
+    let opt = slice_read_sfixed32(b.as_slice(), field_num as u32).map_err(|m| decode_err(py, m))?;
+    Ok(opt.unwrap_or(default))
 }
 
 #[pyfunction]
@@ -2164,7 +2229,8 @@ pub fn opaque_get_fixed64_py(
         return Ok(default);
     }
     let b = LeafBytes::extract(py, raw)?;
-    Ok(slice_read_fixed64(b.as_slice(), field_num as u32).unwrap_or(default))
+    let opt = slice_read_fixed64(b.as_slice(), field_num as u32).map_err(|m| decode_err(py, m))?;
+    Ok(opt.unwrap_or(default))
 }
 
 #[pyfunction]
@@ -2179,7 +2245,8 @@ pub fn opaque_get_sfixed64_py(
         return Ok(default);
     }
     let b = LeafBytes::extract(py, raw)?;
-    Ok(slice_read_sfixed64(b.as_slice(), field_num as u32).unwrap_or(default))
+    let opt = slice_read_sfixed64(b.as_slice(), field_num as u32).map_err(|m| decode_err(py, m))?;
+    Ok(opt.unwrap_or(default))
 }
 
 #[pyfunction]
@@ -2194,7 +2261,8 @@ pub fn opaque_get_float32_py(
         return Ok(default);
     }
     let b = LeafBytes::extract(py, raw)?;
-    Ok(slice_read_float32(b.as_slice(), field_num as u32).map_or(default, f64::from))
+    let opt = slice_read_float32(b.as_slice(), field_num as u32).map_err(|m| decode_err(py, m))?;
+    Ok(opt.map_or(default, f64::from))
 }
 
 #[pyfunction]
@@ -2209,7 +2277,8 @@ pub fn opaque_get_float64_py(
         return Ok(default);
     }
     let b = LeafBytes::extract(py, raw)?;
-    Ok(slice_read_float64(b.as_slice(), field_num as u32).unwrap_or(default))
+    let opt = slice_read_float64(b.as_slice(), field_num as u32).map_err(|m| decode_err(py, m))?;
+    Ok(opt.unwrap_or(default))
 }
 
 #[pyfunction]
@@ -2225,7 +2294,9 @@ pub fn opaque_get_string_py<'py>(
     }
     let out_opt = {
         let b = LeafBytes::extract(py, raw)?;
-        slice_read_str(b.as_slice(), field_num as u32).map(str::to_owned)
+        slice_read_str(b.as_slice(), field_num as u32)
+            .map_err(|m| decode_err(py, m))?
+            .map(str::to_owned)
     };
     if let Some(s) = out_opt {
         Ok(PyString::new(py, &s))
@@ -2257,7 +2328,9 @@ pub fn opaque_get_bytes_py<'py>(
     }
     let out_opt = {
         let b = LeafBytes::extract(py, raw)?;
-        slice_read_bytes(b.as_slice(), field_num as u32).map(|s| s.to_vec())
+        slice_read_bytes(b.as_slice(), field_num as u32)
+            .map_err(|m| decode_err(py, m))?
+            .map(|s| s.to_vec())
     };
     if let Some(found) = out_opt {
         Ok(PyBytes::new(py, &found))
@@ -2278,18 +2351,13 @@ pub fn opaque_get_submsg_slice_py<'py>(
     let found_vec: Option<Vec<u8>> = {
         let b = LeafBytes::extract(py, raw)?;
         let slice = b.as_slice();
-        let (first, ok1) = next_container_u32(slice, 0, field_num as u32, WIRE_SUB_MSG, 0);
-        if !ok1 {
-            None
-        } else if let Some((b1_s, b1_e, mut pos)) = first {
+        let first = next_container_u32(slice, 0, field_num as u32, WIRE_SUB_MSG, 0)
+            .map_err(|m| decode_err(py, m))?;
+        if let Some((b1_s, b1_e, mut pos)) = first {
             let mut merged: Option<Vec<u8>> = None;
-            let mut valid = true;
             while pos < slice.len() {
-                let (nxt, ok) = next_container_u32(slice, pos, field_num as u32, WIRE_SUB_MSG, 0);
-                if !ok {
-                    valid = false;
-                    break;
-                }
+                let nxt = next_container_u32(slice, pos, field_num as u32, WIRE_SUB_MSG, 0)
+                    .map_err(|m| decode_err(py, m))?;
                 let Some((bn_s, bn_e, next_p)) = nxt else {
                     break;
                 };
@@ -2297,11 +2365,7 @@ pub fn opaque_get_submsg_slice_py<'py>(
                 let vec = merged.get_or_insert_with(|| slice[b1_s..b1_e].to_vec());
                 vec.extend_from_slice(&slice[bn_s..bn_e]);
             }
-            if !valid {
-                None
-            } else {
-                Some(merged.unwrap_or_else(|| slice[b1_s..b1_e].to_vec()))
-            }
+            Some(merged.unwrap_or_else(|| slice[b1_s..b1_e].to_vec()))
         } else {
             None
         }

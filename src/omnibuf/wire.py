@@ -651,12 +651,13 @@ def _validate_container_entry(
     wt: int,
     depth: int,
     limit_depth: int,
+    check_utf8: bool = False,
 ) -> int:
     if wt == WIRE_BOOL_FALSE:
         if pos >= len(body) or body[pos] > 1:
             raise OmniBufDecodeError(f"omnibuf: invalid bool byte in container at byte {pos}")
         return pos + 1
-    return validate_value(body, pos, wt, depth, limit_depth)
+    return validate_value(body, pos, wt, depth, limit_depth, check_utf8=check_utf8)
 
 
 def validate_value(
@@ -666,6 +667,7 @@ def validate_value(
     depth: int = 0,
     limit_depth: int = MAX_NESTING_DEPTH,
     end: int | None = None,
+    check_utf8: bool = False,
 ) -> int:
     """Recursively validates a field payload at data[pos] enforcing MAX_NESTING_DEPTH."""
     if depth > limit_depth:
@@ -674,9 +676,15 @@ def validate_value(
     if pos < 0 or pos > limit:
         raise OmniBufDecodeError(f"omnibuf: position {pos} out of bounds")
 
+    if wt == WIRE_STRING:
+        raw_str, next_pos = read_len_slice(data, pos, 0, limit)
+        if check_utf8:
+            decode_utf8_strict(raw_str, pos)
+        return next_pos
+
     if wt == WIRE_SUB_MSG:
         body, next_pos = read_len_slice(data, pos, 0, limit)
-        validate_message(body, depth + 1, limit_depth)
+        validate_message(body, depth + 1, limit_depth, check_utf8=check_utf8)
         return next_pos
 
     if wt == WIRE_ARRAY:
@@ -704,7 +712,9 @@ def validate_value(
                 raise OmniBufDecodeError("omnibuf: invalid WireArray 64-bit byte length")
             return next_pos
         for _ in range(count):
-            p = _validate_container_entry(body, p, elem_wt, depth + 1, limit_depth)
+            p = _validate_container_entry(
+                body, p, elem_wt, depth + 1, limit_depth, check_utf8=check_utf8
+            )
         if p != len(body):
             raise OmniBufDecodeError("omnibuf: trailing bytes in WireArray")
         return next_pos
@@ -719,8 +729,12 @@ def validate_value(
         if not ok:
             raise OmniBufDecodeError(f"omnibuf: invalid WireMap header at byte {pos}")
         for _ in range(count):
-            p = _validate_container_entry(body, p, key_wt, depth + 1, limit_depth)
-            p = _validate_container_entry(body, p, val_wt, depth + 1, limit_depth)
+            p = _validate_container_entry(
+                body, p, key_wt, depth + 1, limit_depth, check_utf8=check_utf8
+            )
+            p = _validate_container_entry(
+                body, p, val_wt, depth + 1, limit_depth, check_utf8=check_utf8
+            )
         if p != len(body):
             raise OmniBufDecodeError("omnibuf: trailing bytes in WireMap")
         return next_pos
@@ -816,9 +830,10 @@ def validate_message(
     data: Buffer,
     depth: int = 0,
     limit_depth: int = MAX_NESTING_DEPTH,
+    check_utf8: bool = True,
 ) -> None:
     """Validates an entire OmniBuf message buffer without allocating decoded objects."""
-    if depth == 0 and limit_depth == MAX_NESTING_DEPTH:
+    if depth == 0 and limit_depth == MAX_NESTING_DEPTH and check_utf8:
         _omnibuf_ext.validate_message_py(data)
         return
     if depth > limit_depth:
@@ -836,7 +851,7 @@ def validate_message(
         if fnum == 0:
             pos = validate_field0_at(mv, pos, wt, depth, limit_depth, n)
         else:
-            pos = validate_value(mv, pos, wt, depth, limit_depth, n)
+            pos = validate_value(mv, pos, wt, depth, limit_depth, n, check_utf8=check_utf8)
 
 
 @dataclass(slots=True, frozen=True)
