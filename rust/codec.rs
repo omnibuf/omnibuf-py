@@ -58,6 +58,47 @@ unsafe fn put_varint_inline(ptr: *mut u8, v: u64) -> usize {
 }
 
 #[inline(always)]
+unsafe fn slot_submsg_min_wire_size(
+    cls_ptr: *mut ffi::PyTypeObject,
+    inner: &CodecInner,
+    obj_ptr: *mut ffi::PyObject,
+) -> usize {
+    unsafe {
+        if obj_ptr.is_null()
+            || !inner.fast_slot_encode
+            || ffi::Py_IS_TYPE(obj_ptr, cls_ptr) == 0
+        {
+            return 0;
+        }
+        let mut sz = inner.min_wire_reserve;
+        for fp in &inner.fields {
+            if let FieldPlanKind::Scalar { kind, .. } = &fp.kind {
+                match kind {
+                    ScalarKind::String | ScalarKind::StrAsBytes => {
+                        let vp = *obj_ptr
+                            .byte_add(fp.slot_offset)
+                            .cast::<*mut ffi::PyObject>();
+                        if !vp.is_null() && ffi::PyUnicode_CheckExact(vp) != 0 {
+                            sz = sz.saturating_add(ffi::PyUnicode_GET_LENGTH(vp) as usize);
+                        }
+                    }
+                    ScalarKind::Bytes | ScalarKind::BytesAsStr => {
+                        let vp = *obj_ptr
+                            .byte_add(fp.slot_offset)
+                            .cast::<*mut ffi::PyObject>();
+                        if !vp.is_null() && ffi::PyBytes_CheckExact(vp) != 0 {
+                            sz = sz.saturating_add(ffi::PyBytes_Size(vp) as usize);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        sz
+    }
+}
+
+#[inline(always)]
 fn backpatch_container_fast(dst: &mut Vec<u8>, len_pos: usize) {
     let sub_len = dst.len() - (len_pos + 2);
     if sub_len <= 16_383 {
@@ -1632,11 +1673,29 @@ impl CompiledCodec {
                             buf.truncate(checkpoint);
                             return None;
                         };
-                        let len_pos =
-                            write_raw_tag_and_len_placeholder(buf, fp.tag_bytes, fp.tag_len);
+                        let sub_min = slot_submsg_min_wire_size(
+                            sub.cls.as_ptr().cast::<ffi::PyTypeObject>(),
+                            sub_inner,
+                            val_ptr,
+                        );
+                        let use_len4 = sub_min > 16_383;
+                        if use_len4 {
+                            buf.reserve(sub_min.saturating_add(64));
+                        }
+                        let len_pos = if use_len4 {
+                            write_raw_tag_and_len4_placeholder(buf, fp.tag_bytes, fp.tag_len)
+                        } else {
+                            write_raw_tag_and_len_placeholder(buf, fp.tag_bytes, fp.tag_len)
+                        };
                         match sub.try_encode_pure_fast_slots(py, buf, sub_inner, val_ptr, depth + 1)
                         {
-                            Some(Ok(())) => backpatch_container_fast(buf, len_pos),
+                            Some(Ok(())) => {
+                                if use_len4 {
+                                    backpatch_container_len4(buf, len_pos);
+                                } else {
+                                    backpatch_container_fast(buf, len_pos);
+                                }
+                            }
                             Some(Err(e)) => return Some(Err(e)),
                             None => {
                                 buf.truncate(checkpoint);
@@ -1771,7 +1830,22 @@ impl CompiledCodec {
                             return None;
                         };
                         let n = ffi::PyList_GET_SIZE(val_ptr) as usize;
-                        let use_len4 = 2usize.saturating_add(n) > 16_383;
+                        let sub_cls_ptr = sub.cls.as_ptr().cast::<ffi::PyTypeObject>();
+                        let mut arr_min = 2usize.saturating_add(n.saturating_mul(2));
+                        if n <= 64 {
+                            for i in 0..n {
+                                let item_ptr = ffi::PyList_GET_ITEM(val_ptr, i as ffi::Py_ssize_t);
+                                arr_min = arr_min.saturating_add(slot_submsg_min_wire_size(
+                                    sub_cls_ptr,
+                                    sub_inner,
+                                    item_ptr,
+                                ));
+                            }
+                        }
+                        let use_len4 = arr_min > 16_383;
+                        if use_len4 {
+                            buf.reserve(arr_min.saturating_add(64));
+                        }
                         let len_pos = if use_len4 {
                             write_raw_tag_and_len4_placeholder(buf, fp.tag_bytes, fp.tag_len)
                         } else {
@@ -1782,13 +1856,25 @@ impl CompiledCodec {
 
                         for i in 0..n {
                             let item_ptr = ffi::PyList_GET_ITEM(val_ptr, i as ffi::Py_ssize_t);
-                            buf.reserve(2);
+                            let elem_len4 = use_len4
+                                && slot_submsg_min_wire_size(sub_cls_ptr, sub_inner, item_ptr)
+                                    > 16_383;
                             let elem_len_pos = buf.len();
-                            core::ptr::write_unaligned(
-                                buf.as_mut_ptr().add(elem_len_pos).cast::<u16>(),
-                                0u16,
-                            );
-                            buf.set_len(elem_len_pos + 2);
+                            if elem_len4 {
+                                buf.reserve(4);
+                                core::ptr::write_unaligned(
+                                    buf.as_mut_ptr().add(elem_len_pos).cast::<u32>(),
+                                    0u32,
+                                );
+                                buf.set_len(elem_len_pos + 4);
+                            } else {
+                                buf.reserve(2);
+                                core::ptr::write_unaligned(
+                                    buf.as_mut_ptr().add(elem_len_pos).cast::<u16>(),
+                                    0u16,
+                                );
+                                buf.set_len(elem_len_pos + 2);
+                            }
                             match sub.try_encode_pure_fast_slots(
                                 py,
                                 buf,
@@ -1796,7 +1882,13 @@ impl CompiledCodec {
                                 item_ptr,
                                 depth + 2,
                             ) {
-                                Some(Ok(())) => backpatch_container_fast(buf, elem_len_pos),
+                                Some(Ok(())) => {
+                                    if elem_len4 {
+                                        backpatch_container_len4(buf, elem_len_pos);
+                                    } else {
+                                        backpatch_container_fast(buf, elem_len_pos);
+                                    }
+                                }
                                 Some(Err(e)) => return Some(Err(e)),
                                 None => {
                                     buf.truncate(checkpoint);
