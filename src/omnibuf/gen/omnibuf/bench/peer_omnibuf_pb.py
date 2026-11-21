@@ -3,17 +3,21 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import ClassVar
+from dataclasses import dataclass as _omnibuf_dataclass, field as _omnibuf_field
+from typing import TYPE_CHECKING as _omnibuf_TYPE_CHECKING, ClassVar as _omnibuf_ClassVar
 
-from omnibuf._omnibuf_ext import CompiledCodec, OpaqueView
-from omnibuf.wire import Buffer
+from omnibuf._omnibuf_ext import (
+    CompiledCodec as _omnibuf_CompiledCodec,
+    OpaqueView as _omnibuf_OpaqueView,
+)
+from omnibuf.wire import Buffer as _omnibuf_Buffer
 
 _FIELD0_LOCATION: bytes = b'\x19\x16\x015\x11Location]\xe2\x00\x00\n\r\x03\rregion\x05\x15datacenter\x07\tcity\t\track\x0b\x11latitude\r\x13longitude'
 
-@dataclass(slots=True)
+@_omnibuf_dataclass(slots=True)
 class Location:
-    __omnibuf_codec__: ClassVar[CompiledCodec[Location]]
+    if _omnibuf_TYPE_CHECKING:
+        __omnibuf_codec__: _omnibuf_ClassVar[_omnibuf_CompiledCodec[Location]]
     region: str = ""
     datacenter: str = ""
     city: str = ""
@@ -30,16 +34,23 @@ class Location:
         return _CODEC_LOCATION.marshal(self, deterministic=deterministic, self_describing=self_describing)
 
     @classmethod
-    def unmarshal_omnibuf(cls, data: Buffer, out: Location | None = None) -> Location:
-        return _CODEC_LOCATION.unmarshal(data, out)
+    def unmarshal_omnibuf(
+        cls,
+        data: _omnibuf_Buffer,
+        out: Location | None = None,
+        *,
+        max_elements: int | None = None,
+        zero_copy_bytes: bool = False,
+    ) -> Location:
+        return _CODEC_LOCATION.unmarshal(data, out, max_elements=max_elements, zero_copy_bytes=zero_copy_bytes)
 
-_CODEC_LOCATION: CompiledCodec[Location] = CompiledCodec(Location, 'Location')
+_CODEC_LOCATION: _omnibuf_CompiledCodec[Location] = _omnibuf_CompiledCodec(Location, 'Location')
 Location.__omnibuf_codec__ = _CODEC_LOCATION
 marshal_location = _CODEC_LOCATION.marshal
 unmarshal_location = _CODEC_LOCATION.unmarshal
 _decode_location = _CODEC_LOCATION.decode_at
 
-class OpaqueLocation(OpaqueView):
+class OpaqueLocation(_omnibuf_OpaqueView):
     __slots__ = ()
 
     def get_region(self) -> str:
@@ -81,16 +92,33 @@ class OpaqueLocation(OpaqueView):
     def marshal(
         self,
         *,
-        dst_prefix: Buffer | None = None,
+        dst_prefix: _omnibuf_Buffer | None = None,
         self_describing: bool = False,
     ) -> bytes:
         return self._marshal_with_codec(_CODEC_LOCATION, dst_prefix=dst_prefix, self_describing=self_describing)
 
+    def marshal_validated(
+        self,
+        *,
+        dst_prefix: _omnibuf_Buffer | None = None,
+        self_describing: bool = False,
+    ) -> bytes:
+        return self._marshal_with_codec(_CODEC_LOCATION, dst_prefix=dst_prefix, self_describing=self_describing, validate_all=True)
+
+    def try_marshal(
+        self,
+        *,
+        dst_prefix: _omnibuf_Buffer | None = None,
+        self_describing: bool = False,
+    ) -> bytes:
+        return self.marshal_validated(dst_prefix=dst_prefix, self_describing=self_describing)
+
 _FIELD0_NEIGHBOR: bytes = b'\x19\xee\x005\x11Neighbor]\xba\x00\x00\n\t\x03\x11peer_asn\x05\rrouter\x07\x15latency_us\t\x17established'
 
-@dataclass(slots=True)
+@_omnibuf_dataclass(slots=True)
 class Neighbor:
-    __omnibuf_codec__: ClassVar[CompiledCodec[Neighbor]]
+    if _omnibuf_TYPE_CHECKING:
+        __omnibuf_codec__: _omnibuf_ClassVar[_omnibuf_CompiledCodec[Neighbor]]
     peer_asn: int = 0
     router: str = ""
     latency_us: int = 0
@@ -105,16 +133,23 @@ class Neighbor:
         return _CODEC_NEIGHBOR.marshal(self, deterministic=deterministic, self_describing=self_describing)
 
     @classmethod
-    def unmarshal_omnibuf(cls, data: Buffer, out: Neighbor | None = None) -> Neighbor:
-        return _CODEC_NEIGHBOR.unmarshal(data, out)
+    def unmarshal_omnibuf(
+        cls,
+        data: _omnibuf_Buffer,
+        out: Neighbor | None = None,
+        *,
+        max_elements: int | None = None,
+        zero_copy_bytes: bool = False,
+    ) -> Neighbor:
+        return _CODEC_NEIGHBOR.unmarshal(data, out, max_elements=max_elements, zero_copy_bytes=zero_copy_bytes)
 
-_CODEC_NEIGHBOR: CompiledCodec[Neighbor] = CompiledCodec(Neighbor, 'Neighbor')
+_CODEC_NEIGHBOR: _omnibuf_CompiledCodec[Neighbor] = _omnibuf_CompiledCodec(Neighbor, 'Neighbor')
 Neighbor.__omnibuf_codec__ = _CODEC_NEIGHBOR
 marshal_neighbor = _CODEC_NEIGHBOR.marshal
 unmarshal_neighbor = _CODEC_NEIGHBOR.unmarshal
 _decode_neighbor = _CODEC_NEIGHBOR.decode_at
 
-class OpaqueNeighbor(OpaqueView):
+class OpaqueNeighbor(_omnibuf_OpaqueView):
     __slots__ = ()
 
     def get_peer_asn(self) -> int:
@@ -144,26 +179,43 @@ class OpaqueNeighbor(OpaqueView):
     def marshal(
         self,
         *,
-        dst_prefix: Buffer | None = None,
+        dst_prefix: _omnibuf_Buffer | None = None,
         self_describing: bool = False,
     ) -> bytes:
         return self._marshal_with_codec(_CODEC_NEIGHBOR, dst_prefix=dst_prefix, self_describing=self_describing)
 
+    def marshal_validated(
+        self,
+        *,
+        dst_prefix: _omnibuf_Buffer | None = None,
+        self_describing: bool = False,
+    ) -> bytes:
+        return self._marshal_with_codec(_CODEC_NEIGHBOR, dst_prefix=dst_prefix, self_describing=self_describing, validate_all=True)
+
+    def try_marshal(
+        self,
+        *,
+        dst_prefix: _omnibuf_Buffer | None = None,
+        self_describing: bool = False,
+    ) -> bytes:
+        return self.marshal_validated(dst_prefix=dst_prefix, self_describing=self_describing)
+
 _FIELD0_PEER_UPDATE: bytes = b'\x19\x16\x045\x15PeerUpdate]\xaa\x01\x00\n\x17\x03\x07asn\x05\x13router_id\x07\ractive\t\x15uptime_sec\x0b\x11rssi_dbm\r\x11cpu_load\x0f\ttags\x11\x11prefixes\x13\x11location\x15\x13neighbors\x17\x11sequence}&\x02\x00\x0c\x05\x13\x16\x015\x11Location]\xe2\x00\x00\n\r\x03\rregion\x05\x15datacenter\x07\tcity\t\track\x0b\x11latitude\r\x13longitude\x15\xee\x005\x11Neighbor]\xba\x00\x00\n\t\x03\x11peer_asn\x05\rrouter\x07\x15latency_us\t\x17established'
 
-@dataclass(slots=True)
+@_omnibuf_dataclass(slots=True)
 class PeerUpdate:
-    __omnibuf_codec__: ClassVar[CompiledCodec[PeerUpdate]]
+    if _omnibuf_TYPE_CHECKING:
+        __omnibuf_codec__: _omnibuf_ClassVar[_omnibuf_CompiledCodec[PeerUpdate]]
     asn: int = 0
     router_id: str = ""
     active: bool = False
     uptime_sec: int = 0
     rssi_dbm: int = 0
     cpu_load: float = 0.0
-    tags: list[str] = field(default_factory=list)
-    prefixes: list[int] = field(default_factory=list)
+    tags: list[str] = _omnibuf_field(default_factory=list)
+    prefixes: list[int] = _omnibuf_field(default_factory=list)
     location: Location | None = None
-    neighbors: list[Neighbor] = field(default_factory=list)
+    neighbors: list[Neighbor] = _omnibuf_field(default_factory=list)
     sequence: int = 0
 
     def marshal_omnibuf(
@@ -175,16 +227,23 @@ class PeerUpdate:
         return _CODEC_PEER_UPDATE.marshal(self, deterministic=deterministic, self_describing=self_describing)
 
     @classmethod
-    def unmarshal_omnibuf(cls, data: Buffer, out: PeerUpdate | None = None) -> PeerUpdate:
-        return _CODEC_PEER_UPDATE.unmarshal(data, out)
+    def unmarshal_omnibuf(
+        cls,
+        data: _omnibuf_Buffer,
+        out: PeerUpdate | None = None,
+        *,
+        max_elements: int | None = None,
+        zero_copy_bytes: bool = False,
+    ) -> PeerUpdate:
+        return _CODEC_PEER_UPDATE.unmarshal(data, out, max_elements=max_elements, zero_copy_bytes=zero_copy_bytes)
 
-_CODEC_PEER_UPDATE: CompiledCodec[PeerUpdate] = CompiledCodec(PeerUpdate, 'PeerUpdate')
+_CODEC_PEER_UPDATE: _omnibuf_CompiledCodec[PeerUpdate] = _omnibuf_CompiledCodec(PeerUpdate, 'PeerUpdate')
 PeerUpdate.__omnibuf_codec__ = _CODEC_PEER_UPDATE
 marshal_peer_update = _CODEC_PEER_UPDATE.marshal
 unmarshal_peer_update = _CODEC_PEER_UPDATE.unmarshal
 _decode_peer_update = _CODEC_PEER_UPDATE.decode_at
 
-class OpaquePeerUpdate(OpaqueView):
+class OpaquePeerUpdate(_omnibuf_OpaqueView):
     __slots__ = ()
 
     def get_asn(self) -> int:
@@ -262,10 +321,26 @@ class OpaquePeerUpdate(OpaqueView):
     def marshal(
         self,
         *,
-        dst_prefix: Buffer | None = None,
+        dst_prefix: _omnibuf_Buffer | None = None,
         self_describing: bool = False,
     ) -> bytes:
         return self._marshal_with_codec(_CODEC_PEER_UPDATE, dst_prefix=dst_prefix, self_describing=self_describing)
+
+    def marshal_validated(
+        self,
+        *,
+        dst_prefix: _omnibuf_Buffer | None = None,
+        self_describing: bool = False,
+    ) -> bytes:
+        return self._marshal_with_codec(_CODEC_PEER_UPDATE, dst_prefix=dst_prefix, self_describing=self_describing, validate_all=True)
+
+    def try_marshal(
+        self,
+        *,
+        dst_prefix: _omnibuf_Buffer | None = None,
+        self_describing: bool = False,
+    ) -> bytes:
+        return self.marshal_validated(dst_prefix=dst_prefix, self_describing=self_describing)
 
 _CODEC_LOCATION.set_fields(
     [

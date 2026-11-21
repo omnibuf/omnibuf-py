@@ -9,9 +9,11 @@ from typing import Any
 from . import _omnibuf_ext
 from ._omnibuf_ext import OpaqueView
 from .wire import (
+    DEFAULT_MAX_ELEMENTS,
     MAX_FIELD_NUMBER,
     MAX_NESTING_DEPTH,
     WIRE_ARRAY,
+    WIRE_BYTES,
     WIRE_MAP,
     WIRE_SUB_MSG,
     Buffer,
@@ -22,6 +24,7 @@ from .wire import (
     decode_varint,
     decode_zigzag,
     decode_zigzag32,
+    locate_field_offset,
     next_container_span,
     parse_array_header,
     parse_map_header,
@@ -56,6 +59,20 @@ opaque_get_string = _omnibuf_ext.opaque_get_string_py
 
 def opaque_get_bytes(raw: Buffer, field_num: int, default: bytes = b"") -> bytes:
     return _omnibuf_ext.opaque_get_bytes_py(raw, field_num, default)
+
+
+def opaque_get_bytes_view(raw: Buffer, field_num: int) -> memoryview:
+    """Returns a zero-copy read-only memoryview slice over a WireBytes field payload."""
+    if isinstance(field_num, bool) or field_num <= 0 or field_num > MAX_FIELD_NUMBER:
+        return memoryview(b"")
+    val_pos, _ = locate_field_offset(raw, field_num, 1 << WIRE_BYTES)
+    if val_pos < 0:
+        return memoryview(b"")
+    try:
+        mv_slice, _ = read_len_slice(raw, val_pos, 0)
+    except OmniBufDecodeError:
+        return memoryview(b"")
+    return mv_slice.toreadonly()
 
 
 def opaque_get_submsg_slice(raw: Buffer, field_num: int) -> Buffer | None:
@@ -154,10 +171,13 @@ def opaque_get_scalar_array(
     field_num: int,
     exp_elem_wt: int,
     elem_kind: str,
+    *,
+    max_elements: int = DEFAULT_MAX_ELEMENTS,
 ) -> list[Any]:
     out: list[Any] = []
     pos = 0
     n = len(raw)
+    total_elems = 0
     while pos < n:
         b_start, b_end, pos = next_container_span(raw, pos, field_num, WIRE_ARRAY, 2)
         if b_start == -2:
@@ -170,6 +190,11 @@ def opaque_get_scalar_array(
         elem_wt, count, p, ok = parse_array_header(body_mv)
         if not ok or elem_wt != exp_elem_wt:
             raise OmniBufDecodeError(f"omnibuf: invalid WireArray header on field #{field_num}")
+        total_elems += count
+        if total_elems > max_elements:
+            raise OmniBufDecodeError(
+                f"omnibuf: container element count {total_elems} exceeds max_elements {max_elements}"
+            )
         end = len(body_mv)
         for _ in range(count):
             val, p = _read_scalar_elem(body_mv, p, end, elem_kind)
@@ -183,10 +208,13 @@ def opaque_get_submsg_array[T](
     raw: Buffer,
     field_num: int,
     decode_fn: Callable[[Buffer, T | None, int, bool], T],
+    *,
+    max_elements: int = DEFAULT_MAX_ELEMENTS,
 ) -> list[T]:
     out: list[T] = []
     pos = 0
     n = len(raw)
+    total_elems = 0
     while pos < n:
         b_start, b_end, pos = next_container_span(raw, pos, field_num, WIRE_ARRAY, 2)
         if b_start == -2:
@@ -200,6 +228,11 @@ def opaque_get_submsg_array[T](
         if not ok or elem_wt != WIRE_SUB_MSG:
             raise OmniBufDecodeError(
                 f"omnibuf: invalid WireArray<WireSubMsg> header on field #{field_num}"
+            )
+        total_elems += count
+        if total_elems > max_elements:
+            raise OmniBufDecodeError(
+                f"omnibuf: container element count {total_elems} exceeds max_elements {max_elements}"
             )
         end = len(body)
         for _ in range(count):
@@ -220,10 +253,13 @@ def opaque_get_map(
     exp_val_wt: int,
     val_kind: str,
     sub_decode_fn: Callable[[Buffer, Any, int, bool], Any] | None = None,
+    *,
+    max_elements: int = DEFAULT_MAX_ELEMENTS,
 ) -> dict[Any, Any]:
     out: dict[Any, Any] = {}
     pos = 0
     n = len(raw)
+    total_elems = 0
     while pos < n:
         b_start, b_end, pos = next_container_span(raw, pos, field_num, WIRE_MAP, 3)
         if b_start == -2:
@@ -236,6 +272,11 @@ def opaque_get_map(
         key_wt, val_wt, count, p, ok = parse_map_header(body_mv)
         if not ok or key_wt != exp_key_wt or val_wt != exp_val_wt:
             raise OmniBufDecodeError(f"omnibuf: invalid WireMap header on field #{field_num}")
+        total_elems += count
+        if total_elems > max_elements:
+            raise OmniBufDecodeError(
+                f"omnibuf: container element count {total_elems} exceeds max_elements {max_elements}"
+            )
         end = len(body_mv)
         for _ in range(count):
             k, p = _read_scalar_elem(body_mv, p, end, key_kind)
@@ -360,6 +401,7 @@ __all__ = [
     "SpliceField",
     "opaque_get_bool",
     "opaque_get_bytes",
+    "opaque_get_bytes_view",
     "opaque_get_fixed32",
     "opaque_get_fixed64",
     "opaque_get_float32",

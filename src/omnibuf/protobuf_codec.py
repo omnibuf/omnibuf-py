@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 from ._omnibuf_ext import CompiledCodec
 from .field0 import SchemaMeta, encode_field0_schema_meta, merge_schema_meta
 from .wire import (
+    DEFAULT_MAX_ELEMENTS,
     INT32_MAX,
     INT32_MIN,
     INT64_MAX,
@@ -153,47 +154,71 @@ _GPB_SCALAR_SPEC: dict[int, tuple[str, int]] = {
 
 def _write_proto_scalar(dst: bytearray, kind: str, val: Any, field_name: str) -> None:
     if kind == "bool":
+        if not isinstance(val, bool):
+            raise OmniBufEncodeError(
+                f"omnibuf: field {field_name} expected bool, got {type(val).__name__}"
+            )
         dst.append(1 if val else 0)
     elif kind == "uint32":
+        if isinstance(val, bool):
+            raise OmniBufEncodeError(f"omnibuf: field {field_name} expected int, got bool")
         iv = int(val)
         if iv < 0 or iv > UINT32_MAX:
             raise OmniBufEncodeError(f"omnibuf: field {field_name} uint32 {iv} out of range")
         append_varint(dst, iv)
     elif kind == "uint64":
+        if isinstance(val, bool):
+            raise OmniBufEncodeError(f"omnibuf: field {field_name} expected int, got bool")
         iv = int(val)
         if iv < 0 or iv > UINT64_MAX:
             raise OmniBufEncodeError(f"omnibuf: field {field_name} uint64 {iv} out of range")
         append_varint(dst, iv)
     elif kind in ("sint32", "enum"):
+        if isinstance(val, bool):
+            raise OmniBufEncodeError(f"omnibuf: field {field_name} expected int, got bool")
         append_varint(dst, encode_zigzag32(int(val)))
     elif kind == "sint64":
+        if isinstance(val, bool):
+            raise OmniBufEncodeError(f"omnibuf: field {field_name} expected int, got bool")
         append_varint(dst, encode_zigzag(int(val)))
     elif kind == "fixed32":
+        if isinstance(val, bool):
+            raise OmniBufEncodeError(f"omnibuf: field {field_name} expected int, got bool")
         iv = int(val)
         if iv < 0 or iv > UINT32_MAX:
             raise OmniBufEncodeError(f"omnibuf: field {field_name} fixed32 {iv} out of range")
         dst.extend(_U32_PACK(iv))
     elif kind == "sfixed32":
+        if isinstance(val, bool):
+            raise OmniBufEncodeError(f"omnibuf: field {field_name} expected int, got bool")
         iv = int(val)
         if iv < INT32_MIN or iv > INT32_MAX:
             raise OmniBufEncodeError(f"omnibuf: field {field_name} sfixed32 {iv} out of range")
         dst.extend(_I32_PACK(iv))
     elif kind == "fixed64":
+        if isinstance(val, bool):
+            raise OmniBufEncodeError(f"omnibuf: field {field_name} expected int, got bool")
         iv = int(val)
         if iv < 0 or iv > UINT64_MAX:
             raise OmniBufEncodeError(f"omnibuf: field {field_name} fixed64 {iv} out of range")
         dst.extend(_U64_PACK(iv))
     elif kind == "sfixed64":
+        if isinstance(val, bool):
+            raise OmniBufEncodeError(f"omnibuf: field {field_name} expected int, got bool")
         iv = int(val)
         if iv < INT64_MIN or iv > INT64_MAX:
             raise OmniBufEncodeError(f"omnibuf: field {field_name} sfixed64 {iv} out of range")
         dst.extend(_I64_PACK(iv))
     elif kind == "float32":
+        if isinstance(val, bool):
+            raise OmniBufEncodeError(f"omnibuf: field {field_name} expected float, got bool")
         try:
             dst.extend(_F32_PACK(float(val)))
         except OverflowError as exc:
             raise OmniBufEncodeError(f"omnibuf: field {field_name} float32 overflow") from exc
     elif kind == "float64":
+        if isinstance(val, bool):
+            raise OmniBufEncodeError(f"omnibuf: field {field_name} expected float, got bool")
         dst.extend(_F64_PACK(float(val)))
     elif kind == "string":
         raw = encode_utf8_strict(val, field_name)
@@ -344,16 +369,28 @@ class _PbpyMsgPlan:
             pbpy_mode=True,
         )
 
-    def get_schema_meta(self, visiting: frozenset[str] = frozenset()) -> SchemaMeta:
-        if self._schema_meta is not None and not visiting:
+    def get_schema_meta(
+        self,
+        visiting: frozenset[str] = frozenset(),
+        schema_depth: int = 1,
+    ) -> SchemaMeta:
+        if self._schema_meta is not None and not visiting and schema_depth == 1:
             return self._schema_meta
         meta = SchemaMeta(type_name=self.desc.name)
+        if schema_depth + 1 > MAX_NESTING_DEPTH:
+            return meta
         next_visiting = visiting | {self.desc.type_name}
         for fp in self.fields:
             meta.fields[fp.field_num] = fp.proto_name
-            if fp.sub_plan is not None and fp.sub_plan.desc.type_name not in next_visiting:
-                meta.children[fp.field_num] = fp.sub_plan.get_schema_meta(next_visiting)
-        if not visiting:
+            if (
+                schema_depth + 3 <= MAX_NESTING_DEPTH
+                and fp.sub_plan is not None
+                and fp.sub_plan.desc.type_name not in next_visiting
+            ):
+                meta.children[fp.field_num] = fp.sub_plan.get_schema_meta(
+                    next_visiting, schema_depth + 2
+                )
+        if not visiting and schema_depth == 1:
             self._schema_meta = meta
         return meta
 
@@ -720,7 +757,9 @@ def _build_gpb_schema_meta(
     return meta
 
 
-def _encode_gpb_msg(dst: bytearray, msg: Any, deterministic: bool) -> None:
+def _encode_gpb_msg(dst: bytearray, msg: Any, deterministic: bool, depth: int = 0) -> None:
+    if depth > MAX_NESTING_DEPTH:
+        raise OmniBufEncodeError(f"omnibuf: nesting depth {depth} exceeds {MAX_NESTING_DEPTH}")
     desc: Any = msg.DESCRIPTOR
     _check_gpb_descriptor_supported(desc, for_encode=True)
     for list_fd, _ in msg.ListFields():
@@ -736,6 +775,10 @@ def _encode_gpb_msg(dst: bytearray, msg: Any, deterministic: bool) -> None:
         val = getattr(msg, fd.name)
 
         if _is_gpb_map_field(fd):
+            if depth + 1 > MAX_NESTING_DEPTH:
+                raise OmniBufEncodeError(
+                    f"omnibuf: map nesting depth {depth + 1} exceeds {MAX_NESTING_DEPTH}"
+                )
             assert fd.message_type is not None
             k_fd = fd.message_type.fields_by_name["key"]
             v_fd = fd.message_type.fields_by_name["value"]
@@ -758,12 +801,16 @@ def _encode_gpb_msg(dst: bytearray, msg: Any, deterministic: bool) -> None:
                 if is_v_msg:
                     v_pos = len(dst)
                     dst.extend(b"\x00\x00")
-                    _encode_gpb_msg(dst, val[k], deterministic)
+                    _encode_gpb_msg(dst, val[k], deterministic, depth + 2)
                     backpatch_container_len(dst, v_pos)
                 else:
                     _write_proto_scalar(dst, v_kind, val[k], fd.name)
             backpatch_container_len(dst, len_pos)
         elif _is_gpb_repeated(fd):
+            if depth + 1 > MAX_NESTING_DEPTH:
+                raise OmniBufEncodeError(
+                    f"omnibuf: array nesting depth {depth + 1} exceeds {MAX_NESTING_DEPTH}"
+                )
             is_msg = fd.type == _GPB_TYPE_MESSAGE
             e_kind, e_wt = ("submsg", WIRE_SUB_MSG) if is_msg else _GPB_SCALAR_SPEC[fd.type]
             dst.extend(encode_tag(fnum, WIRE_ARRAY))
@@ -775,18 +822,26 @@ def _encode_gpb_msg(dst: bytearray, msg: Any, deterministic: bool) -> None:
                 if is_msg:
                     e_pos = len(dst)
                     dst.extend(b"\x00\x00")
-                    _encode_gpb_msg(dst, item, deterministic)
+                    _encode_gpb_msg(dst, item, deterministic, depth + 2)
                     backpatch_container_len(dst, e_pos)
                 else:
                     _write_proto_scalar(dst, e_kind, item, fd.name)
             backpatch_container_len(dst, len_pos)
         elif fd.type == _GPB_TYPE_MESSAGE:
+            if depth + 1 > MAX_NESTING_DEPTH:
+                raise OmniBufEncodeError(
+                    f"omnibuf: nesting depth {depth + 1} exceeds {MAX_NESTING_DEPTH}"
+                )
             dst.extend(encode_tag(fnum, WIRE_SUB_MSG))
             len_pos = len(dst)
             dst.extend(b"\x00\x00")
-            _encode_gpb_msg(dst, val, deterministic)
+            _encode_gpb_msg(dst, val, deterministic, depth + 1)
             backpatch_container_len(dst, len_pos)
         elif fd.type == _GPB_TYPE_BOOL:
+            if not isinstance(val, bool):
+                raise OmniBufEncodeError(
+                    f"omnibuf: field {fd.name} expected bool, got {type(val).__name__}"
+                )
             dst.extend(encode_tag(fnum, WIRE_BOOL_TRUE if val else WIRE_BOOL_FALSE))
         else:
             s_kind, s_wt = _GPB_SCALAR_SPEC[fd.type]
@@ -794,9 +849,25 @@ def _encode_gpb_msg(dst: bytearray, msg: Any, deterministic: bool) -> None:
             _write_proto_scalar(dst, s_kind, val, fd.name)
 
 
-def _decode_gpb_msg(data: memoryview, dst: Any, depth: int, merge: bool) -> None:
+def _consume_budget(budget: list[int], count: int) -> None:
+    if count > budget[0]:
+        raise OmniBufDecodeError(
+            f"omnibuf: container element count exceeds max_elements budget ({budget[1]})"
+        )
+    budget[0] -= count
+
+
+def _decode_gpb_msg(
+    data: memoryview,
+    dst: Any,
+    depth: int,
+    merge: bool,
+    budget: list[int] | None = None,
+) -> None:
     if depth > MAX_NESTING_DEPTH:
         raise OmniBufDecodeError(f"omnibuf: nesting depth {depth} exceeds {MAX_NESTING_DEPTH}")
+    if budget is None:
+        budget = [DEFAULT_MAX_ELEMENTS, DEFAULT_MAX_ELEMENTS]
     desc = dst.DESCRIPTOR
     _check_gpb_descriptor_supported(desc, for_encode=False)
     if not merge:
@@ -846,6 +917,7 @@ def _decode_gpb_msg(data: memoryview, dst: Any, depth: int, merge: bool) -> None
             key_wt, val_wt, count, p, ok = parse_map_header(map_mv)
             if not ok or key_wt != exp_k_wt or val_wt != exp_v_wt:
                 raise OmniBufDecodeError(f"omnibuf: invalid map header on field {fd.name}")
+            _consume_budget(budget, count)
             mp = getattr(dst, fd.name)
             if not already_seen and len(mp) > 0:
                 mp.clear()
@@ -855,7 +927,7 @@ def _decode_gpb_msg(data: memoryview, dst: Any, depth: int, merge: bool) -> None
                 if is_v_msg:
                     v_mv, p = read_len_slice(map_mv, p, 0, map_end)
                     sub_entry = mp[k_val]
-                    _decode_gpb_msg(v_mv, sub_entry, depth + 2, False)
+                    _decode_gpb_msg(v_mv, sub_entry, depth + 2, False, budget)
                 else:
                     v_val, p = _read_proto_scalar(map_mv, p, map_end, v_kind)
                     mp[k_val] = v_val
@@ -875,6 +947,7 @@ def _decode_gpb_msg(data: memoryview, dst: Any, depth: int, merge: bool) -> None
             elem_wt, count, p, ok = parse_array_header(arr_mv)
             if not ok or elem_wt != exp_e_wt:
                 raise OmniBufDecodeError(f"omnibuf: invalid array header on field {fd.name}")
+            _consume_budget(budget, count)
             rep = getattr(dst, fd.name)
             if not already_seen and len(rep) > 0:
                 del rep[:]
@@ -883,7 +956,7 @@ def _decode_gpb_msg(data: memoryview, dst: Any, depth: int, merge: bool) -> None
                 if is_msg:
                     e_mv, p = read_len_slice(arr_mv, p, 0, arr_end)
                     elem_msg = rep.add()
-                    _decode_gpb_msg(e_mv, elem_msg, depth + 2, False)
+                    _decode_gpb_msg(e_mv, elem_msg, depth + 2, False, budget)
                 else:
                     item, p = _read_proto_scalar(arr_mv, p, arr_end, e_kind)
                     rep.append(item)
@@ -896,7 +969,7 @@ def _decode_gpb_msg(data: memoryview, dst: Any, depth: int, merge: bool) -> None
             sub_mv, pos = read_len_slice(data, pos, 0, n)
             sub_msg = getattr(dst, fd.name)
             sub_msg.SetInParent()
-            _decode_gpb_msg(sub_mv, sub_msg, depth + 1, already_seen)
+            _decode_gpb_msg(sub_mv, sub_msg, depth + 1, already_seen, budget)
         elif fd.type == _GPB_TYPE_BOOL:
             if wt not in (WIRE_BOOL_FALSE, WIRE_BOOL_TRUE):
                 pos = validate_value(data, pos, wt, depth, MAX_NESTING_DEPTH, n)
@@ -964,54 +1037,72 @@ def marshal_proto(
 
 
 @overload
-def unmarshal_proto[M: pbpy.Message[Any]](packet: Buffer, target: type[M]) -> M: ...
+def unmarshal_proto[M: pbpy.Message[Any]](
+    packet: Buffer, target: type[M], *, max_elements: int | None = None
+) -> M: ...
 
 
 @overload
-def unmarshal_proto[M: pbpy.Message[Any]](packet: Buffer, target: M) -> M: ...
+def unmarshal_proto[M: pbpy.Message[Any]](
+    packet: Buffer, target: M, *, max_elements: int | None = None
+) -> M: ...
 
 
 @overload
-def unmarshal_proto(packet: Buffer, target: pbpy.DescMessage) -> pbpy.Message[Any]: ...
+def unmarshal_proto(
+    packet: Buffer, target: pbpy.DescMessage, *, max_elements: int | None = None
+) -> pbpy.Message[Any]: ...
 
 
 @overload
-def unmarshal_proto[G: GpbMessage](packet: Buffer, target: type[G]) -> G: ...
+def unmarshal_proto[G: GpbMessage](
+    packet: Buffer, target: type[G], *, max_elements: int | None = None
+) -> G: ...
 
 
 @overload
-def unmarshal_proto[G: GpbMessage](packet: Buffer, target: G) -> G: ...
+def unmarshal_proto[G: GpbMessage](
+    packet: Buffer, target: G, *, max_elements: int | None = None
+) -> G: ...
 
 
-def unmarshal_proto(packet: Buffer, target: Any) -> Any:
+def unmarshal_proto(
+    packet: Buffer,
+    target: Any,
+    *,
+    max_elements: int | None = None,
+) -> Any:
     """Decodes OmniBuf wire bytes into a protobuf-py Message/DescMessage or google.protobuf Message."""
+    eff_limit = DEFAULT_MAX_ELEMENTS if max_elements is None else max_elements
+    if isinstance(eff_limit, bool) or not isinstance(eff_limit, int) or eff_limit < 0:
+        raise OmniBufDecodeError(f"omnibuf: invalid max_elements {eff_limit!r}")
     if isinstance(target, type):
         rc = _PBPY_RUST_BY_CLS.get(target)
         if rc is not None:
-            return rc.unmarshal(packet)
+            return rc.unmarshal(packet, max_elements=max_elements)
         if issubclass(target, pbpy.Message):
             plan = _get_pbpy_plan(target.desc())
-            return plan.rust_codec.unmarshal(packet)
+            return plan.rust_codec.unmarshal(packet, max_elements=max_elements)
         gpb_cls = _get_gpb_message_cls()
         if gpb_cls is not None and issubclass(target, gpb_cls):
             g_inst = target()
             mv = memoryview(bytes(packet)) if not isinstance(packet, bytes) else memoryview(packet)
-            _decode_gpb_msg(mv, g_inst, 0, False)
+            _decode_gpb_msg(mv, g_inst, 0, False, [eff_limit, eff_limit])
             return g_inst
     else:
         rc = _PBPY_RUST_BY_CLS.get(type(target))
         if rc is not None:
-            return rc.unmarshal(packet, target)
+            return rc.unmarshal(packet, target, max_elements=max_elements)
         if isinstance(target, pbpy.DescMessage):
             plan = _get_pbpy_plan(target)
-            return plan.rust_codec.unmarshal(packet)
+            return plan.rust_codec.unmarshal(packet, max_elements=max_elements)
         if isinstance(target, pbpy.Message):
             plan = _get_pbpy_plan(target.desc())
-            return plan.rust_codec.unmarshal(packet, target)
+            return plan.rust_codec.unmarshal(packet, target, max_elements=max_elements)
         gpb_cls = _get_gpb_message_cls()
         if gpb_cls is not None and isinstance(target, gpb_cls):
             mv = memoryview(bytes(packet)) if not isinstance(packet, bytes) else memoryview(packet)
-            _decode_gpb_msg(mv, target, 0, False)
+            _decode_gpb_msg(mv, target, 0, False, [eff_limit, eff_limit])
             return target
     raise OmniBufDecodeError(
         f"omnibuf: unmarshal_proto expected protobuf.Message or google.protobuf.Message, got {target!r}"

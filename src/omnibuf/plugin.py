@@ -22,6 +22,7 @@ except ImportError as exc:
 from .field0 import SchemaMeta, encode_field0_schema_meta
 from .wire import (
     MAX_FIELD_NUMBER,
+    MAX_NESTING_DEPTH,
     WIRE_ARRAY,
     WIRE_BOOL_FALSE,
     WIRE_BOOL_TRUE,
@@ -45,10 +46,46 @@ def _to_snake_case(name: str) -> str:
     return re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s1).lower()
 
 
+_RESERVED_MSG_ATTRS: frozenset[str] = frozenset(
+    {
+        "None",
+        "True",
+        "False",
+        "self",
+        "cls",
+        "marshal_omnibuf",
+        "unmarshal_omnibuf",
+        "__omnibuf_codec__",
+    }
+)
+
+
 def _safe_ident(name: str) -> str:
     if keyword.iskeyword(name) or name in {"None", "True", "False", "self", "cls"}:
         return f"{name}_"
     return name
+
+
+def _sanitize_module_ident(part: str) -> str:
+    cleaned = re.sub(r"[^0-9A-Za-z_]", "_", part)
+    if not cleaned or cleaned[0].isdigit():
+        cleaned = f"_{cleaned}"
+    if keyword.iskeyword(cleaned):
+        cleaned = f"{cleaned}_"
+    return cleaned
+
+
+def _unique_field_attr(raw_name: str, used: set[str], field_num: int) -> str:
+    cand = _safe_ident(raw_name)
+    if cand in _RESERVED_MSG_ATTRS:
+        cand = f"{cand}_"
+    if cand in used:
+        base = cand
+        cand = f"{base}_{field_num}"
+        while cand in used:
+            cand = f"{cand}_"
+    used.add(cand)
+    return cand
 
 
 _PROTO_SCALAR_INFO: dict[int, tuple[str, int, str, str]] = {
@@ -232,10 +269,12 @@ def _module_import_for_proto(
     target_proto: str,
     suffix: str,
 ) -> tuple[str, str]:
-    cur_parts = re.sub(r"\.proto$", "", current_proto).split("/")[:-1]
+    cur_parts = [
+        _sanitize_module_ident(p) for p in re.sub(r"\.proto$", "", current_proto).split("/")[:-1]
+    ]
     tgt_clean = re.sub(r"\.proto$", "", target_proto).split("/")
-    stem = f"{tgt_clean[-1]}{suffix}"
-    tgt_parts = tgt_clean[:-1]
+    stem = _sanitize_module_ident(f"{tgt_clean[-1]}{suffix}")
+    tgt_parts = [_sanitize_module_ident(p) for p in tgt_clean[:-1]]
     if not cur_parts:
         return (f".{'.'.join(tgt_parts)}" if tgt_parts else "."), stem
     common = 0
@@ -255,15 +294,24 @@ def _build_schema_meta(
     msg_spec: _MsgSpec,
     reg: _Registry,
     visiting: frozenset[str] = frozenset(),
+    schema_depth: int = 1,
 ) -> SchemaMeta:
     meta = SchemaMeta(type_name=msg_spec.short_name)
+    if schema_depth + 1 > MAX_NESTING_DEPTH:
+        return meta
     next_visiting = visiting | {msg_spec.full_name}
     for rf in msg_spec.fields:
         meta.fields[rf.number] = rf.proto_name
-        if rf.sub_msg_full and rf.sub_msg_full not in next_visiting:
+        if (
+            schema_depth + 3 <= MAX_NESTING_DEPTH
+            and rf.sub_msg_full
+            and rf.sub_msg_full not in next_visiting
+        ):
             child_spec = reg.messages.get(rf.sub_msg_full)
             if child_spec is not None:
-                meta.children[rf.number] = _build_schema_meta(child_spec, reg, next_visiting)
+                meta.children[rf.number] = _build_schema_meta(
+                    child_spec, reg, next_visiting, schema_depth + 2
+                )
     return meta
 
 
@@ -461,6 +509,18 @@ def _emit_opaque_methods(
                 f"    def get_{attr}(self) -> {opt_tp}:",
                 f"        return self._get_opt_{s_kind}({opt_args})",
                 "",
+            ]
+        )
+        if s_kind == "bytes":
+            lines.extend(
+                [
+                    f"    def get_{attr}_view(self) -> memoryview | None:",
+                    f"        return self._get_opt_bytes_view({opt_args})",
+                    "",
+                ]
+            )
+        lines.extend(
+            [
                 f"    def set_{attr}(self, val: {opt_tp}) -> None:",
                 f"        {set_call}",
                 "",
@@ -473,6 +533,18 @@ def _emit_opaque_methods(
             f"    def get_{attr}(self) -> {s_py}:",
             f"        return self._get_{s_kind}({num})",
             "",
+        ]
+    )
+    if s_kind == "bytes":
+        lines.extend(
+            [
+                f"    def get_{attr}_view(self) -> memoryview:",
+                f"        return self._get_bytes_view({num})",
+                "",
+            ]
+        )
+    lines.extend(
+        [
             f"    def set_{attr}(self, val: {s_py}) -> None:",
             f"        self._set_{s_kind}({num}, val)",
             "",
@@ -524,6 +596,9 @@ def _generate_file(
             raise ValueError(f"omnibuf: Proto2 extensions are not supported on {m_spec.full_name}")
         resolved: list[_ResolvedField] = []
         oneof_map: dict[int, _OneofGroup] = {}
+        used_attrs: set[str] = set(_RESERVED_MSG_ATTRS)
+        for od in mdp.oneof_decl:
+            used_attrs.add(f"which_{_safe_ident(_to_snake_case(od.name))}")
 
         for fd in mdp.field:
             if fd.type == FieldDescriptorProto.TYPE_GROUP:
@@ -534,7 +609,7 @@ def _generate_file(
             if num < 1 or num > MAX_FIELD_NUMBER or (19000 <= num <= 19999):
                 raise ValueError(f"omnibuf: invalid field number {num} on {m_spec.full_name}")
             rep = fd.label == FieldDescriptorProto.LABEL_REPEATED
-            attr = _safe_ident(fd.name)
+            attr = _unique_field_attr(fd.name, used_attrs, num)
             map_entry = (
                 reg.map_entries.get(fd.type_name)
                 if fd.type == FieldDescriptorProto.TYPE_MESSAGE
@@ -615,11 +690,14 @@ def _generate_file(
         "",
         "from __future__ import annotations",
         "",
-        "from dataclasses import dataclass, field",
-        "from typing import ClassVar",
+        "from dataclasses import dataclass as _omnibuf_dataclass, field as _omnibuf_field",
+        "from typing import TYPE_CHECKING as _omnibuf_TYPE_CHECKING, ClassVar as _omnibuf_ClassVar",
         "",
-        "from omnibuf._omnibuf_ext import CompiledCodec, OpaqueView",
-        "from omnibuf.wire import Buffer",
+        "from omnibuf._omnibuf_ext import (",
+        "    CompiledCodec as _omnibuf_CompiledCodec,",
+        "    OpaqueView as _omnibuf_OpaqueView,",
+        ")",
+        "from omnibuf.wire import Buffer as _omnibuf_Buffer",
     ]
 
     for imp_file, alias in imported_files.items():
@@ -646,9 +724,12 @@ def _generate_file(
         lines.append(f"_FIELD0_{upper_msg}: bytes = {field0_bytes!r}")
         lines.append("")
 
-        lines.append("@dataclass(slots=True)")
+        lines.append("@_omnibuf_dataclass(slots=True)")
         lines.append(f"class {m_spec.py_name}:")
-        lines.append(f"    __omnibuf_codec__: ClassVar[CompiledCodec[{m_spec.py_name}]]")
+        lines.append("    if _omnibuf_TYPE_CHECKING:")
+        lines.append(
+            f"        __omnibuf_codec__: _omnibuf_ClassVar[_omnibuf_CompiledCodec[{m_spec.py_name}]]"
+        )
         for rf in m_spec.fields:
             if rf.is_map:
                 _, _, k_py, _ = _PROTO_SCALAR_INFO[rf.map_key_type]
@@ -657,14 +738,16 @@ def _generate_file(
                 else:
                     _, _, v_py, _ = _PROTO_SCALAR_INFO[rf.map_val_type]
                 lines.append(
-                    f"    {rf.attr_name}: dict[{k_py}, {v_py}] = field(default_factory=dict)"
+                    f"    {rf.attr_name}: dict[{k_py}, {v_py}] = _omnibuf_field(default_factory=dict)"
                 )
             elif rf.repeated:
                 if rf.proto_type == FieldDescriptorProto.TYPE_MESSAGE:
                     e_py = rf.sub_msg_py
                 else:
                     _, _, e_py, _ = _PROTO_SCALAR_INFO[rf.proto_type]
-                lines.append(f"    {rf.attr_name}: list[{e_py}] = field(default_factory=list)")
+                lines.append(
+                    f"    {rf.attr_name}: list[{e_py}] = _omnibuf_field(default_factory=list)"
+                )
             elif rf.proto_type == FieldDescriptorProto.TYPE_MESSAGE:
                 lines.append(f"    {rf.attr_name}: {rf.sub_msg_py} | None = None")
             else:
@@ -694,16 +777,23 @@ def _generate_file(
                 f"        return {codec_var}.marshal(self, deterministic=deterministic, self_describing=self_describing)",
                 "",
                 "    @classmethod",
-                f"    def unmarshal_omnibuf(cls, data: Buffer, out: {m_spec.py_name} | None = None) -> {m_spec.py_name}:",
-                f"        return {codec_var}.unmarshal(data, out)",
+                "    def unmarshal_omnibuf(",
+                "        cls,",
+                "        data: _omnibuf_Buffer,",
+                f"        out: {m_spec.py_name} | None = None,",
+                "        *,",
+                "        max_elements: int | None = None,",
+                "        zero_copy_bytes: bool = False,",
+                f"    ) -> {m_spec.py_name}:",
+                f"        return {codec_var}.unmarshal(data, out, max_elements=max_elements, zero_copy_bytes=zero_copy_bytes)",
                 "",
-                f"{codec_var}: CompiledCodec[{m_spec.py_name}] = CompiledCodec({m_spec.py_name}, {m_spec.short_name!r})",
+                f"{codec_var}: _omnibuf_CompiledCodec[{m_spec.py_name}] = _omnibuf_CompiledCodec({m_spec.py_name}, {m_spec.short_name!r})",
                 f"{m_spec.py_name}.__omnibuf_codec__ = {codec_var}",
                 f"marshal_{snake_msg} = {codec_var}.marshal",
                 f"unmarshal_{snake_msg} = {codec_var}.unmarshal",
                 f"_decode_{snake_msg} = {codec_var}.decode_at",
                 "",
-                f"class Opaque{m_spec.py_name}(OpaqueView):",
+                f"class Opaque{m_spec.py_name}(_omnibuf_OpaqueView):",
                 "    __slots__ = ()",
                 "",
             ]
@@ -729,10 +819,26 @@ def _generate_file(
                 "    def marshal(",
                 "        self,",
                 "        *,",
-                "        dst_prefix: Buffer | None = None,",
+                "        dst_prefix: _omnibuf_Buffer | None = None,",
                 "        self_describing: bool = False,",
                 "    ) -> bytes:",
                 f"        return self._marshal_with_codec({codec_var}, dst_prefix=dst_prefix, self_describing=self_describing)",
+                "",
+                "    def marshal_validated(",
+                "        self,",
+                "        *,",
+                "        dst_prefix: _omnibuf_Buffer | None = None,",
+                "        self_describing: bool = False,",
+                "    ) -> bytes:",
+                f"        return self._marshal_with_codec({codec_var}, dst_prefix=dst_prefix, self_describing=self_describing, validate_all=True)",
+                "",
+                "    def try_marshal(",
+                "        self,",
+                "        *,",
+                "        dst_prefix: _omnibuf_Buffer | None = None,",
+                "        self_describing: bool = False,",
+                "    ) -> bytes:",
+                "        return self.marshal_validated(dst_prefix=dst_prefix, self_describing=self_describing)",
                 "",
             ]
         )
@@ -753,7 +859,10 @@ def _generate_file(
             lines.append(")")
         lines.append("")
 
-    out_path = re.sub(r"\.proto$", f"{suffix}.py", fdp.name)
+    raw_parts = re.sub(r"\.proto$", "", fdp.name).split("/")
+    out_dirs = [_sanitize_module_ident(p) for p in raw_parts[:-1]]
+    out_stem = _sanitize_module_ident(f"{raw_parts[-1]}{suffix}")
+    out_path = "/".join([*out_dirs, f"{out_stem}.py"])
     return out_path, "\n".join(lines)
 
 

@@ -1,12 +1,11 @@
-use omnibuf_core::field0::{read_field0_schema_meta, validate_field0};
+use std::sync::OnceLock;
+
 use omnibuf_core::wire::{
     Encoder, MAX_FIELD_NUMBER, WIRE_ARRAY, WIRE_BOOL_FALSE, WIRE_BOOL_TRUE, WIRE_BYTES,
     WIRE_EXTENDED, WIRE_FIXED32, WIRE_FIXED64, WIRE_FLOAT32, WIRE_FLOAT64, WIRE_MAP, WIRE_SFIXED32,
     WIRE_SFIXED64, WIRE_SINT, WIRE_STRING, WIRE_SUB_MSG, WIRE_UINT, append_tag, append_varint,
     decode_varint, decode_zigzag, encode_zigzag, fast_skip_value, parse_array_header,
-    parse_map_header, read_bool, read_bytes, read_fixed32, read_fixed64, read_float32,
-    read_float64, read_len_slice, read_sfixed32, read_sfixed64, read_sint, read_str, read_sub_msg,
-    read_tag_at, read_uint, skip_value, validate_utf8,
+    parse_map_header, read_len_slice, read_tag_at, skip_value, validate_utf8,
 };
 use pyo3::ffi;
 use pyo3::prelude::*;
@@ -16,58 +15,18 @@ use crate::codec::{
     CompiledCodec, ScalarKind, extract_bool, extract_f64, extract_i64, extract_u64,
     read_scalar_payload,
 };
-use crate::{LeafBytes, decode_err, encode_err, validate_message_slice, validate_unknown_value};
+use crate::{
+    ByteSliceOwner, DecodeBudget, LeafBytes, create_readonly_memoryview_slice, decode_err,
+    encode_err, read_field0_checked, validate_field0_slice, validate_message_slice,
+};
 
-enum RawBacking {
-    PyBytes {
-        owner: Py<PyBytes>,
-        start: usize,
-        end: usize,
-    },
-    Owned(Vec<u8>),
-}
-
-impl RawBacking {
-    #[inline]
-    fn from_py_any(py: Python<'_>, raw: &Bound<'_, PyAny>) -> PyResult<Self> {
-        unsafe {
-            if ffi::PyBytes_CheckExact(raw.as_ptr()) != 0 {
-                let len = ffi::PyBytes_Size(raw.as_ptr()) as usize;
-                let pb = raw.cast_unchecked::<PyBytes>().clone().unbind();
-                return Ok(Self::PyBytes {
-                    owner: pb,
-                    start: 0,
-                    end: len,
-                });
-            }
-        }
-        let borrowed = LeafBytes::extract(py, raw)?;
-        let vec = borrowed.as_slice().to_vec();
-        drop(borrowed);
-        Ok(Self::Owned(vec))
-    }
-
-    #[inline]
-    fn as_slice<'a>(&'a self, py: Python<'a>) -> &'a [u8] {
-        match self {
-            Self::PyBytes { owner, start, end } => &owner.as_bytes(py)[*start..*end],
-            Self::Owned(vec) => vec.as_slice(),
-        }
-    }
-
-    fn to_py_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        match self {
-            Self::PyBytes { owner, start, end } => {
-                let full = owner.bind(py);
-                if *start == 0 && *end == full.as_bytes().len() {
-                    full.clone()
-                } else {
-                    PyBytes::new(py, &full.as_bytes()[*start..*end])
-                }
-            }
-            Self::Owned(vec) => PyBytes::new(py, vec),
-        }
-    }
+#[derive(Clone, Copy)]
+struct FieldDirEntry {
+    fnum: u32,
+    wt: u8,
+    f_start: usize,
+    val_start: usize,
+    f_end: usize,
 }
 
 enum FastDirty {
@@ -218,7 +177,7 @@ fn skip_checked_wire_field(
                 format!("omnibuf: Field #0 requires WireSubMsg (12), got {wt}"),
             ));
         }
-        return validate_field0(packet, pos, 0).map_err(|e| decode_err(py, e.to_string()));
+        return validate_field0_slice(packet, pos, 0).map_err(|m| decode_err(py, m));
     }
     match wt {
         WIRE_ARRAY | WIRE_MAP | WIRE_EXTENDED => {
@@ -233,37 +192,29 @@ fn skip_checked_wire_field(
     }
 }
 
-/// Scans `packet` for the last matching occurrence of `target_field` (clearing if any `siblings`
-/// member appears afterward on the wire), raising `OmniBufDecodeError` on corrupt wire framing.
+/// Scans cached top-level directory entries for the last matching occurrence of `target_field`
+/// (clearing if any `siblings` member appears afterward on the wire).
 #[inline]
-fn locate_field_checked<'a>(
-    py: Python<'_>,
-    packet: &'a [u8],
+fn locate_in_dir(
+    entries: &[FieldDirEntry],
     target_field: u32,
     exp_mask: u16,
     siblings: &[(u32, u16)],
-) -> PyResult<Option<(&'a [u8], u8)>> {
-    let mut pos = 0usize;
-    let n = packet.len();
-    let mut found: Option<(&'a [u8], u8)> = None;
+) -> Option<(usize, u8)> {
+    let mut found: Option<(usize, u8)> = None;
     let has_sibs = !siblings.is_empty();
-
-    while pos < n {
-        let (fnum, wt, next_pos) = read_tag_at(packet, pos)
-            .ok_or_else(|| decode_err(py, format!("omnibuf: invalid tag at byte {pos}")))?;
-        pos = next_pos;
-        if fnum == target_field && (exp_mask & (1u16 << wt)) != 0 {
-            found = Some((&packet[pos..], wt));
+    for entry in entries {
+        if entry.fnum == target_field && (exp_mask & (1u16 << entry.wt)) != 0 {
+            found = Some((entry.val_start, entry.wt));
         } else if has_sibs
             && siblings
                 .iter()
-                .any(|&(sf, sm)| sf == fnum && (sm & (1u16 << wt)) != 0)
+                .any(|&(sf, sm)| sf == entry.fnum && (sm & (1u16 << entry.wt)) != 0)
         {
             found = None;
         }
-        pos = skip_checked_wire_field(py, packet, pos, fnum, wt)?;
     }
-    Ok(found)
+    found
 }
 
 #[inline]
@@ -274,8 +225,12 @@ fn locate_field_u32(packet: &[u8], target_field: u32, exp_mask: u16) -> Option<(
     while pos < n {
         let (fnum, wt, next_pos) = read_tag_at(packet, pos)?;
         pos = next_pos;
-        if fnum == 0 && wt != WIRE_SUB_MSG {
-            return None;
+        if fnum == 0 {
+            if wt != WIRE_SUB_MSG {
+                return None;
+            }
+            pos = validate_field0_slice(packet, pos, 0).ok()?;
+            continue;
         }
         if fnum == target_field && (exp_mask & (1u16 << wt)) != 0 {
             found = Some((&packet[pos..], wt));
@@ -302,8 +257,15 @@ fn next_container_u32(
             return (None, false);
         };
         pos = after_tag;
-        if fnum == 0 && wt != WIRE_SUB_MSG {
-            return (None, false);
+        if fnum == 0 {
+            if wt != WIRE_SUB_MSG {
+                return (None, false);
+            }
+            let Ok(end_f0) = validate_field0_slice(packet, pos, 0) else {
+                return (None, false);
+            };
+            pos = end_f0;
+            continue;
         }
         if fnum == target_field && wt == exp_wt {
             let Ok((body, end)) = read_len_slice(packet, pos, min_len) else {
@@ -326,84 +288,61 @@ fn next_container_u32(
 }
 
 #[inline]
-fn next_container_checked(
-    py: Python<'_>,
-    packet: &[u8],
-    mut pos: usize,
-    target_field: u32,
-    exp_wt: u8,
-    min_len: usize,
-) -> PyResult<Option<(usize, usize, usize)>> {
-    let n = packet.len();
-    while pos < n {
-        let (fnum, wt, after_tag) = read_tag_at(packet, pos)
-            .ok_or_else(|| decode_err(py, format!("omnibuf: invalid tag at byte {pos}")))?;
-        pos = after_tag;
-        if fnum == target_field && wt == exp_wt {
-            let (body, end) =
-                read_len_slice(packet, pos, min_len).map_err(|e| decode_err(py, e.to_string()))?;
-            let start = end - body.len();
-            return Ok(Some((start, end, end)));
-        }
-        pos = skip_checked_wire_field(py, packet, pos, fnum, wt)?;
-    }
-    Ok(None)
-}
-
-#[inline]
 fn checked_read_uint(
     py: Python<'_>,
+    entries: &[FieldDirEntry],
     slice: &[u8],
     fnum: u32,
     siblings: &[(u32, u16)],
 ) -> PyResult<Option<u64>> {
-    let Some((s, _)) = locate_field_checked(py, slice, fnum, 1 << WIRE_UINT, siblings)? else {
+    let Some((val_start, _)) = locate_in_dir(entries, fnum, 1 << WIRE_UINT, siblings) else {
         return Ok(None);
     };
-    let (v, _) = decode_varint(s).ok_or_else(|| decode_err(py, "omnibuf: invalid uint varint"))?;
+    let (v, _) = decode_varint(&slice[val_start..])
+        .ok_or_else(|| decode_err(py, "omnibuf: invalid uint varint"))?;
     Ok(Some(v))
 }
 
 #[inline]
 fn checked_read_sint(
     py: Python<'_>,
+    entries: &[FieldDirEntry],
     slice: &[u8],
     fnum: u32,
     siblings: &[(u32, u16)],
 ) -> PyResult<Option<i64>> {
-    let Some((s, _)) = locate_field_checked(py, slice, fnum, 1 << WIRE_SINT, siblings)? else {
+    let Some((val_start, _)) = locate_in_dir(entries, fnum, 1 << WIRE_SINT, siblings) else {
         return Ok(None);
     };
-    let (v, _) = decode_varint(s).ok_or_else(|| decode_err(py, "omnibuf: invalid sint varint"))?;
+    let (v, _) = decode_varint(&slice[val_start..])
+        .ok_or_else(|| decode_err(py, "omnibuf: invalid sint varint"))?;
     Ok(Some(decode_zigzag(v)))
 }
 
 #[inline]
 fn checked_read_bool(
-    py: Python<'_>,
-    slice: &[u8],
+    entries: &[FieldDirEntry],
     fnum: u32,
     siblings: &[(u32, u16)],
-) -> PyResult<Option<bool>> {
+) -> Option<bool> {
     let mask = (1u16 << WIRE_BOOL_FALSE) | (1u16 << WIRE_BOOL_TRUE);
-    let Some((_, wt)) = locate_field_checked(py, slice, fnum, mask, siblings)? else {
-        return Ok(None);
-    };
-    Ok(Some(wt == WIRE_BOOL_TRUE))
+    let (_, wt) = locate_in_dir(entries, fnum, mask, siblings)?;
+    Some(wt == WIRE_BOOL_TRUE)
 }
 
 #[inline]
 fn checked_read_fixed32(
     py: Python<'_>,
+    entries: &[FieldDirEntry],
     slice: &[u8],
     fnum: u32,
     siblings: &[(u32, u16)],
 ) -> PyResult<Option<u32>> {
-    let Some((s, _)) = locate_field_checked(py, slice, fnum, 1 << WIRE_FIXED32, siblings)? else {
+    let Some((val_start, _)) = locate_in_dir(entries, fnum, 1 << WIRE_FIXED32, siblings) else {
         return Ok(None);
     };
-    let raw: [u8; 4] = s
-        .get(..4)
+    let raw: [u8; 4] = slice
+        .get(val_start..val_start + 4)
         .ok_or_else(|| decode_err(py, "omnibuf: truncated fixed32"))?
         .try_into()
         .unwrap();
@@ -413,15 +352,16 @@ fn checked_read_fixed32(
 #[inline]
 fn checked_read_sfixed32(
     py: Python<'_>,
+    entries: &[FieldDirEntry],
     slice: &[u8],
     fnum: u32,
     siblings: &[(u32, u16)],
 ) -> PyResult<Option<i32>> {
-    let Some((s, _)) = locate_field_checked(py, slice, fnum, 1 << WIRE_SFIXED32, siblings)? else {
+    let Some((val_start, _)) = locate_in_dir(entries, fnum, 1 << WIRE_SFIXED32, siblings) else {
         return Ok(None);
     };
-    let raw: [u8; 4] = s
-        .get(..4)
+    let raw: [u8; 4] = slice
+        .get(val_start..val_start + 4)
         .ok_or_else(|| decode_err(py, "omnibuf: truncated sfixed32"))?
         .try_into()
         .unwrap();
@@ -431,15 +371,16 @@ fn checked_read_sfixed32(
 #[inline]
 fn checked_read_fixed64(
     py: Python<'_>,
+    entries: &[FieldDirEntry],
     slice: &[u8],
     fnum: u32,
     siblings: &[(u32, u16)],
 ) -> PyResult<Option<u64>> {
-    let Some((s, _)) = locate_field_checked(py, slice, fnum, 1 << WIRE_FIXED64, siblings)? else {
+    let Some((val_start, _)) = locate_in_dir(entries, fnum, 1 << WIRE_FIXED64, siblings) else {
         return Ok(None);
     };
-    let raw: [u8; 8] = s
-        .get(..8)
+    let raw: [u8; 8] = slice
+        .get(val_start..val_start + 8)
         .ok_or_else(|| decode_err(py, "omnibuf: truncated fixed64"))?
         .try_into()
         .unwrap();
@@ -449,15 +390,16 @@ fn checked_read_fixed64(
 #[inline]
 fn checked_read_sfixed64(
     py: Python<'_>,
+    entries: &[FieldDirEntry],
     slice: &[u8],
     fnum: u32,
     siblings: &[(u32, u16)],
 ) -> PyResult<Option<i64>> {
-    let Some((s, _)) = locate_field_checked(py, slice, fnum, 1 << WIRE_SFIXED64, siblings)? else {
+    let Some((val_start, _)) = locate_in_dir(entries, fnum, 1 << WIRE_SFIXED64, siblings) else {
         return Ok(None);
     };
-    let raw: [u8; 8] = s
-        .get(..8)
+    let raw: [u8; 8] = slice
+        .get(val_start..val_start + 8)
         .ok_or_else(|| decode_err(py, "omnibuf: truncated sfixed64"))?
         .try_into()
         .unwrap();
@@ -467,15 +409,16 @@ fn checked_read_sfixed64(
 #[inline]
 fn checked_read_float32(
     py: Python<'_>,
+    entries: &[FieldDirEntry],
     slice: &[u8],
     fnum: u32,
     siblings: &[(u32, u16)],
 ) -> PyResult<Option<f32>> {
-    let Some((s, _)) = locate_field_checked(py, slice, fnum, 1 << WIRE_FLOAT32, siblings)? else {
+    let Some((val_start, _)) = locate_in_dir(entries, fnum, 1 << WIRE_FLOAT32, siblings) else {
         return Ok(None);
     };
-    let raw: [u8; 4] = s
-        .get(..4)
+    let raw: [u8; 4] = slice
+        .get(val_start..val_start + 4)
         .ok_or_else(|| decode_err(py, "omnibuf: truncated float32"))?
         .try_into()
         .unwrap();
@@ -485,15 +428,16 @@ fn checked_read_float32(
 #[inline]
 fn checked_read_float64(
     py: Python<'_>,
+    entries: &[FieldDirEntry],
     slice: &[u8],
     fnum: u32,
     siblings: &[(u32, u16)],
 ) -> PyResult<Option<f64>> {
-    let Some((s, _)) = locate_field_checked(py, slice, fnum, 1 << WIRE_FLOAT64, siblings)? else {
+    let Some((val_start, _)) = locate_in_dir(entries, fnum, 1 << WIRE_FLOAT64, siblings) else {
         return Ok(None);
     };
-    let raw: [u8; 8] = s
-        .get(..8)
+    let raw: [u8; 8] = slice
+        .get(val_start..val_start + 8)
         .ok_or_else(|| decode_err(py, "omnibuf: truncated float64"))?
         .try_into()
         .unwrap();
@@ -503,158 +447,150 @@ fn checked_read_float64(
 #[inline]
 fn checked_read_str<'a>(
     py: Python<'_>,
+    entries: &[FieldDirEntry],
     slice: &'a [u8],
     fnum: u32,
     siblings: &[(u32, u16)],
 ) -> PyResult<Option<&'a str>> {
-    let Some((s, _)) = locate_field_checked(py, slice, fnum, 1 << WIRE_STRING, siblings)? else {
+    let Some((val_start, _)) = locate_in_dir(entries, fnum, 1 << WIRE_STRING, siblings) else {
         return Ok(None);
     };
-    let (bytes, _) = read_len_slice(s, 0, 0).map_err(|e| decode_err(py, e.to_string()))?;
+    let (bytes, _) =
+        read_len_slice(slice, val_start, 0).map_err(|e| decode_err(py, e.to_string()))?;
     let valid_str = validate_utf8(bytes).map_err(|e| decode_err(py, e.to_string()))?;
     Ok(Some(valid_str))
 }
 
 #[inline]
-fn checked_read_bytes<'a>(
+fn checked_read_bytes_span(
     py: Python<'_>,
-    slice: &'a [u8],
+    entries: &[FieldDirEntry],
+    slice: &[u8],
     fnum: u32,
     siblings: &[(u32, u16)],
-) -> PyResult<Option<&'a [u8]>> {
-    let Some((s, _)) = locate_field_checked(py, slice, fnum, 1 << WIRE_BYTES, siblings)? else {
+) -> PyResult<Option<(usize, usize)>> {
+    let Some((val_start, _)) = locate_in_dir(entries, fnum, 1 << WIRE_BYTES, siblings) else {
         return Ok(None);
     };
-    let (bytes, _) = read_len_slice(s, 0, 0).map_err(|e| decode_err(py, e.to_string()))?;
-    Ok(Some(bytes))
+    let (bytes, end) =
+        read_len_slice(slice, val_start, 0).map_err(|e| decode_err(py, e.to_string()))?;
+    Ok(Some((end - bytes.len(), end)))
 }
 
 #[inline]
 fn slice_read_uint(slice: &[u8], fnum: u32) -> Option<u64> {
-    if let Ok(f16) = u16::try_from(fnum) {
-        read_uint(slice, f16)
-    } else {
-        let (s, _) = locate_field_u32(slice, fnum, 1 << WIRE_UINT)?;
-        decode_varint(s).map(|(v, _)| v)
-    }
+    let (s, _) = locate_field_u32(slice, fnum, 1 << WIRE_UINT)?;
+    decode_varint(s).map(|(v, _)| v)
 }
 
 #[inline]
 fn slice_read_sint(slice: &[u8], fnum: u32) -> Option<i64> {
-    if let Ok(f16) = u16::try_from(fnum) {
-        read_sint(slice, f16)
-    } else {
-        let (s, _) = locate_field_u32(slice, fnum, 1 << WIRE_SINT)?;
-        decode_varint(s).map(|(v, _)| decode_zigzag(v))
-    }
+    let (s, _) = locate_field_u32(slice, fnum, 1 << WIRE_SINT)?;
+    decode_varint(s).map(|(v, _)| decode_zigzag(v))
 }
 
 #[inline]
 fn slice_read_bool(slice: &[u8], fnum: u32) -> Option<bool> {
-    if let Ok(f16) = u16::try_from(fnum) {
-        read_bool(slice, f16)
-    } else {
-        let (_, wt) =
-            locate_field_u32(slice, fnum, (1 << WIRE_BOOL_FALSE) | (1 << WIRE_BOOL_TRUE))?;
-        Some(wt == WIRE_BOOL_TRUE)
-    }
+    let (_, wt) = locate_field_u32(slice, fnum, (1 << WIRE_BOOL_FALSE) | (1 << WIRE_BOOL_TRUE))?;
+    Some(wt == WIRE_BOOL_TRUE)
 }
 
 #[inline]
 fn slice_read_fixed32(slice: &[u8], fnum: u32) -> Option<u32> {
-    if let Ok(f16) = u16::try_from(fnum) {
-        read_fixed32(slice, f16)
-    } else {
-        let (s, _) = locate_field_u32(slice, fnum, 1 << WIRE_FIXED32)?;
-        Some(u32::from_le_bytes(s.get(..4)?.try_into().ok()?))
-    }
+    let (s, _) = locate_field_u32(slice, fnum, 1 << WIRE_FIXED32)?;
+    Some(u32::from_le_bytes(s.get(..4)?.try_into().ok()?))
 }
 
 #[inline]
 fn slice_read_sfixed32(slice: &[u8], fnum: u32) -> Option<i32> {
-    if let Ok(f16) = u16::try_from(fnum) {
-        read_sfixed32(slice, f16)
-    } else {
-        let (s, _) = locate_field_u32(slice, fnum, 1 << WIRE_SFIXED32)?;
-        Some(i32::from_le_bytes(s.get(..4)?.try_into().ok()?))
-    }
+    let (s, _) = locate_field_u32(slice, fnum, 1 << WIRE_SFIXED32)?;
+    Some(i32::from_le_bytes(s.get(..4)?.try_into().ok()?))
 }
 
 #[inline]
 fn slice_read_fixed64(slice: &[u8], fnum: u32) -> Option<u64> {
-    if let Ok(f16) = u16::try_from(fnum) {
-        read_fixed64(slice, f16)
-    } else {
-        let (s, _) = locate_field_u32(slice, fnum, 1 << WIRE_FIXED64)?;
-        Some(u64::from_le_bytes(s.get(..8)?.try_into().ok()?))
-    }
+    let (s, _) = locate_field_u32(slice, fnum, 1 << WIRE_FIXED64)?;
+    Some(u64::from_le_bytes(s.get(..8)?.try_into().ok()?))
 }
 
 #[inline]
 fn slice_read_sfixed64(slice: &[u8], fnum: u32) -> Option<i64> {
-    if let Ok(f16) = u16::try_from(fnum) {
-        read_sfixed64(slice, f16)
-    } else {
-        let (s, _) = locate_field_u32(slice, fnum, 1 << WIRE_SFIXED64)?;
-        Some(i64::from_le_bytes(s.get(..8)?.try_into().ok()?))
-    }
+    let (s, _) = locate_field_u32(slice, fnum, 1 << WIRE_SFIXED64)?;
+    Some(i64::from_le_bytes(s.get(..8)?.try_into().ok()?))
 }
 
 #[inline]
 fn slice_read_float32(slice: &[u8], fnum: u32) -> Option<f32> {
-    if let Ok(f16) = u16::try_from(fnum) {
-        read_float32(slice, f16)
-    } else {
-        let (s, _) = locate_field_u32(slice, fnum, 1 << WIRE_FLOAT32)?;
-        Some(f32::from_bits(u32::from_le_bytes(
-            s.get(..4)?.try_into().ok()?,
-        )))
-    }
+    let (s, _) = locate_field_u32(slice, fnum, 1 << WIRE_FLOAT32)?;
+    Some(f32::from_bits(u32::from_le_bytes(
+        s.get(..4)?.try_into().ok()?,
+    )))
 }
 
 #[inline]
 fn slice_read_float64(slice: &[u8], fnum: u32) -> Option<f64> {
-    if let Ok(f16) = u16::try_from(fnum) {
-        read_float64(slice, f16)
-    } else {
-        let (s, _) = locate_field_u32(slice, fnum, 1 << WIRE_FLOAT64)?;
-        Some(f64::from_bits(u64::from_le_bytes(
-            s.get(..8)?.try_into().ok()?,
-        )))
-    }
+    let (s, _) = locate_field_u32(slice, fnum, 1 << WIRE_FLOAT64)?;
+    Some(f64::from_bits(u64::from_le_bytes(
+        s.get(..8)?.try_into().ok()?,
+    )))
 }
 
 #[inline]
 fn slice_read_str(slice: &[u8], fnum: u32) -> Option<&str> {
-    if let Ok(f16) = u16::try_from(fnum) {
-        read_str(slice, f16)
-    } else {
-        let (s, _) = locate_field_u32(slice, fnum, 1 << WIRE_STRING)?;
-        let (bytes, _) = read_len_slice(s, 0, 0).ok()?;
-        validate_utf8(bytes).ok()
-    }
+    let (s, _) = locate_field_u32(slice, fnum, 1 << WIRE_STRING)?;
+    let (bytes, _) = read_len_slice(s, 0, 0).ok()?;
+    validate_utf8(bytes).ok()
 }
 
 #[inline]
 fn slice_read_bytes(slice: &[u8], fnum: u32) -> Option<&[u8]> {
-    if let Ok(f16) = u16::try_from(fnum) {
-        read_bytes(slice, f16)
-    } else {
-        let (s, _) = locate_field_u32(slice, fnum, 1 << WIRE_BYTES)?;
-        let (b, _) = read_len_slice(s, 0, 0).ok()?;
-        Some(b)
-    }
+    let (s, _) = locate_field_u32(slice, fnum, 1 << WIRE_BYTES)?;
+    let (b, _) = read_len_slice(s, 0, 0).ok()?;
+    Some(b)
 }
 
 #[pyclass(subclass)]
 pub struct OpaqueView {
-    backing: RawBacking,
+    backing: ByteSliceOwner,
+    dir: OnceLock<Vec<FieldDirEntry>>,
     dirty_mask: u64,
     fast_dirty: Option<FastDirty>,
     dirty_objs: Vec<(u32, Py<PyAny>)>,
 }
 
 impl OpaqueView {
+    #[inline]
+    fn ensure_dir(&self, py: Python<'_>) -> PyResult<&[FieldDirEntry]> {
+        if let Some(entries) = self.dir.get() {
+            return Ok(entries.as_slice());
+        }
+        let slice = self.backing.as_slice(py);
+        let n = slice.len();
+        let mut entries = Vec::with_capacity((n / 8).clamp(8, 256));
+        let mut pos = 0usize;
+        let mut step = 0usize;
+        while pos < n {
+            step += 1;
+            if (step & 0xFFF) == 0 {
+                py.check_signals()?;
+            }
+            let f_start = pos;
+            let (fnum, wt, val_start) = read_tag_at(slice, pos)
+                .ok_or_else(|| decode_err(py, format!("omnibuf: invalid tag at byte {pos}")))?;
+            let f_end = skip_checked_wire_field(py, slice, val_start, fnum, wt)?;
+            entries.push(FieldDirEntry {
+                fnum,
+                wt,
+                f_start,
+                val_start,
+                f_end,
+            });
+            pos = f_end;
+        }
+        let _ = self.dir.set(entries);
+        Ok(self.dir.get().map_or(&[], Vec::as_slice))
+    }
+
     #[inline]
     fn find_dirty<'py>(&self, py: Python<'py>, fnum: u32) -> PyResult<Option<Bound<'py, PyAny>>> {
         if fnum < 64 && (self.dirty_mask & (1u64 << fnum)) == 0 {
@@ -723,46 +659,27 @@ impl OpaqueView {
         Ok(())
     }
 
-    fn collect_submsg_spans(
-        &self,
+    fn collect_submsg_spans_from_dir(
         py: Python<'_>,
+        entries: &[FieldDirEntry],
         slice: &[u8],
         fnum: u32,
         siblings: &[(u32, u16)],
     ) -> PyResult<Vec<(usize, usize)>> {
-        if siblings.is_empty() {
-            let mut spans = Vec::new();
-            let mut pos = 0usize;
-            while let Some((b_start, b_end, next_pos)) =
-                next_container_checked(py, slice, pos, fnum, WIRE_SUB_MSG, 0)?
-            {
-                spans.push((b_start, b_end));
-                pos = next_pos;
-            }
-            return Ok(spans);
-        }
-
         let mut spans = Vec::new();
-        let mut pos = 0usize;
-        let n = slice.len();
-        while pos < n {
-            let (tag_fnum, wt, after_tag) = read_tag_at(slice, pos)
-                .ok_or_else(|| decode_err(py, format!("omnibuf: invalid tag at byte {pos}")))?;
-            pos = after_tag;
-            if tag_fnum == fnum && wt == WIRE_SUB_MSG {
-                let (body, end) =
-                    read_len_slice(slice, pos, 0).map_err(|e| decode_err(py, e.to_string()))?;
+        let has_sibs = !siblings.is_empty();
+        for entry in entries {
+            if entry.fnum == fnum && entry.wt == WIRE_SUB_MSG {
+                let (body, end) = read_len_slice(slice, entry.val_start, 0)
+                    .map_err(|e| decode_err(py, e.to_string()))?;
                 spans.push((end - body.len(), end));
-                pos = end;
-                continue;
-            }
-            if siblings
-                .iter()
-                .any(|&(sf, sm)| sf == tag_fnum && (sm & (1u16 << wt)) != 0)
+            } else if has_sibs
+                && siblings
+                    .iter()
+                    .any(|&(sf, sm)| sf == entry.fnum && (sm & (1u16 << entry.wt)) != 0)
             {
                 spans.clear();
             }
-            pos = skip_checked_wire_field(py, slice, pos, tag_fnum, wt)?;
         }
         Ok(spans)
     }
@@ -770,6 +687,7 @@ impl OpaqueView {
     fn splice_single_fast<'py>(
         &mut self,
         py: Python<'py>,
+        validate_all: bool,
     ) -> PyResult<Option<Bound<'py, PyBytes>>> {
         let Some(ref fd) = self.fast_dirty else {
             return Ok(None);
@@ -778,38 +696,25 @@ impl OpaqueView {
         let mut field_buf = Vec::with_capacity(24);
         fd.write_encoded(&mut field_buf);
 
-        let (only_start, only_end, match_count, src_len) = {
+        if validate_all {
             let src = self.backing.as_slice(py);
-            let n = src.len();
-            let mut pos = 0usize;
+            validate_message_slice(py, src, 0)?;
+        }
+
+        let (only_start, only_end, match_count, src_len) = {
+            let entries = self.ensure_dir(py)?;
+            let src_len = self.backing.as_slice(py).len();
             let mut m_count = 0usize;
             let mut o_start = 0usize;
             let mut o_end = 0usize;
-
-            while pos < n {
-                let f_start = pos;
-                let (fnum, wt, after_tag) = read_tag_at(src, pos)
-                    .ok_or_else(|| decode_err(py, format!("omnibuf: invalid tag at byte {pos}")))?;
-                pos = after_tag;
-                let next_pos = if fnum == 0 {
-                    if wt != WIRE_SUB_MSG {
-                        return Err(decode_err(
-                            py,
-                            format!("omnibuf: Field #0 requires WireSubMsg (12), got {wt}"),
-                        ));
-                    }
-                    validate_field0(src, pos, 0).map_err(|e| decode_err(py, e.to_string()))?
-                } else {
-                    validate_unknown_value(src, pos, wt, 0).map_err(|m| decode_err(py, m))?
-                };
-                if fnum == target_fnum {
+            for entry in entries {
+                if entry.fnum == target_fnum {
                     m_count += 1;
-                    o_start = f_start;
-                    o_end = next_pos;
+                    o_start = entry.f_start;
+                    o_end = entry.f_end;
                 }
-                pos = next_pos;
             }
-            (o_start, o_end, m_count, n)
+            (o_start, o_end, m_count, src_len)
         };
 
         if match_count > 1 {
@@ -864,11 +769,12 @@ impl OpaqueView {
             bound.cast_into_unchecked::<PyBytes>()
         };
 
-        self.backing = RawBacking::PyBytes {
+        self.backing = ByteSliceOwner {
             owner: out_bytes.clone().unbind(),
             start: 0,
             end: total_len,
         };
+        self.dir = OnceLock::new();
         self.dirty_mask = 0;
         self.fast_dirty = None;
         Ok(Some(out_bytes))
@@ -880,7 +786,8 @@ impl OpaqueView {
     #[new]
     fn py_new(py: Python<'_>, raw: &Bound<'_, PyAny>) -> PyResult<Self> {
         Ok(Self {
-            backing: RawBacking::from_py_any(py, raw)?,
+            backing: ByteSliceOwner::from_py_any(py, raw)?,
+            dir: OnceLock::new(),
             dirty_mask: 0,
             fast_dirty: None,
             dirty_objs: Vec::new(),
@@ -892,7 +799,7 @@ impl OpaqueView {
     }
 
     pub fn validate(&self, py: Python<'_>) -> PyResult<()> {
-        validate_message_slice(self.backing.as_slice(py), 0).map_err(|m| decode_err(py, m))
+        validate_message_slice(py, self.backing.as_slice(py), 0)
     }
 
     #[pyo3(signature = (fnum, exp_mask, siblings=None))]
@@ -907,8 +814,8 @@ impl OpaqueView {
             return Ok(!d.is_none());
         }
         let sibs = parse_sibling_specs(siblings)?;
-        let found = locate_field_checked(py, self.backing.as_slice(py), fnum, exp_mask, &sibs)?;
-        Ok(found.is_some())
+        let entries = self.ensure_dir(py)?;
+        Ok(locate_in_dir(entries, fnum, exp_mask, &sibs).is_some())
     }
 
     pub fn _which_oneof<'py>(
@@ -930,38 +837,35 @@ impl OpaqueView {
             specs.push((fn_num, mask, name_obj));
         }
 
-        for (fn_num, _, _) in &specs {
-            if self.find_dirty(py, *fn_num)?.is_some() {
-                for (cand_fn, _, name_obj) in &specs {
-                    if let Some(d) = self.find_dirty(py, *cand_fn)?
-                        && !d.is_none()
-                    {
-                        return Ok(name_obj.clone());
-                    }
-                }
-                return Ok(py.None().into_bound(py));
+        for (cand_fn, _, name_obj) in &specs {
+            if let Some(d) = self.find_dirty(py, *cand_fn)?
+                && !d.is_none()
+            {
+                return Ok(name_obj.clone());
             }
         }
 
-        let slice = self.backing.as_slice(py);
-        let mut pos = 0usize;
-        let n = slice.len();
+        let entries = self.ensure_dir(py)?;
         let mut active: Option<usize> = None;
-        while pos < n {
-            let (tag_fnum, wt, after_tag) = read_tag_at(slice, pos)
-                .ok_or_else(|| decode_err(py, format!("omnibuf: invalid tag at byte {pos}")))?;
-            pos = after_tag;
+        for entry in entries {
             for (idx, (cand_fn, cand_mask, _)) in specs.iter().enumerate() {
-                if tag_fnum == *cand_fn && (*cand_mask & (1u16 << wt)) != 0 {
+                if entry.fnum == *cand_fn && (*cand_mask & (1u16 << entry.wt)) != 0 {
                     active = Some(idx);
                     break;
                 }
             }
-            pos = skip_checked_wire_field(py, slice, pos, tag_fnum, wt)?;
         }
 
         match active {
-            Some(idx) => Ok(specs[idx].2.clone()),
+            Some(idx) => {
+                let (cand_fn, _, ref name_obj) = specs[idx];
+                if let Some(d) = self.find_dirty(py, cand_fn)?
+                    && d.is_none()
+                {
+                    return Ok(py.None().into_bound(py));
+                }
+                Ok(name_obj.clone())
+            }
             None => Ok(py.None().into_bound(py)),
         }
     }
@@ -970,7 +874,8 @@ impl OpaqueView {
         if let Some(d) = self.find_dirty(py, fnum)? {
             return Ok(d);
         }
-        let v = checked_read_uint(py, self.backing.as_slice(py), fnum, &[])?
+        let entries = self.ensure_dir(py)?;
+        let v = checked_read_uint(py, entries, self.backing.as_slice(py), fnum, &[])?
             .map_or(0, |u| u64::from(u as u32));
         unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromUnsignedLongLong(v)) }
     }
@@ -986,7 +891,9 @@ impl OpaqueView {
             return Ok(d);
         }
         let sibs = parse_sibling_specs(siblings)?;
-        let Some(u) = checked_read_uint(py, self.backing.as_slice(py), fnum, &sibs)? else {
+        let entries = self.ensure_dir(py)?;
+        let Some(u) = checked_read_uint(py, entries, self.backing.as_slice(py), fnum, &sibs)?
+        else {
             return Ok(py.None().into_bound(py));
         };
         unsafe {
@@ -998,7 +905,8 @@ impl OpaqueView {
         if let Some(d) = self.find_dirty(py, fnum)? {
             return Ok(d);
         }
-        let v = checked_read_uint(py, self.backing.as_slice(py), fnum, &[])?.unwrap_or(0);
+        let entries = self.ensure_dir(py)?;
+        let v = checked_read_uint(py, entries, self.backing.as_slice(py), fnum, &[])?.unwrap_or(0);
         unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromUnsignedLongLong(v)) }
     }
 
@@ -1013,7 +921,9 @@ impl OpaqueView {
             return Ok(d);
         }
         let sibs = parse_sibling_specs(siblings)?;
-        let Some(u) = checked_read_uint(py, self.backing.as_slice(py), fnum, &sibs)? else {
+        let entries = self.ensure_dir(py)?;
+        let Some(u) = checked_read_uint(py, entries, self.backing.as_slice(py), fnum, &sibs)?
+        else {
             return Ok(py.None().into_bound(py));
         };
         unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromUnsignedLongLong(u)) }
@@ -1023,7 +933,8 @@ impl OpaqueView {
         if let Some(d) = self.find_dirty(py, fnum)? {
             return Ok(d);
         }
-        let v = checked_read_sint(py, self.backing.as_slice(py), fnum, &[])?
+        let entries = self.ensure_dir(py)?;
+        let v = checked_read_sint(py, entries, self.backing.as_slice(py), fnum, &[])?
             .map_or(0, |i| i64::from(i as i32));
         unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromLongLong(v)) }
     }
@@ -1039,7 +950,9 @@ impl OpaqueView {
             return Ok(d);
         }
         let sibs = parse_sibling_specs(siblings)?;
-        let Some(i) = checked_read_sint(py, self.backing.as_slice(py), fnum, &sibs)? else {
+        let entries = self.ensure_dir(py)?;
+        let Some(i) = checked_read_sint(py, entries, self.backing.as_slice(py), fnum, &sibs)?
+        else {
             return Ok(py.None().into_bound(py));
         };
         unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromLongLong(i64::from(i as i32))) }
@@ -1049,7 +962,8 @@ impl OpaqueView {
         if let Some(d) = self.find_dirty(py, fnum)? {
             return Ok(d);
         }
-        let v = checked_read_sint(py, self.backing.as_slice(py), fnum, &[])?.unwrap_or(0);
+        let entries = self.ensure_dir(py)?;
+        let v = checked_read_sint(py, entries, self.backing.as_slice(py), fnum, &[])?.unwrap_or(0);
         unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromLongLong(v)) }
     }
 
@@ -1064,7 +978,9 @@ impl OpaqueView {
             return Ok(d);
         }
         let sibs = parse_sibling_specs(siblings)?;
-        let Some(i) = checked_read_sint(py, self.backing.as_slice(py), fnum, &sibs)? else {
+        let entries = self.ensure_dir(py)?;
+        let Some(i) = checked_read_sint(py, entries, self.backing.as_slice(py), fnum, &sibs)?
+        else {
             return Ok(py.None().into_bound(py));
         };
         unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromLongLong(i)) }
@@ -1074,7 +990,8 @@ impl OpaqueView {
         if let Some(d) = self.find_dirty(py, fnum)? {
             return Ok(d);
         }
-        let v = checked_read_bool(py, self.backing.as_slice(py), fnum, &[])?.unwrap_or(false);
+        let entries = self.ensure_dir(py)?;
+        let v = checked_read_bool(entries, fnum, &[]).unwrap_or(false);
         Ok(PyBool::new(py, v).to_owned().into_any())
     }
 
@@ -1089,7 +1006,8 @@ impl OpaqueView {
             return Ok(d);
         }
         let sibs = parse_sibling_specs(siblings)?;
-        let Some(v) = checked_read_bool(py, self.backing.as_slice(py), fnum, &sibs)? else {
+        let entries = self.ensure_dir(py)?;
+        let Some(v) = checked_read_bool(entries, fnum, &sibs) else {
             return Ok(py.None().into_bound(py));
         };
         Ok(PyBool::new(py, v).to_owned().into_any())
@@ -1099,8 +1017,10 @@ impl OpaqueView {
         if let Some(d) = self.find_dirty(py, fnum)? {
             return Ok(d);
         }
-        let v =
-            u64::from(checked_read_fixed32(py, self.backing.as_slice(py), fnum, &[])?.unwrap_or(0));
+        let entries = self.ensure_dir(py)?;
+        let v = u64::from(
+            checked_read_fixed32(py, entries, self.backing.as_slice(py), fnum, &[])?.unwrap_or(0),
+        );
         unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromUnsignedLongLong(v)) }
     }
 
@@ -1115,7 +1035,9 @@ impl OpaqueView {
             return Ok(d);
         }
         let sibs = parse_sibling_specs(siblings)?;
-        let Some(u) = checked_read_fixed32(py, self.backing.as_slice(py), fnum, &sibs)? else {
+        let entries = self.ensure_dir(py)?;
+        let Some(u) = checked_read_fixed32(py, entries, self.backing.as_slice(py), fnum, &sibs)?
+        else {
             return Ok(py.None().into_bound(py));
         };
         unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromUnsignedLongLong(u64::from(u))) }
@@ -1125,8 +1047,9 @@ impl OpaqueView {
         if let Some(d) = self.find_dirty(py, fnum)? {
             return Ok(d);
         }
+        let entries = self.ensure_dir(py)?;
         let v = i64::from(
-            checked_read_sfixed32(py, self.backing.as_slice(py), fnum, &[])?.unwrap_or(0),
+            checked_read_sfixed32(py, entries, self.backing.as_slice(py), fnum, &[])?.unwrap_or(0),
         );
         unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromLongLong(v)) }
     }
@@ -1142,7 +1065,9 @@ impl OpaqueView {
             return Ok(d);
         }
         let sibs = parse_sibling_specs(siblings)?;
-        let Some(i) = checked_read_sfixed32(py, self.backing.as_slice(py), fnum, &sibs)? else {
+        let entries = self.ensure_dir(py)?;
+        let Some(i) = checked_read_sfixed32(py, entries, self.backing.as_slice(py), fnum, &sibs)?
+        else {
             return Ok(py.None().into_bound(py));
         };
         unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromLongLong(i64::from(i))) }
@@ -1152,7 +1077,9 @@ impl OpaqueView {
         if let Some(d) = self.find_dirty(py, fnum)? {
             return Ok(d);
         }
-        let v = checked_read_fixed64(py, self.backing.as_slice(py), fnum, &[])?.unwrap_or(0);
+        let entries = self.ensure_dir(py)?;
+        let v =
+            checked_read_fixed64(py, entries, self.backing.as_slice(py), fnum, &[])?.unwrap_or(0);
         unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromUnsignedLongLong(v)) }
     }
 
@@ -1167,7 +1094,9 @@ impl OpaqueView {
             return Ok(d);
         }
         let sibs = parse_sibling_specs(siblings)?;
-        let Some(u) = checked_read_fixed64(py, self.backing.as_slice(py), fnum, &sibs)? else {
+        let entries = self.ensure_dir(py)?;
+        let Some(u) = checked_read_fixed64(py, entries, self.backing.as_slice(py), fnum, &sibs)?
+        else {
             return Ok(py.None().into_bound(py));
         };
         unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromUnsignedLongLong(u)) }
@@ -1177,7 +1106,9 @@ impl OpaqueView {
         if let Some(d) = self.find_dirty(py, fnum)? {
             return Ok(d);
         }
-        let v = checked_read_sfixed64(py, self.backing.as_slice(py), fnum, &[])?.unwrap_or(0);
+        let entries = self.ensure_dir(py)?;
+        let v =
+            checked_read_sfixed64(py, entries, self.backing.as_slice(py), fnum, &[])?.unwrap_or(0);
         unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromLongLong(v)) }
     }
 
@@ -1192,7 +1123,9 @@ impl OpaqueView {
             return Ok(d);
         }
         let sibs = parse_sibling_specs(siblings)?;
-        let Some(i) = checked_read_sfixed64(py, self.backing.as_slice(py), fnum, &sibs)? else {
+        let entries = self.ensure_dir(py)?;
+        let Some(i) = checked_read_sfixed64(py, entries, self.backing.as_slice(py), fnum, &sibs)?
+        else {
             return Ok(py.None().into_bound(py));
         };
         unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromLongLong(i)) }
@@ -1202,8 +1135,9 @@ impl OpaqueView {
         if let Some(d) = self.find_dirty(py, fnum)? {
             return Ok(d);
         }
+        let entries = self.ensure_dir(py)?;
         let v = f64::from(
-            checked_read_float32(py, self.backing.as_slice(py), fnum, &[])?.unwrap_or(0.0),
+            checked_read_float32(py, entries, self.backing.as_slice(py), fnum, &[])?.unwrap_or(0.0),
         );
         Ok(PyFloat::new(py, v).into_any())
     }
@@ -1219,7 +1153,9 @@ impl OpaqueView {
             return Ok(d);
         }
         let sibs = parse_sibling_specs(siblings)?;
-        let Some(f) = checked_read_float32(py, self.backing.as_slice(py), fnum, &sibs)? else {
+        let entries = self.ensure_dir(py)?;
+        let Some(f) = checked_read_float32(py, entries, self.backing.as_slice(py), fnum, &sibs)?
+        else {
             return Ok(py.None().into_bound(py));
         };
         Ok(PyFloat::new(py, f64::from(f)).into_any())
@@ -1229,7 +1165,9 @@ impl OpaqueView {
         if let Some(d) = self.find_dirty(py, fnum)? {
             return Ok(d);
         }
-        let v = checked_read_float64(py, self.backing.as_slice(py), fnum, &[])?.unwrap_or(0.0);
+        let entries = self.ensure_dir(py)?;
+        let v =
+            checked_read_float64(py, entries, self.backing.as_slice(py), fnum, &[])?.unwrap_or(0.0);
         Ok(PyFloat::new(py, v).into_any())
     }
 
@@ -1244,7 +1182,9 @@ impl OpaqueView {
             return Ok(d);
         }
         let sibs = parse_sibling_specs(siblings)?;
-        let Some(f) = checked_read_float64(py, self.backing.as_slice(py), fnum, &sibs)? else {
+        let entries = self.ensure_dir(py)?;
+        let Some(f) = checked_read_float64(py, entries, self.backing.as_slice(py), fnum, &sibs)?
+        else {
             return Ok(py.None().into_bound(py));
         };
         Ok(PyFloat::new(py, f).into_any())
@@ -1254,7 +1194,8 @@ impl OpaqueView {
         if let Some(d) = self.find_dirty(py, fnum)? {
             return Ok(d);
         }
-        if let Some(s) = checked_read_str(py, self.backing.as_slice(py), fnum, &[])? {
+        let entries = self.ensure_dir(py)?;
+        if let Some(s) = checked_read_str(py, entries, self.backing.as_slice(py), fnum, &[])? {
             unsafe {
                 Bound::from_owned_ptr_or_err(
                     py,
@@ -1280,7 +1221,8 @@ impl OpaqueView {
             return Ok(d);
         }
         let sibs = parse_sibling_specs(siblings)?;
-        let Some(s) = checked_read_str(py, self.backing.as_slice(py), fnum, &sibs)? else {
+        let entries = self.ensure_dir(py)?;
+        let Some(s) = checked_read_str(py, entries, self.backing.as_slice(py), fnum, &sibs)? else {
             return Ok(py.None().into_bound(py));
         };
         unsafe {
@@ -1298,8 +1240,10 @@ impl OpaqueView {
         if let Some(d) = self.find_dirty(py, fnum)? {
             return Ok(d);
         }
-        if let Some(b) = checked_read_bytes(py, self.backing.as_slice(py), fnum, &[])? {
-            Ok(PyBytes::new(py, b).into_any())
+        let entries = self.ensure_dir(py)?;
+        let slice = self.backing.as_slice(py);
+        if let Some((start, end)) = checked_read_bytes_span(py, entries, slice, fnum, &[])? {
+            Ok(PyBytes::new(py, &slice[start..end]).into_any())
         } else {
             Ok(PyBytes::new(py, b"").into_any())
         }
@@ -1316,30 +1260,100 @@ impl OpaqueView {
             return Ok(d);
         }
         let sibs = parse_sibling_specs(siblings)?;
-        let Some(b) = checked_read_bytes(py, self.backing.as_slice(py), fnum, &sibs)? else {
+        let entries = self.ensure_dir(py)?;
+        let slice = self.backing.as_slice(py);
+        let Some((start, end)) = checked_read_bytes_span(py, entries, slice, fnum, &sibs)? else {
             return Ok(py.None().into_bound(py));
         };
-        Ok(PyBytes::new(py, b).into_any())
+        Ok(PyBytes::new(py, &slice[start..end]).into_any())
     }
 
-    #[pyo3(signature = (fnum, sub_codec, siblings=None))]
+    pub fn _get_bytes_view<'py>(&self, py: Python<'py>, fnum: u32) -> PyResult<Bound<'py, PyAny>> {
+        if let Some(d) = self.find_dirty(py, fnum)? {
+            let pb = if unsafe { ffi::PyBytes_CheckExact(d.as_ptr()) != 0 } {
+                unsafe { d.cast_into_unchecked::<PyBytes>() }
+            } else {
+                let leaf = LeafBytes::extract(py, &d)?;
+                let v = leaf.as_slice().to_vec();
+                drop(leaf);
+                PyBytes::new(py, &v)
+            };
+            let len = pb.as_bytes().len();
+            return create_readonly_memoryview_slice(py, &pb, 0, len);
+        }
+        let entries = self.ensure_dir(py)?;
+        let slice = self.backing.as_slice(py);
+        if let Some((start, end)) = checked_read_bytes_span(py, entries, slice, fnum, &[])? {
+            self.backing.to_readonly_memoryview(py, start, end)
+        } else {
+            let empty = PyBytes::new(py, b"");
+            create_readonly_memoryview_slice(py, &empty, 0, 0)
+        }
+    }
+
+    #[pyo3(signature = (fnum, siblings=None))]
+    pub fn _get_opt_bytes_view<'py>(
+        &self,
+        py: Python<'py>,
+        fnum: u32,
+        siblings: Option<&Bound<'py, PyTuple>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if let Some(d) = self.find_dirty(py, fnum)? {
+            if d.is_none() {
+                return Ok(py.None().into_bound(py));
+            }
+            let pb = if unsafe { ffi::PyBytes_CheckExact(d.as_ptr()) != 0 } {
+                unsafe { d.cast_into_unchecked::<PyBytes>() }
+            } else {
+                let leaf = LeafBytes::extract(py, &d)?;
+                let v = leaf.as_slice().to_vec();
+                drop(leaf);
+                PyBytes::new(py, &v)
+            };
+            let len = pb.as_bytes().len();
+            return create_readonly_memoryview_slice(py, &pb, 0, len);
+        }
+        let sibs = parse_sibling_specs(siblings)?;
+        let entries = self.ensure_dir(py)?;
+        let slice = self.backing.as_slice(py);
+        let Some((start, end)) = checked_read_bytes_span(py, entries, slice, fnum, &sibs)? else {
+            return Ok(py.None().into_bound(py));
+        };
+        self.backing.to_readonly_memoryview(py, start, end)
+    }
+
+    #[pyo3(signature = (fnum, sub_codec, siblings=None, *, max_elements=None))]
     pub fn _get_submsg<'py>(
         &self,
         py: Python<'py>,
         fnum: u32,
         sub_codec: &CompiledCodec,
         siblings: Option<&Bound<'py, PyTuple>>,
+        max_elements: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         if let Some(d) = self.find_dirty(py, fnum)? {
             return Ok(d);
         }
+        let mut budget = match max_elements {
+            Some(obj) => crate::extract_max_elements(py, obj)?,
+            None => DecodeBudget::default_budget(),
+        };
         let sibs = parse_sibling_specs(siblings)?;
+        let entries = self.ensure_dir(py)?;
         let slice = self.backing.as_slice(py);
-        let spans = self.collect_submsg_spans(py, slice, fnum, &sibs)?;
+        let spans = Self::collect_submsg_spans_from_dir(py, entries, slice, fnum, &sibs)?;
         let mut result: Option<Bound<'py, PyAny>> = None;
         for (b_start, b_end) in spans {
             let body = &slice[b_start..b_end];
-            let decoded = sub_codec.decode_slice(py, body, result.as_ref(), 1, result.is_some())?;
+            let decoded = sub_codec.decode_slice_budget(
+                py,
+                body,
+                result.as_ref(),
+                1,
+                result.is_some(),
+                &mut budget,
+                None,
+            )?;
             result = Some(decoded);
         }
         Ok(result.unwrap_or_else(|| py.None().into_bound(py)))
@@ -1363,90 +1377,60 @@ impl OpaqueView {
         }
 
         let sibs = parse_sibling_specs(siblings)?;
+        let entries = self.ensure_dir(py)?;
         let slice = self.backing.as_slice(py);
-        if sibs.is_empty() {
-            let Some((b1_start, b1_end, pos1)) =
-                next_container_checked(py, slice, 0, fnum, WIRE_SUB_MSG, 0)?
-            else {
-                return Ok(py.None().into_bound(py));
-            };
-            let second = next_container_checked(py, slice, pos1, fnum, WIRE_SUB_MSG, 0)?;
-            if let Some((b2_start, b2_end, mut pos)) = second {
-                let mut merged = Vec::with_capacity((b1_end - b1_start) + (b2_end - b2_start) + 32);
-                merged.extend_from_slice(&slice[b1_start..b1_end]);
-                merged.extend_from_slice(&slice[b2_start..b2_end]);
-                while let Some((bn_start, bn_end, next_p)) =
-                    next_container_checked(py, slice, pos, fnum, WIRE_SUB_MSG, 0)?
-                {
-                    pos = next_p;
-                    merged.extend_from_slice(&slice[bn_start..bn_end]);
-                }
-                let inst = opaque_cls.call1((PyBytes::new(py, b""),))?;
-                inst.cast::<OpaqueView>()?.borrow_mut().backing = RawBacking::Owned(merged);
-                return Ok(inst);
-            }
-            let sub_backing = match &self.backing {
-                RawBacking::PyBytes { owner, start, .. } => RawBacking::PyBytes {
-                    owner: owner.clone_ref(py),
-                    start: start + b1_start,
-                    end: start + b1_end,
-                },
-                RawBacking::Owned(vec) => RawBacking::Owned(vec[b1_start..b1_end].to_vec()),
-            };
-            let inst = opaque_cls.call1((PyBytes::new(py, b""),))?;
-            inst.cast::<OpaqueView>()?.borrow_mut().backing = sub_backing;
-            return Ok(inst);
-        }
-
-        let spans = self.collect_submsg_spans(py, slice, fnum, &sibs)?;
+        let spans = Self::collect_submsg_spans_from_dir(py, entries, slice, fnum, &sibs)?;
         if spans.is_empty() {
             return Ok(py.None().into_bound(py));
         }
-        if spans.len() == 1 {
+        let sub_backing = if spans.len() == 1 {
             let (b1_start, b1_end) = spans[0];
-            let sub_backing = match &self.backing {
-                RawBacking::PyBytes { owner, start, .. } => RawBacking::PyBytes {
-                    owner: owner.clone_ref(py),
-                    start: start + b1_start,
-                    end: start + b1_end,
-                },
-                RawBacking::Owned(vec) => RawBacking::Owned(vec[b1_start..b1_end].to_vec()),
-            };
-            let inst = opaque_cls.call1((PyBytes::new(py, b""),))?;
-            inst.cast::<OpaqueView>()?.borrow_mut().backing = sub_backing;
-            return Ok(inst);
-        }
-        let total: usize = spans.iter().map(|(s, e)| e - s).sum();
-        let mut merged = Vec::with_capacity(total);
-        for (s, e) in spans {
-            merged.extend_from_slice(&slice[s..e]);
-        }
+            self.backing.subslice(py, b1_start, b1_end)
+        } else {
+            let total: usize = spans.iter().map(|(s, e)| e - s).sum();
+            let mut merged = Vec::with_capacity(total);
+            for (s, e) in spans {
+                merged.extend_from_slice(&slice[s..e]);
+            }
+            ByteSliceOwner::from_vec(py, &merged)
+        };
         let inst = opaque_cls.call1((PyBytes::new(py, b""),))?;
-        inst.cast::<OpaqueView>()?.borrow_mut().backing = RawBacking::Owned(merged);
+        {
+            let mut view_ref = inst.cast::<OpaqueView>()?.borrow_mut();
+            view_ref.backing = sub_backing;
+            view_ref.dir = OnceLock::new();
+        }
         Ok(inst)
     }
 
+    #[pyo3(signature = (fnum, exp_elem_wt, elem_kind_code, *, max_elements=None))]
     pub fn _get_scalar_array<'py>(
         &self,
         py: Python<'py>,
         fnum: u32,
         exp_elem_wt: u8,
         elem_kind_code: u8,
+        max_elements: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         if let Some(d) = self.find_dirty(py, fnum)? {
             return Ok(d);
         }
+        let mut budget = match max_elements {
+            Some(obj) => crate::extract_max_elements(py, obj)?,
+            None => DecodeBudget::default_budget(),
+        };
         let elem_kind = ScalarKind::from_code(elem_kind_code).ok_or_else(|| {
             decode_err(py, format!("omnibuf: unknown kind code {elem_kind_code}"))
         })?;
+        let entries = self.ensure_dir(py)?;
         let slice = self.backing.as_slice(py);
         let out = PyList::empty(py);
-        let mut pos = 0usize;
-        while let Some((b_start, b_end, next_pos)) =
-            next_container_checked(py, slice, pos, fnum, WIRE_ARRAY, 2)?
-        {
-            pos = next_pos;
-            let body = &slice[b_start..b_end];
+        for entry in entries {
+            if entry.fnum != fnum || entry.wt != WIRE_ARRAY {
+                continue;
+            }
+            let (body, _) = read_len_slice(slice, entry.val_start, 2)
+                .map_err(|e| decode_err(py, e.to_string()))?;
             let (ewt, count, mut p) = parse_array_header(body).ok_or_else(|| {
                 decode_err(
                     py,
@@ -1459,8 +1443,12 @@ impl OpaqueView {
                     format!("omnibuf: mismatched array element wire type on field #{fnum}"),
                 ));
             }
-            for _ in 0..count {
-                let (val_obj, next_p) = read_scalar_payload(py, body, p, elem_kind, None)?;
+            budget.consume(py, count)?;
+            for i in 0..count {
+                if (i & 0xFFF) == 0xFFF {
+                    py.check_signals()?;
+                }
+                let (val_obj, next_p) = read_scalar_payload(py, body, p, elem_kind, None, None)?;
                 p = next_p;
                 out.append(val_obj)?;
             }
@@ -1474,23 +1462,30 @@ impl OpaqueView {
         Ok(out.into_any())
     }
 
+    #[pyo3(signature = (fnum, sub_codec, *, max_elements=None))]
     pub fn _get_submsg_array<'py>(
         &self,
         py: Python<'py>,
         fnum: u32,
         sub_codec: &CompiledCodec,
+        max_elements: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         if let Some(d) = self.find_dirty(py, fnum)? {
             return Ok(d);
         }
+        let mut budget = match max_elements {
+            Some(obj) => crate::extract_max_elements(py, obj)?,
+            None => DecodeBudget::default_budget(),
+        };
+        let entries = self.ensure_dir(py)?;
         let slice = self.backing.as_slice(py);
         let out = PyList::empty(py);
-        let mut pos = 0usize;
-        while let Some((b_start, b_end, next_pos)) =
-            next_container_checked(py, slice, pos, fnum, WIRE_ARRAY, 2)?
-        {
-            pos = next_pos;
-            let body = &slice[b_start..b_end];
+        for entry in entries {
+            if entry.fnum != fnum || entry.wt != WIRE_ARRAY {
+                continue;
+            }
+            let (body, _) = read_len_slice(slice, entry.val_start, 2)
+                .map_err(|e| decode_err(py, e.to_string()))?;
             let (ewt, count, mut p) = parse_array_header(body).ok_or_else(|| {
                 decode_err(
                     py,
@@ -1503,11 +1498,23 @@ impl OpaqueView {
                     format!("omnibuf: invalid submsg array element wire type on field #{fnum}"),
                 ));
             }
-            for _ in 0..count {
+            budget.consume(py, count)?;
+            for i in 0..count {
+                if (i & 0xFFF) == 0xFFF {
+                    py.check_signals()?;
+                }
                 let (elem_slice, next_p) =
                     read_len_slice(body, p, 0).map_err(|e| decode_err(py, e.to_string()))?;
                 p = next_p;
-                let elem_obj = sub_codec.decode_slice(py, elem_slice, None, 2, false)?;
+                let elem_obj = sub_codec.decode_slice_budget(
+                    py,
+                    elem_slice,
+                    None,
+                    2,
+                    false,
+                    &mut budget,
+                    None,
+                )?;
                 out.append(elem_obj)?;
             }
             if p != body.len() {
@@ -1520,7 +1527,7 @@ impl OpaqueView {
         Ok(out.into_any())
     }
 
-    #[pyo3(signature = (fnum, exp_key_wt, key_kind_code, exp_val_wt, val_kind_code, sub_codec=None))]
+    #[pyo3(signature = (fnum, exp_key_wt, key_kind_code, exp_val_wt, val_kind_code, sub_codec=None, *, max_elements=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn _get_map<'py>(
         &self,
@@ -1531,10 +1538,15 @@ impl OpaqueView {
         exp_val_wt: u8,
         val_kind_code: u8,
         sub_codec: Option<&CompiledCodec>,
+        max_elements: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         if let Some(d) = self.find_dirty(py, fnum)? {
             return Ok(d);
         }
+        let mut budget = match max_elements {
+            Some(obj) => crate::extract_max_elements(py, obj)?,
+            None => DecodeBudget::default_budget(),
+        };
         let key_kind = ScalarKind::from_code(key_kind_code).ok_or_else(|| {
             decode_err(
                 py,
@@ -1553,14 +1565,15 @@ impl OpaqueView {
             None
         };
 
+        let entries = self.ensure_dir(py)?;
         let slice = self.backing.as_slice(py);
         let out = PyDict::new(py);
-        let mut pos = 0usize;
-        while let Some((b_start, b_end, next_pos)) =
-            next_container_checked(py, slice, pos, fnum, WIRE_MAP, 3)?
-        {
-            pos = next_pos;
-            let body = &slice[b_start..b_end];
+        for entry in entries {
+            if entry.fnum != fnum || entry.wt != WIRE_MAP {
+                continue;
+            }
+            let (body, _) = read_len_slice(slice, entry.val_start, 3)
+                .map_err(|e| decode_err(py, e.to_string()))?;
             let (kwt, vwt, count, mut p) = parse_map_header(body).ok_or_else(|| {
                 decode_err(py, format!("omnibuf: invalid map header on field #{fnum}"))
             })?;
@@ -1570,15 +1583,20 @@ impl OpaqueView {
                     format!("omnibuf: mismatched map header on field #{fnum}"),
                 ));
             }
-            for _ in 0..count {
-                let (k_obj, after_k) = read_scalar_payload(py, body, p, key_kind, None)?;
+            budget.consume(py, count)?;
+            for i in 0..count {
+                if (i & 0xFFF) == 0xFFF {
+                    py.check_signals()?;
+                }
+                let (k_obj, after_k) = read_scalar_payload(py, body, p, key_kind, None, None)?;
                 let (v_obj, after_v) = if let Some(sc) = sub_codec {
                     let (v_slice, vp) = read_len_slice(body, after_k, 0)
                         .map_err(|e| decode_err(py, e.to_string()))?;
-                    let msg_v = sc.decode_slice(py, v_slice, None, 2, false)?;
+                    let msg_v =
+                        sc.decode_slice_budget(py, v_slice, None, 2, false, &mut budget, None)?;
                     (msg_v, vp)
                 } else {
-                    read_scalar_payload(py, body, after_k, val_scalar_kind.unwrap(), None)?
+                    read_scalar_payload(py, body, after_k, val_scalar_kind.unwrap(), None, None)?
                 };
                 p = after_v;
                 out.set_item(k_obj, v_obj)?;
@@ -1874,39 +1892,51 @@ impl OpaqueView {
         val: Py<PyAny>,
         sibling_fnums: &Bound<'_, PyTuple>,
     ) -> PyResult<()> {
+        let clearing = val.is_none(py);
         self.record_dirty_obj(py, fnum, val)?;
-        let n = sibling_fnums.len();
-        for i in 0..n {
-            let sib: u32 = sibling_fnums.get_item(i)?.extract()?;
-            if sib != fnum {
-                self.record_dirty_obj(py, sib, py.None())?;
+        if !clearing {
+            let n = sibling_fnums.len();
+            for i in 0..n {
+                let sib: u32 = sibling_fnums.get_item(i)?.extract()?;
+                if sib != fnum {
+                    self.record_dirty_obj(py, sib, py.None())?;
+                }
             }
         }
         Ok(())
     }
 
-    #[pyo3(signature = (codec, *, dst_prefix=None, self_describing=false))]
+    #[pyo3(signature = (codec, *, dst_prefix=None, self_describing=false, validate_all=false))]
     pub fn _marshal_with_codec<'py>(
         &mut self,
         py: Python<'py>,
         codec: &CompiledCodec,
         dst_prefix: Option<&Bound<'py, PyAny>>,
         self_describing: bool,
+        validate_all: bool,
     ) -> PyResult<Bound<'py, PyBytes>> {
         let has_dirty = self.fast_dirty.is_some() || !self.dirty_objs.is_empty();
 
         if !has_dirty {
-            let src = self.backing.as_slice(py);
-            validate_message_slice(src, 0).map_err(|m| decode_err(py, m))?;
+            if validate_all {
+                validate_message_slice(py, self.backing.as_slice(py), 0)?;
+            } else {
+                let _ = self.ensure_dir(py)?;
+            }
             if dst_prefix.is_none() && !self_describing {
                 return Ok(self.backing.to_py_bytes(py));
             }
+            let src = self.backing.as_slice(py);
             let mut out = Vec::with_capacity(src.len() + 64);
             if let Some(p_obj) = dst_prefix {
                 let pb = LeafBytes::extract(py, p_obj)?;
                 out.extend_from_slice(pb.as_slice());
             }
-            if self_describing && read_field0_schema_meta(src).is_none() {
+            if self_describing
+                && read_field0_checked(src)
+                    .map_err(|m| decode_err(py, m))?
+                    .is_none()
+            {
                 out.extend_from_slice(codec.field0_bytes());
             }
             out.extend_from_slice(src);
@@ -1917,7 +1947,7 @@ impl OpaqueView {
             && self.dirty_objs.is_empty()
             && dst_prefix.is_none()
             && !self_describing
-            && let Some(fast_bytes) = self.splice_single_fast(py)?
+            && let Some(fast_bytes) = self.splice_single_fast(py, validate_all)?
         {
             return Ok(fast_bytes);
         }
@@ -1925,56 +1955,45 @@ impl OpaqueView {
         self.spill_fast_dirty(py)?;
         self.dirty_objs.sort_by_key(|(fnum, _)| *fnum);
 
+        if validate_all {
+            validate_message_slice(py, self.backing.as_slice(py), 0)?;
+        }
+
         let spliced_vec = {
+            let entries = self.ensure_dir(py)?;
             let src = self.backing.as_slice(py);
             let n = src.len();
-            let mut spans: Vec<(u32, usize, usize)> = Vec::with_capacity(16);
             let mut last_idx: Vec<Option<usize>> = vec![None; self.dirty_objs.len()];
-            let mut pos = 0usize;
 
-            while pos < n {
-                let f_start = pos;
-                let (fnum, wt, after_tag) = read_tag_at(src, pos)
-                    .ok_or_else(|| decode_err(py, format!("omnibuf: invalid tag at byte {pos}")))?;
-                pos = after_tag;
-
-                let next_pos = if fnum == 0 {
-                    if wt != WIRE_SUB_MSG {
-                        return Err(decode_err(
-                            py,
-                            format!("omnibuf: Field #0 requires WireSubMsg (12), got {wt}"),
-                        ));
-                    }
-                    validate_field0(src, pos, 0).map_err(|e| decode_err(py, e.to_string()))?
-                } else {
-                    validate_unknown_value(src, pos, wt, 0).map_err(|m| decode_err(py, m))?
-                };
-
-                let span_i = spans.len();
-                spans.push((fnum, f_start, next_pos));
-                if let Ok(d_idx) = self.dirty_objs.binary_search_by_key(&fnum, |(k, _)| *k) {
+            for (span_i, entry) in entries.iter().enumerate() {
+                if let Ok(d_idx) = self
+                    .dirty_objs
+                    .binary_search_by_key(&entry.fnum, |(k, _)| *k)
+                {
                     last_idx[d_idx] = Some(span_i);
                 }
-                pos = next_pos;
             }
 
             let mut enc = Encoder::new(n + 128);
             let mut emitted = vec![false; self.dirty_objs.len()];
             let mut copy_start = 0usize;
 
-            for (idx, &(fnum, f_start, f_end)) in spans.iter().enumerate() {
-                let Ok(d_idx) = self.dirty_objs.binary_search_by_key(&fnum, |(k, _)| *k) else {
+            for (idx, entry) in entries.iter().enumerate() {
+                let Ok(d_idx) = self
+                    .dirty_objs
+                    .binary_search_by_key(&entry.fnum, |(k, _)| *k)
+                else {
                     continue;
                 };
-                if copy_start < f_start {
-                    enc.write_raw(&src[copy_start..f_start]);
+                if copy_start < entry.f_start {
+                    enc.write_raw(&src[copy_start..entry.f_start]);
                 }
                 if last_idx[d_idx] == Some(idx) {
                     let val_bound = self.dirty_objs[d_idx].1.bind(py);
-                    codec.encode_single_field(py, &mut enc, fnum, val_bound, true)?;
+                    codec.encode_single_field(py, &mut enc, entry.fnum, val_bound, true)?;
                     emitted[d_idx] = true;
                 }
-                copy_start = f_end;
+                copy_start = entry.f_end;
             }
 
             if copy_start < n {
@@ -1991,11 +2010,12 @@ impl OpaqueView {
         };
 
         let spliced_py = PyBytes::new(py, &spliced_vec);
-        self.backing = RawBacking::PyBytes {
+        self.backing = ByteSliceOwner {
             owner: spliced_py.clone().unbind(),
             start: 0,
             end: spliced_vec.len(),
         };
+        self.dir = OnceLock::new();
         self.dirty_mask = 0;
         self.dirty_objs.clear();
 
@@ -2008,7 +2028,11 @@ impl OpaqueView {
             let pb = LeafBytes::extract(py, p_obj)?;
             prefix_out.extend_from_slice(pb.as_slice());
         }
-        if self_describing && read_field0_schema_meta(&spliced_vec).is_none() {
+        if self_describing
+            && read_field0_checked(&spliced_vec)
+                .map_err(|m| decode_err(py, m))?
+                .is_none()
+        {
             prefix_out.extend_from_slice(codec.field0_bytes());
         }
         if prefix_out.is_empty() {
@@ -2254,37 +2278,32 @@ pub fn opaque_get_submsg_slice_py<'py>(
     let found_vec: Option<Vec<u8>> = {
         let b = LeafBytes::extract(py, raw)?;
         let slice = b.as_slice();
-        if let Ok(f16) = u16::try_from(field_num as u32) {
-            read_sub_msg(slice, f16).map(|cow| cow.into_owned())
-        } else {
-            let (first, ok1) = next_container_u32(slice, 0, field_num as u32, WIRE_SUB_MSG, 0);
-            if !ok1 {
-                None
-            } else if let Some((b1_s, b1_e, mut pos)) = first {
-                let mut merged: Option<Vec<u8>> = None;
-                let mut valid = true;
-                while pos < slice.len() {
-                    let (nxt, ok) =
-                        next_container_u32(slice, pos, field_num as u32, WIRE_SUB_MSG, 0);
-                    if !ok {
-                        valid = false;
-                        break;
-                    }
-                    let Some((bn_s, bn_e, next_p)) = nxt else {
-                        break;
-                    };
-                    pos = next_p;
-                    let vec = merged.get_or_insert_with(|| slice[b1_s..b1_e].to_vec());
-                    vec.extend_from_slice(&slice[bn_s..bn_e]);
+        let (first, ok1) = next_container_u32(slice, 0, field_num as u32, WIRE_SUB_MSG, 0);
+        if !ok1 {
+            None
+        } else if let Some((b1_s, b1_e, mut pos)) = first {
+            let mut merged: Option<Vec<u8>> = None;
+            let mut valid = true;
+            while pos < slice.len() {
+                let (nxt, ok) = next_container_u32(slice, pos, field_num as u32, WIRE_SUB_MSG, 0);
+                if !ok {
+                    valid = false;
+                    break;
                 }
-                if !valid {
-                    None
-                } else {
-                    Some(merged.unwrap_or_else(|| slice[b1_s..b1_e].to_vec()))
-                }
-            } else {
-                None
+                let Some((bn_s, bn_e, next_p)) = nxt else {
+                    break;
+                };
+                pos = next_p;
+                let vec = merged.get_or_insert_with(|| slice[b1_s..b1_e].to_vec());
+                vec.extend_from_slice(&slice[bn_s..bn_e]);
             }
+            if !valid {
+                None
+            } else {
+                Some(merged.unwrap_or_else(|| slice[b1_s..b1_e].to_vec()))
+            }
+        } else {
+            None
         }
     };
     Ok(found_vec.map(|v| PyBytes::new(py, &v)))

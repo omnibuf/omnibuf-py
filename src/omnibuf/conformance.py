@@ -254,11 +254,11 @@ def _handle_plugin_tier(
             if msg_type == "omnibuf.bench.PeerUpdate":
                 probe_peer = peer_omnibuf_pb.OpaquePeerUpdate(payload)
                 probe_peer.set_sequence(0)
-                _ = probe_peer.marshal()
+                _ = probe_peer.marshal_validated()
             elif msg_type == "omnibuf.conformance.TestAllTypes":
                 probe_all = conformance_omnibuf_pb.OpaqueTestAllTypes(payload)
                 probe_all.set_f1_uint32(0)
-                _ = probe_all.marshal()
+                _ = probe_all.marshal_validated()
         except OmniBufDecodeError as exc:
             resp.parse_error = str(exc)
             return resp

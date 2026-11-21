@@ -24,6 +24,7 @@ from .encoder import Encoder
 from .field0 import SchemaMeta, encode_field0_schema_meta
 from .wire import (
     MAX_FIELD_NUMBER,
+    MAX_NESTING_DEPTH,
     WIRE_ARRAY,
     WIRE_BOOL_FALSE,
     WIRE_BYTES,
@@ -401,6 +402,11 @@ def omnibuf_message(
         if not dataclasses.is_dataclass(target):
             _apply_default_if_missing(target, local_snap)
             target = dataclass(slots=slots)(target)
+        for dc_f in dataclasses.fields(target):
+            if not isinstance(dc_f.metadata.get(_META_KEY), FieldInfo):
+                raise OmniBufEncodeError(
+                    f"omnibuf: field {target.__name__}.{dc_f.name} is missing omnibuf_field(...)"
+                )
         if local_snap is not None:
             setattr(target, "__omnibuf_localns__", local_snap)  # noqa: B010
         setattr(target, "__omnibuf_type_name__", resolved_name or target.__name__)  # noqa: B010
@@ -551,16 +557,28 @@ class _StructCodec:
             fast_alloc=fast_alloc,
         )
 
-    def get_schema_meta(self, visiting: frozenset[type[Any]] = frozenset()) -> SchemaMeta:
-        if self._schema_meta is not None and not visiting:
+    def get_schema_meta(
+        self,
+        visiting: frozenset[type[Any]] = frozenset(),
+        schema_depth: int = 1,
+    ) -> SchemaMeta:
+        if self._schema_meta is not None and not visiting and schema_depth == 1:
             return self._schema_meta
         meta = SchemaMeta(type_name=self.type_name)
+        if schema_depth + 1 > MAX_NESTING_DEPTH:
+            return meta
         next_visiting = visiting | {self.cls}
         for fc in self.fields:
             meta.fields[fc.field_num] = fc.wire_name
-            if fc.sub_codec is not None and fc.sub_codec.cls not in next_visiting:
-                meta.children[fc.field_num] = fc.sub_codec.get_schema_meta(next_visiting)
-        if not visiting:
+            if (
+                schema_depth + 3 <= MAX_NESTING_DEPTH
+                and fc.sub_codec is not None
+                and fc.sub_codec.cls not in next_visiting
+            ):
+                meta.children[fc.field_num] = fc.sub_codec.get_schema_meta(
+                    next_visiting, schema_depth + 2
+                )
+        if not visiting and schema_depth == 1:
             self._schema_meta = meta
         return meta
 
@@ -657,16 +675,12 @@ def _get_struct_codec(cls: type[Any]) -> _StructCodec:
             raise OmniBufEncodeError(f"omnibuf: {cls!r} is not an @omnibuf_message / @dataclass")
 
         dc_fields = dataclasses.fields(cls)
-        all_annotated = all(isinstance(f.metadata.get(_META_KEY), FieldInfo) for f in dc_fields)
-        slots_val = getattr(cls, "__slots__", ())
-        has_dict_slot = "__dict__" in (slots_val if isinstance(slots_val, tuple) else (slots_val,))
-        req_fast = (
-            "__slots__" in cls.__dict__
-            and not has_dict_slot
-            and not hasattr(cls, "__post_init__")
-            and cls.__bases__ == (object,)
-            and all_annotated
-        )
+        for dc_f in dc_fields:
+            if not isinstance(dc_f.metadata.get(_META_KEY), FieldInfo):
+                raise OmniBufEncodeError(
+                    f"omnibuf: field {cls.__name__}.{dc_f.name} is missing omnibuf_field(...)"
+                )
+        req_fast = not hasattr(cls, "__post_init__") and cls.__bases__ == (object,)
 
         type_name = getattr(cls, "__omnibuf_type_name__", cls.__name__)
         is_root = not _BUILDING_CODECS

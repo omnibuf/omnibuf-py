@@ -43,6 +43,7 @@ from .field0 import (
 from .opaque import (
     opaque_get_bool,
     opaque_get_bytes,
+    opaque_get_bytes_view,
     opaque_get_fixed32,
     opaque_get_fixed64,
     opaque_get_float32,
@@ -63,6 +64,7 @@ from .opaque import (
 )
 from .protobuf_codec import is_proto_message_or_type, marshal_proto, unmarshal_proto
 from .wire import (
+    DEFAULT_MAX_ELEMENTS,
     FIELD0_TAG,
     MAX_CONTAINER_DEPTH,
     MAX_FIELD_NUMBER,
@@ -146,57 +148,134 @@ def marshal(
 
 
 @overload
-def unmarshal[M: pbpy.Message[Any]](packet: Buffer, target: type[M]) -> M: ...
+def unmarshal[M: pbpy.Message[Any]](
+    packet: Buffer,
+    target: type[M],
+    *,
+    max_elements: int | None = None,
+    zero_copy_bytes: bool = False,
+) -> M: ...
 
 
 @overload
-def unmarshal[M: pbpy.Message[Any]](packet: Buffer, target: M) -> M: ...
+def unmarshal[M: pbpy.Message[Any]](
+    packet: Buffer,
+    target: M,
+    *,
+    max_elements: int | None = None,
+    zero_copy_bytes: bool = False,
+) -> M: ...
 
 
 @overload
-def unmarshal(packet: Buffer, target: pbpy.DescMessage) -> pbpy.Message[Any]: ...
+def unmarshal(
+    packet: Buffer,
+    target: pbpy.DescMessage,
+    *,
+    max_elements: int | None = None,
+    zero_copy_bytes: bool = False,
+) -> pbpy.Message[Any]: ...
 
 
 @overload
-def unmarshal[G: GpbMessage](packet: Buffer, target: type[G]) -> G: ...
+def unmarshal[G: GpbMessage](
+    packet: Buffer,
+    target: type[G],
+    *,
+    max_elements: int | None = None,
+    zero_copy_bytes: bool = False,
+) -> G: ...
 
 
 @overload
-def unmarshal[G: GpbMessage](packet: Buffer, target: G) -> G: ...
+def unmarshal[G: GpbMessage](
+    packet: Buffer,
+    target: G,
+    *,
+    max_elements: int | None = None,
+    zero_copy_bytes: bool = False,
+) -> G: ...
 
 
 @overload
-def unmarshal[T](packet: Buffer, target: type[T]) -> T: ...
+def unmarshal[T](
+    packet: Buffer,
+    target: type[T],
+    *,
+    max_elements: int | None = None,
+    zero_copy_bytes: bool = False,
+) -> T: ...
 
 
 @overload
-def unmarshal[T](packet: Buffer, target: T) -> T: ...
+def unmarshal[T](
+    packet: Buffer,
+    target: T,
+    *,
+    max_elements: int | None = None,
+    zero_copy_bytes: bool = False,
+) -> T: ...
 
 
-def unmarshal(packet: Buffer, target: Any) -> Any:
+def unmarshal(
+    packet: Buffer,
+    target: Any,
+    *,
+    max_elements: int | None = None,
+    zero_copy_bytes: bool = False,
+) -> Any:
     """Decodes OmniBuf wire bytes into a protobuf-py message, dataclass, or generated message."""
     if isinstance(target, type):
         gen_codec: CompiledCodec[Any] | None = getattr(target, "__omnibuf_codec__", None)
         if gen_codec is not None:
-            return gen_codec.unmarshal(packet)
+            return gen_codec.unmarshal(
+                packet,
+                max_elements=max_elements,
+                zero_copy_bytes=zero_copy_bytes,
+            )
         if is_proto_message_or_type(target):
-            return unmarshal_proto(packet, target)
+            return unmarshal_proto(packet, target, max_elements=max_elements)
         unmarshal_cls_fn = getattr(target, "unmarshal_omnibuf", None)
         if callable(unmarshal_cls_fn):
-            return unmarshal_cls_fn(packet)
-        return unmarshal_dataclass(packet, target)
+            return unmarshal_cls_fn(
+                packet,
+                max_elements=max_elements,
+                zero_copy_bytes=zero_copy_bytes,
+            )
+        return unmarshal_dataclass(
+            packet,
+            target,
+            max_elements=max_elements,
+            zero_copy_bytes=zero_copy_bytes,
+        )
     gen_inst_codec: CompiledCodec[Any] | None = getattr(type(target), "__omnibuf_codec__", None)
     if gen_inst_codec is not None:
-        return gen_inst_codec.unmarshal(packet, target)
+        return gen_inst_codec.unmarshal(
+            packet,
+            target,
+            max_elements=max_elements,
+            zero_copy_bytes=zero_copy_bytes,
+        )
     if is_proto_message_or_type(target):
-        return unmarshal_proto(packet, target)
+        return unmarshal_proto(packet, target, max_elements=max_elements)
     unmarshal_inst_fn = getattr(type(target), "unmarshal_omnibuf", None)
     if callable(unmarshal_inst_fn):
-        return unmarshal_inst_fn(packet, target)
-    return unmarshal_dataclass(packet, target)
+        return unmarshal_inst_fn(
+            packet,
+            target,
+            max_elements=max_elements,
+            zero_copy_bytes=zero_copy_bytes,
+        )
+    return unmarshal_dataclass(
+        packet,
+        target,
+        max_elements=max_elements,
+        zero_copy_bytes=zero_copy_bytes,
+    )
 
 
 __all__ = [
+    "DEFAULT_MAX_ELEMENTS",
     "FIELD0_TAG",
     "MAX_CONTAINER_DEPTH",
     "MAX_FIELD_NUMBER",
@@ -266,6 +345,7 @@ __all__ = [
     "omnibuf_message",
     "opaque_get_bool",
     "opaque_get_bytes",
+    "opaque_get_bytes_view",
     "opaque_get_fixed32",
     "opaque_get_fixed64",
     "opaque_get_float32",

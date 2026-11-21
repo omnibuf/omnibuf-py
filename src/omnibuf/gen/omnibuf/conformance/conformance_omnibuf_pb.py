@@ -3,11 +3,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import ClassVar
+from dataclasses import dataclass as _omnibuf_dataclass, field as _omnibuf_field
+from typing import TYPE_CHECKING as _omnibuf_TYPE_CHECKING, ClassVar as _omnibuf_ClassVar
 
-from omnibuf._omnibuf_ext import CompiledCodec, OpaqueView
-from omnibuf.wire import Buffer
+from omnibuf._omnibuf_ext import (
+    CompiledCodec as _omnibuf_CompiledCodec,
+    OpaqueView as _omnibuf_OpaqueView,
+)
+from omnibuf.wire import Buffer as _omnibuf_Buffer
 
 class WireFormat:
     WIRE_FORMAT_UNSPECIFIED = 0
@@ -23,9 +26,10 @@ class TestTier:
 
 _FIELD0_CONFORMANCE_REQUEST: bytes = b'\x19\xc6\x025%ConformanceRequest]j\x02\x00\n\x13\x03\x13test_name\x05\x19message_type\x07\ttier\t/requested_output_format\x0b\x1fomnibuf_payload\r\x19json_payload\x0f\x1fself_describing\x11%test_opaque_splice\x133test_opaque_splice_shrink'
 
-@dataclass(slots=True)
+@_omnibuf_dataclass(slots=True)
 class ConformanceRequest:
-    __omnibuf_codec__: ClassVar[CompiledCodec[ConformanceRequest]]
+    if _omnibuf_TYPE_CHECKING:
+        __omnibuf_codec__: _omnibuf_ClassVar[_omnibuf_CompiledCodec[ConformanceRequest]]
     test_name: str = ""
     message_type: str = ""
     tier: int = 0
@@ -45,16 +49,23 @@ class ConformanceRequest:
         return _CODEC_CONFORMANCE_REQUEST.marshal(self, deterministic=deterministic, self_describing=self_describing)
 
     @classmethod
-    def unmarshal_omnibuf(cls, data: Buffer, out: ConformanceRequest | None = None) -> ConformanceRequest:
-        return _CODEC_CONFORMANCE_REQUEST.unmarshal(data, out)
+    def unmarshal_omnibuf(
+        cls,
+        data: _omnibuf_Buffer,
+        out: ConformanceRequest | None = None,
+        *,
+        max_elements: int | None = None,
+        zero_copy_bytes: bool = False,
+    ) -> ConformanceRequest:
+        return _CODEC_CONFORMANCE_REQUEST.unmarshal(data, out, max_elements=max_elements, zero_copy_bytes=zero_copy_bytes)
 
-_CODEC_CONFORMANCE_REQUEST: CompiledCodec[ConformanceRequest] = CompiledCodec(ConformanceRequest, 'ConformanceRequest')
+_CODEC_CONFORMANCE_REQUEST: _omnibuf_CompiledCodec[ConformanceRequest] = _omnibuf_CompiledCodec(ConformanceRequest, 'ConformanceRequest')
 ConformanceRequest.__omnibuf_codec__ = _CODEC_CONFORMANCE_REQUEST
 marshal_conformance_request = _CODEC_CONFORMANCE_REQUEST.marshal
 unmarshal_conformance_request = _CODEC_CONFORMANCE_REQUEST.unmarshal
 _decode_conformance_request = _CODEC_CONFORMANCE_REQUEST.decode_at
 
-class OpaqueConformanceRequest(OpaqueView):
+class OpaqueConformanceRequest(_omnibuf_OpaqueView):
     __slots__ = ()
 
     def get_test_name(self) -> str:
@@ -83,6 +94,9 @@ class OpaqueConformanceRequest(OpaqueView):
 
     def get_omnibuf_payload(self) -> bytes:
         return self._get_bytes(5)
+
+    def get_omnibuf_payload_view(self) -> memoryview:
+        return self._get_bytes_view(5)
 
     def set_omnibuf_payload(self, val: bytes) -> None:
         self._set_bytes(5, val)
@@ -114,16 +128,33 @@ class OpaqueConformanceRequest(OpaqueView):
     def marshal(
         self,
         *,
-        dst_prefix: Buffer | None = None,
+        dst_prefix: _omnibuf_Buffer | None = None,
         self_describing: bool = False,
     ) -> bytes:
         return self._marshal_with_codec(_CODEC_CONFORMANCE_REQUEST, dst_prefix=dst_prefix, self_describing=self_describing)
 
+    def marshal_validated(
+        self,
+        *,
+        dst_prefix: _omnibuf_Buffer | None = None,
+        self_describing: bool = False,
+    ) -> bytes:
+        return self._marshal_with_codec(_CODEC_CONFORMANCE_REQUEST, dst_prefix=dst_prefix, self_describing=self_describing, validate_all=True)
+
+    def try_marshal(
+        self,
+        *,
+        dst_prefix: _omnibuf_Buffer | None = None,
+        self_describing: bool = False,
+    ) -> bytes:
+        return self.marshal_validated(dst_prefix=dst_prefix, self_describing=self_describing)
+
 _FIELD0_CONFORMANCE_RESPONSE: bytes = b"\x19\xc2\x015'ConformanceResponse]b\x01\x00\n\r\x03\x17parse_error\x05\x1fserialize_error\x07\x1bruntime_error\t\x0fskipped\x0b\x1fomnibuf_payload\r\x19json_payload"
 
-@dataclass(slots=True)
+@_omnibuf_dataclass(slots=True)
 class ConformanceResponse:
-    __omnibuf_codec__: ClassVar[CompiledCodec[ConformanceResponse]]
+    if _omnibuf_TYPE_CHECKING:
+        __omnibuf_codec__: _omnibuf_ClassVar[_omnibuf_CompiledCodec[ConformanceResponse]]
     parse_error: str = ""
     serialize_error: str = ""
     runtime_error: str = ""
@@ -140,16 +171,23 @@ class ConformanceResponse:
         return _CODEC_CONFORMANCE_RESPONSE.marshal(self, deterministic=deterministic, self_describing=self_describing)
 
     @classmethod
-    def unmarshal_omnibuf(cls, data: Buffer, out: ConformanceResponse | None = None) -> ConformanceResponse:
-        return _CODEC_CONFORMANCE_RESPONSE.unmarshal(data, out)
+    def unmarshal_omnibuf(
+        cls,
+        data: _omnibuf_Buffer,
+        out: ConformanceResponse | None = None,
+        *,
+        max_elements: int | None = None,
+        zero_copy_bytes: bool = False,
+    ) -> ConformanceResponse:
+        return _CODEC_CONFORMANCE_RESPONSE.unmarshal(data, out, max_elements=max_elements, zero_copy_bytes=zero_copy_bytes)
 
-_CODEC_CONFORMANCE_RESPONSE: CompiledCodec[ConformanceResponse] = CompiledCodec(ConformanceResponse, 'ConformanceResponse')
+_CODEC_CONFORMANCE_RESPONSE: _omnibuf_CompiledCodec[ConformanceResponse] = _omnibuf_CompiledCodec(ConformanceResponse, 'ConformanceResponse')
 ConformanceResponse.__omnibuf_codec__ = _CODEC_CONFORMANCE_RESPONSE
 marshal_conformance_response = _CODEC_CONFORMANCE_RESPONSE.marshal
 unmarshal_conformance_response = _CODEC_CONFORMANCE_RESPONSE.unmarshal
 _decode_conformance_response = _CODEC_CONFORMANCE_RESPONSE.decode_at
 
-class OpaqueConformanceResponse(OpaqueView):
+class OpaqueConformanceResponse(_omnibuf_OpaqueView):
     __slots__ = ()
 
     def get_parse_error(self) -> str:
@@ -179,6 +217,9 @@ class OpaqueConformanceResponse(OpaqueView):
     def get_omnibuf_payload(self) -> bytes:
         return self._get_bytes(5)
 
+    def get_omnibuf_payload_view(self) -> memoryview:
+        return self._get_bytes_view(5)
+
     def set_omnibuf_payload(self, val: bytes) -> None:
         self._set_bytes(5, val)
 
@@ -191,16 +232,33 @@ class OpaqueConformanceResponse(OpaqueView):
     def marshal(
         self,
         *,
-        dst_prefix: Buffer | None = None,
+        dst_prefix: _omnibuf_Buffer | None = None,
         self_describing: bool = False,
     ) -> bytes:
         return self._marshal_with_codec(_CODEC_CONFORMANCE_RESPONSE, dst_prefix=dst_prefix, self_describing=self_describing)
 
+    def marshal_validated(
+        self,
+        *,
+        dst_prefix: _omnibuf_Buffer | None = None,
+        self_describing: bool = False,
+    ) -> bytes:
+        return self._marshal_with_codec(_CODEC_CONFORMANCE_RESPONSE, dst_prefix=dst_prefix, self_describing=self_describing, validate_all=True)
+
+    def try_marshal(
+        self,
+        *,
+        dst_prefix: _omnibuf_Buffer | None = None,
+        self_describing: bool = False,
+    ) -> bytes:
+        return self.marshal_validated(dst_prefix=dst_prefix, self_describing=self_describing)
+
 _FIELD0_ALL_TYPES_SUB_MSG: bytes = b'\x19\xba\x005\x1dAllTypesSubMsg]n\x00\x00\n\t\x03\x05id\x05\x0blabel\x07\tflag\t\x0bscore'
 
-@dataclass(slots=True)
+@_omnibuf_dataclass(slots=True)
 class AllTypesSubMsg:
-    __omnibuf_codec__: ClassVar[CompiledCodec[AllTypesSubMsg]]
+    if _omnibuf_TYPE_CHECKING:
+        __omnibuf_codec__: _omnibuf_ClassVar[_omnibuf_CompiledCodec[AllTypesSubMsg]]
     id: int = 0
     label: str = ""
     flag: bool = False
@@ -215,16 +273,23 @@ class AllTypesSubMsg:
         return _CODEC_ALL_TYPES_SUB_MSG.marshal(self, deterministic=deterministic, self_describing=self_describing)
 
     @classmethod
-    def unmarshal_omnibuf(cls, data: Buffer, out: AllTypesSubMsg | None = None) -> AllTypesSubMsg:
-        return _CODEC_ALL_TYPES_SUB_MSG.unmarshal(data, out)
+    def unmarshal_omnibuf(
+        cls,
+        data: _omnibuf_Buffer,
+        out: AllTypesSubMsg | None = None,
+        *,
+        max_elements: int | None = None,
+        zero_copy_bytes: bool = False,
+    ) -> AllTypesSubMsg:
+        return _CODEC_ALL_TYPES_SUB_MSG.unmarshal(data, out, max_elements=max_elements, zero_copy_bytes=zero_copy_bytes)
 
-_CODEC_ALL_TYPES_SUB_MSG: CompiledCodec[AllTypesSubMsg] = CompiledCodec(AllTypesSubMsg, 'AllTypesSubMsg')
+_CODEC_ALL_TYPES_SUB_MSG: _omnibuf_CompiledCodec[AllTypesSubMsg] = _omnibuf_CompiledCodec(AllTypesSubMsg, 'AllTypesSubMsg')
 AllTypesSubMsg.__omnibuf_codec__ = _CODEC_ALL_TYPES_SUB_MSG
 marshal_all_types_sub_msg = _CODEC_ALL_TYPES_SUB_MSG.marshal
 unmarshal_all_types_sub_msg = _CODEC_ALL_TYPES_SUB_MSG.unmarshal
 _decode_all_types_sub_msg = _CODEC_ALL_TYPES_SUB_MSG.decode_at
 
-class OpaqueAllTypesSubMsg(OpaqueView):
+class OpaqueAllTypesSubMsg(_omnibuf_OpaqueView):
     __slots__ = ()
 
     def get_id(self) -> int:
@@ -254,16 +319,33 @@ class OpaqueAllTypesSubMsg(OpaqueView):
     def marshal(
         self,
         *,
-        dst_prefix: Buffer | None = None,
+        dst_prefix: _omnibuf_Buffer | None = None,
         self_describing: bool = False,
     ) -> bytes:
         return self._marshal_with_codec(_CODEC_ALL_TYPES_SUB_MSG, dst_prefix=dst_prefix, self_describing=self_describing)
 
+    def marshal_validated(
+        self,
+        *,
+        dst_prefix: _omnibuf_Buffer | None = None,
+        self_describing: bool = False,
+    ) -> bytes:
+        return self._marshal_with_codec(_CODEC_ALL_TYPES_SUB_MSG, dst_prefix=dst_prefix, self_describing=self_describing, validate_all=True)
+
+    def try_marshal(
+        self,
+        *,
+        dst_prefix: _omnibuf_Buffer | None = None,
+        self_describing: bool = False,
+    ) -> bytes:
+        return self.marshal_validated(dst_prefix=dst_prefix, self_describing=self_describing)
+
 _FIELD0_TEST_ALL_TYPES: bytes = b'\x19j\x055\x19TestAllTypes]\x86\x03\x00\n#\x03\x13f1_uint32\x05\x13f2_uint64\x07\x13f3_sint32\t\x13f4_sint64\x0b\x0ff5_bool\r\x13f6_string\x0f\x11f7_bytes\x11\x15f8_sub_msg\x13\x1bf9_string_arr\x15\x1df10_uint32_arr\x17\x1ff11_sub_msg_arr\x19!f12_map_str_uint\x1b\x17f13_float32\x1d\x17f14_float64\x1f\x17f15_fixed32!\x17f16_fixed64)!f20_overflow_str}\x96\x01\x00\x0c\x05\x11\xba\x005\x1dAllTypesSubMsg]n\x00\x00\n\t\x03\x05id\x05\x0blabel\x07\tflag\t\x0bscore\x17\xba\x005\x1dAllTypesSubMsg]n\x00\x00\n\t\x03\x05id\x05\x0blabel\x07\tflag\t\x0bscore'
 
-@dataclass(slots=True)
+@_omnibuf_dataclass(slots=True)
 class TestAllTypes:
-    __omnibuf_codec__: ClassVar[CompiledCodec[TestAllTypes]]
+    if _omnibuf_TYPE_CHECKING:
+        __omnibuf_codec__: _omnibuf_ClassVar[_omnibuf_CompiledCodec[TestAllTypes]]
     f1_uint32: int = 0
     f2_uint64: int = 0
     f3_sint32: int = 0
@@ -272,10 +354,10 @@ class TestAllTypes:
     f6_string: str = ""
     f7_bytes: bytes = b""
     f8_sub_msg: AllTypesSubMsg | None = None
-    f9_string_arr: list[str] = field(default_factory=list)
-    f10_uint32_arr: list[int] = field(default_factory=list)
-    f11_sub_msg_arr: list[AllTypesSubMsg] = field(default_factory=list)
-    f12_map_str_uint: dict[str, int] = field(default_factory=dict)
+    f9_string_arr: list[str] = _omnibuf_field(default_factory=list)
+    f10_uint32_arr: list[int] = _omnibuf_field(default_factory=list)
+    f11_sub_msg_arr: list[AllTypesSubMsg] = _omnibuf_field(default_factory=list)
+    f12_map_str_uint: dict[str, int] = _omnibuf_field(default_factory=dict)
     f13_float32: float = 0.0
     f14_float64: float = 0.0
     f15_fixed32: int = 0
@@ -291,16 +373,23 @@ class TestAllTypes:
         return _CODEC_TEST_ALL_TYPES.marshal(self, deterministic=deterministic, self_describing=self_describing)
 
     @classmethod
-    def unmarshal_omnibuf(cls, data: Buffer, out: TestAllTypes | None = None) -> TestAllTypes:
-        return _CODEC_TEST_ALL_TYPES.unmarshal(data, out)
+    def unmarshal_omnibuf(
+        cls,
+        data: _omnibuf_Buffer,
+        out: TestAllTypes | None = None,
+        *,
+        max_elements: int | None = None,
+        zero_copy_bytes: bool = False,
+    ) -> TestAllTypes:
+        return _CODEC_TEST_ALL_TYPES.unmarshal(data, out, max_elements=max_elements, zero_copy_bytes=zero_copy_bytes)
 
-_CODEC_TEST_ALL_TYPES: CompiledCodec[TestAllTypes] = CompiledCodec(TestAllTypes, 'TestAllTypes')
+_CODEC_TEST_ALL_TYPES: _omnibuf_CompiledCodec[TestAllTypes] = _omnibuf_CompiledCodec(TestAllTypes, 'TestAllTypes')
 TestAllTypes.__omnibuf_codec__ = _CODEC_TEST_ALL_TYPES
 marshal_test_all_types = _CODEC_TEST_ALL_TYPES.marshal
 unmarshal_test_all_types = _CODEC_TEST_ALL_TYPES.unmarshal
 _decode_test_all_types = _CODEC_TEST_ALL_TYPES.decode_at
 
-class OpaqueTestAllTypes(OpaqueView):
+class OpaqueTestAllTypes(_omnibuf_OpaqueView):
     __slots__ = ()
 
     def get_f1_uint32(self) -> int:
@@ -341,6 +430,9 @@ class OpaqueTestAllTypes(OpaqueView):
 
     def get_f7_bytes(self) -> bytes:
         return self._get_bytes(7)
+
+    def get_f7_bytes_view(self) -> memoryview:
+        return self._get_bytes_view(7)
 
     def set_f7_bytes(self, val: bytes) -> None:
         self._set_bytes(7, val)
@@ -414,10 +506,26 @@ class OpaqueTestAllTypes(OpaqueView):
     def marshal(
         self,
         *,
-        dst_prefix: Buffer | None = None,
+        dst_prefix: _omnibuf_Buffer | None = None,
         self_describing: bool = False,
     ) -> bytes:
         return self._marshal_with_codec(_CODEC_TEST_ALL_TYPES, dst_prefix=dst_prefix, self_describing=self_describing)
+
+    def marshal_validated(
+        self,
+        *,
+        dst_prefix: _omnibuf_Buffer | None = None,
+        self_describing: bool = False,
+    ) -> bytes:
+        return self._marshal_with_codec(_CODEC_TEST_ALL_TYPES, dst_prefix=dst_prefix, self_describing=self_describing, validate_all=True)
+
+    def try_marshal(
+        self,
+        *,
+        dst_prefix: _omnibuf_Buffer | None = None,
+        self_describing: bool = False,
+    ) -> bytes:
+        return self.marshal_validated(dst_prefix=dst_prefix, self_describing=self_describing)
 
 _CODEC_CONFORMANCE_REQUEST.set_fields(
     [

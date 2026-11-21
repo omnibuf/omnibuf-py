@@ -32,13 +32,23 @@ class CompiledCodec[T]:
         deterministic: bool = False,
         self_describing: bool = False,
     ) -> bytes: ...
-    def unmarshal(self, data: Buffer, out: T | None = None) -> T: ...
+    def unmarshal(
+        self,
+        data: Buffer,
+        out: T | None = None,
+        *,
+        max_elements: int | None = None,
+        zero_copy_bytes: bool = False,
+    ) -> T: ...
     def decode_at(
         self,
         data: Buffer,
         out: T | None = None,
         depth: int = 0,
         merge: bool = False,
+        *,
+        max_elements: int | None = None,
+        zero_copy_bytes: bool = False,
     ) -> T: ...
 
 class OpaqueView:
@@ -133,11 +143,19 @@ class OpaqueView:
         fnum: int,
         siblings: tuple[tuple[int, int], ...] | None = None,
     ) -> bytes | None: ...
+    def _get_bytes_view(self, fnum: int) -> memoryview: ...
+    def _get_opt_bytes_view(
+        self,
+        fnum: int,
+        siblings: tuple[tuple[int, int], ...] | None = None,
+    ) -> memoryview | None: ...
     def _get_submsg[T](
         self,
         fnum: int,
         sub_codec: CompiledCodec[T],
         siblings: tuple[tuple[int, int], ...] | None = None,
+        *,
+        max_elements: int | None = None,
     ) -> T | None: ...
     def _opaque_sub[O](
         self,
@@ -151,8 +169,16 @@ class OpaqueView:
         fnum: int,
         exp_elem_wt: int,
         elem_kind_code: int,
+        *,
+        max_elements: int | None = None,
     ) -> list[Any]: ...
-    def _get_submsg_array[T](self, fnum: int, sub_codec: CompiledCodec[T]) -> list[T]: ...
+    def _get_submsg_array[T](
+        self,
+        fnum: int,
+        sub_codec: CompiledCodec[T],
+        *,
+        max_elements: int | None = None,
+    ) -> list[T]: ...
     def _get_map(
         self,
         fnum: int,
@@ -161,6 +187,8 @@ class OpaqueView:
         exp_val_wt: int,
         val_kind_code: int,
         sub_codec: CompiledCodec[Any] | None = None,
+        *,
+        max_elements: int | None = None,
     ) -> dict[Any, Any]: ...
     def _set_uint32(self, fnum: int, val: Any, allow_none: bool = False) -> None: ...
     def _set_uint64(self, fnum: int, val: Any, allow_none: bool = False) -> None: ...
@@ -188,6 +216,7 @@ class OpaqueView:
         *,
         dst_prefix: Buffer | None = None,
         self_describing: bool = False,
+        validate_all: bool = False,
     ) -> bytes: ...
 
 def init_exceptions(
@@ -219,9 +248,21 @@ def marshal_dataclass_py(
     self_describing: bool = False,
 ) -> bytes: ...
 @overload
-def unmarshal_dataclass_py[T](packet: Buffer, target: type[T]) -> T: ...
+def unmarshal_dataclass_py[T](
+    packet: Buffer,
+    target: type[T],
+    *,
+    max_elements: int | None = None,
+    zero_copy_bytes: bool = False,
+) -> T: ...
 @overload
-def unmarshal_dataclass_py[T](packet: Buffer, target: T) -> T: ...
+def unmarshal_dataclass_py[T](
+    packet: Buffer,
+    target: T,
+    *,
+    max_elements: int | None = None,
+    zero_copy_bytes: bool = False,
+) -> T: ...
 def opaque_get_uint32_py(raw: Buffer, field_num: int, default: int = 0) -> int: ...
 def opaque_get_uint64_py(raw: Buffer, field_num: int, default: int = 0) -> int: ...
 def opaque_get_sint32_py(raw: Buffer, field_num: int, default: int = 0) -> int: ...

@@ -65,6 +65,8 @@ WireExtended = WIRE_EXTENDED
 MAX_NESTING_DEPTH = 32
 MAX_CONTAINER_DEPTH = 32
 MAX_FIELD_NUMBER = 536_870_911
+DEFAULT_MAX_ELEMENTS = 4_194_304
+DEFAULT_MAX_ALLOC_BYTES = 67_108_864
 FIELD0_TAG = 0x19
 
 MAX_1B_VARINT = 127
@@ -142,6 +144,8 @@ def to_int64(v: int) -> int:
 
 def encode_zigzag(n: int) -> int:
     """Encodes a signed 64-bit integer using ZigZag mapping."""
+    if isinstance(n, bool) or not isinstance(n, int):
+        raise OmniBufEncodeError(f"omnibuf: sint64 expected int, got {type(n).__name__}")
     if n < INT64_MIN or n > INT64_MAX:
         raise OmniBufEncodeError(f"omnibuf: sint64 value {n} out of int64 range")
     return ((n << 1) ^ (n >> 63)) & UINT64_MAX
@@ -149,6 +153,8 @@ def encode_zigzag(n: int) -> int:
 
 def encode_zigzag32(n: int) -> int:
     """Encodes a signed 32-bit integer using ZigZag mapping."""
+    if isinstance(n, bool) or not isinstance(n, int):
+        raise OmniBufEncodeError(f"omnibuf: sint32 expected int, got {type(n).__name__}")
     if n < INT32_MIN or n > INT32_MAX:
         raise OmniBufEncodeError(f"omnibuf: sint32 value {n} out of int32 range")
     return ((n << 1) ^ (n >> 31)) & UINT32_MAX
@@ -206,6 +212,8 @@ def wire_type_name(wt: int) -> str:
 
 def append_varint(dst: bytearray, v: int) -> None:
     """Appends an unsigned 64-bit Prefix-Varint to dst."""
+    if isinstance(v, bool) or not isinstance(v, int):
+        raise OmniBufEncodeError(f"omnibuf: varint expected int, got {type(v).__name__}")
     if v < 0 or v > UINT64_MAX:
         raise OmniBufEncodeError(f"omnibuf: varint value {v} out of uint64 range")
     if v <= MAX_1B_VARINT:
@@ -230,6 +238,12 @@ def encode_varint(v: int) -> bytes:
 
 def append_tag(dst: bytearray, field_num: int, wire_type: int) -> None:
     """Appends an OmniBuf field tag (field_num << 4) | wire_type."""
+    if isinstance(field_num, bool) or not isinstance(field_num, int):
+        raise OmniBufEncodeError(
+            f"omnibuf: field number expected int, got {type(field_num).__name__}"
+        )
+    if isinstance(wire_type, bool) or not isinstance(wire_type, int):
+        raise OmniBufEncodeError(f"omnibuf: wire type expected int, got {type(wire_type).__name__}")
     if field_num < 0 or field_num > MAX_FIELD_NUMBER:
         raise OmniBufEncodeError(f"omnibuf: field number {field_num} out of range")
     if wire_type < 0 or wire_type > WIRE_EXTENDED:
@@ -306,6 +320,16 @@ def backpatch_container_len(dst: bytearray, len_pos: int) -> None:
         dst[len_pos : len_pos + 2] = _U32_LE.pack(w32)
     else:
         dst[len_pos : len_pos + 2] = _VARINT9_LE.pack(0, sub_len)
+
+
+def backpatch_container_len4(dst: bytearray, len_pos: int) -> None:
+    """Backpatches a pre-reserved 4-byte length slot at dst[len_pos:len_pos+4] without shifting."""
+    sub_len = len(dst) - (len_pos + 4)
+    if sub_len <= MAX_4B_VARINT:
+        w32 = (sub_len << 3) | 4
+        _U32_LE.pack_into(dst, len_pos, w32)
+    else:
+        dst[len_pos : len_pos + 4] = _VARINT9_LE.pack(0, sub_len)
 
 
 def encode_utf8_strict(value: str, field_name: str = "") -> bytes:
@@ -865,8 +889,18 @@ def locate_field_offset(
             wt = tag & 0x0F
             pos += tn
 
-        if fnum == 0 and wt != WIRE_SUB_MSG:
-            return -1, 0
+        if fnum == 0:
+            if wt != WIRE_SUB_MSG:
+                return -1, 0
+            try:
+                end_f0 = validate_field0_at(packet, pos, wt, 0, MAX_NESTING_DEPTH, n)
+            except OmniBufDecodeError:
+                return -1, 0
+            if target_field == 0 and ((exp_mask >> wt) & 1) != 0:
+                last_pos = pos
+                last_wt = wt
+            pos = end_f0
+            continue
 
         if fnum == target_field and ((exp_mask >> wt) & 1) != 0:
             last_pos = pos
@@ -976,8 +1010,22 @@ def next_container_span(
             wt = tag & 0x0F
             pos += tn
 
-        if fnum == 0 and wt != WIRE_SUB_MSG:
-            return -2, 0, 0
+        if fnum == 0:
+            if wt != WIRE_SUB_MSG:
+                return -2, 0, 0
+            try:
+                end_f0 = validate_field0_at(packet, pos, wt, 0, MAX_NESTING_DEPTH, n)
+            except OmniBufDecodeError:
+                return -2, 0, 0
+            if target_field == 0 and exp_wt == WIRE_SUB_MSG:
+                try:
+                    b_slice, _ = read_len_slice(packet, pos, min_len, n)
+                except OmniBufDecodeError:
+                    return -2, 0, 0
+                b_len = len(b_slice)
+                return end_f0 - b_len, end_f0, end_f0
+            pos = end_f0
+            continue
 
         if fnum == target_field and wt == exp_wt:
             if pos >= n:
