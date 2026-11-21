@@ -375,9 +375,7 @@ def splice_dirty_fields(
         if fnum == 0:
             next_pos = validate_field0_at(src_packet, pos, wt, 0, MAX_NESTING_DEPTH, n)
         else:
-            next_pos = validate_value(
-                src_packet, pos, wt, 0, MAX_NESTING_DEPTH, n, check_utf8=True
-            )
+            next_pos = validate_value(src_packet, pos, wt, 0, MAX_NESTING_DEPTH, n, check_utf8=True)
         idx = len(spans)
         spans.append((fnum, f_start, next_pos))
         if fnum in dirty_set:
