@@ -64,10 +64,7 @@ unsafe fn slot_submsg_min_wire_size(
     obj_ptr: *mut ffi::PyObject,
 ) -> usize {
     unsafe {
-        if obj_ptr.is_null()
-            || !inner.fast_slot_encode
-            || ffi::Py_IS_TYPE(obj_ptr, cls_ptr) == 0
-        {
+        if obj_ptr.is_null() || !inner.fast_slot_encode || ffi::Py_IS_TYPE(obj_ptr, cls_ptr) == 0 {
             return 0;
         }
         let mut sz = inner.min_wire_reserve;
