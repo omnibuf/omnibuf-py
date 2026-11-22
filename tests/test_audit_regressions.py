@@ -678,3 +678,152 @@ def test_audit_f9c_gpb_mismatched_wire_type_before_repeated_clears_reused_dst() 
 
     unmarshal_proto(pkt, dst)
     assert list(dst.dependency) == ["fresh"]
+
+
+# ---------------------------------------------------------------------------
+# Audit 2026-11 Round 2: Finding 1 - Array PyList_New OOM amplification & max depth
+# ---------------------------------------------------------------------------
+@omnibuf_message
+class _AuditR2ScalarArrays:
+    u32s: list[Uint32] = omnibuf_field(1, default_factory=list)
+    f64s: list[float] = omnibuf_field(2, default_factory=list)
+    bools: list[bool] = omnibuf_field(3, default_factory=list)
+
+
+@omnibuf_message
+class _AuditR2Leaf:
+    x: Uint32 = omnibuf_field(1, default=0)
+
+
+@omnibuf_message
+class _AuditR2SubMsgArray:
+    items: list[_AuditR2Leaf] = omnibuf_field(1, default_factory=list)
+
+
+@omnibuf_message
+class _AuditR2SubMsgChain:
+    nxt: _AuditR2SubMsgChain | None = omnibuf_field(1, default=None)
+    items: list[_AuditR2Leaf] = omnibuf_field(2, default_factory=list)
+
+
+def test_audit_r2_f1_truncated_array_huge_count_no_oom() -> None:
+    """A 7-byte crafted array claiming count=4_194_304 with 0 element bytes must fail without OOM."""
+    import tracemalloc
+
+    huge_count = 4_194_304
+    # 1-byte tag + 1-byte container len (5) + 1-byte elem_wt + 4-byte varint count = 7 bytes
+    arr_body_u32 = bytes([WIRE_UINT]) + encode_varint(huge_count)
+    pkt_u32 = (
+        encode_tag(1, omnibuf_wire.WIRE_ARRAY) + encode_varint(len(arr_body_u32)) + arr_body_u32
+    )
+    assert len(pkt_u32) == 7
+
+    arr_body_sub = bytes([WIRE_SUB_MSG]) + encode_varint(huge_count)
+    pkt_sub = (
+        encode_tag(1, omnibuf_wire.WIRE_ARRAY) + encode_varint(len(arr_body_sub)) + arr_body_sub
+    )
+    assert len(pkt_sub) == 7
+
+    # Also test fixed-width element size check: count=2 for Float64 (8 bytes each) with only 8 bytes
+    arr_body_f64 = bytes([omnibuf_wire.WIRE_FLOAT64]) + encode_varint(2) + (b"\x00" * 8)
+    pkt_f64 = (
+        encode_tag(2, omnibuf_wire.WIRE_ARRAY) + encode_varint(len(arr_body_f64)) + arr_body_f64
+    )
+
+    tracemalloc.start()
+    try:
+        tracemalloc.reset_peak()
+        # Fast-slot scalar array path
+        with pytest.raises(OmniBufDecodeError):
+            omnibuf.unmarshal(pkt_u32, _AuditR2ScalarArrays)
+        # Slow / decode_slice_budget scalar array path (passing an instance forces decode_slice_budget)
+        with pytest.raises(OmniBufDecodeError):
+            omnibuf.unmarshal(pkt_u32, _AuditR2ScalarArrays())
+        # Fixed-width min_elem_bytes check (fast + slow paths)
+        with pytest.raises(OmniBufDecodeError):
+            omnibuf.unmarshal(pkt_f64, _AuditR2ScalarArrays)
+        with pytest.raises(OmniBufDecodeError):
+            omnibuf.unmarshal(pkt_f64, _AuditR2ScalarArrays())
+        # Fast-slot submsg array path
+        with pytest.raises(OmniBufDecodeError):
+            omnibuf.unmarshal(pkt_sub, _AuditR2SubMsgArray)
+        # Slow / decode_slice_budget submsg array path
+        with pytest.raises(OmniBufDecodeError):
+            omnibuf.unmarshal(pkt_sub, _AuditR2SubMsgArray())
+
+        _, peak = tracemalloc.get_traced_memory()
+        # 4_194_304 pointers would be ~33.5 MB; peak must stay tiny (< 1 MB)
+        assert peak < 1_000_000, f"Unexpectedly high allocation peak: {peak} bytes"
+    finally:
+        tracemalloc.stop()
+
+
+def test_audit_r2_f1_fast_submsg_array_max_depth() -> None:
+    """decode_fast_array_submsg_raw must reject non-empty submsg arrays at depth+2 > MAX_NESTING_DEPTH."""
+    # Innermost chain node at depth = MAX_NESTING_DEPTH - 1 (31):
+    # - Its array field is at depth + 1 = 32 (allowed)
+    # - A non-empty element inside that array is at depth + 2 = 33 (> 32 -> rejected)
+    arr_non_empty = bytes([WIRE_SUB_MSG]) + encode_varint(1) + encode_varint(0)
+    node_non_empty = (
+        encode_tag(2, omnibuf_wire.WIRE_ARRAY) + encode_varint(len(arr_non_empty)) + arr_non_empty
+    )
+    arr_empty = bytes([WIRE_SUB_MSG]) + encode_varint(0)
+    node_empty = encode_tag(2, omnibuf_wire.WIRE_ARRAY) + encode_varint(len(arr_empty)) + arr_empty
+
+    pkt_non_empty = node_non_empty
+    pkt_empty = node_empty
+    for _ in range(omnibuf_wire.MAX_NESTING_DEPTH - 1):
+        pkt_non_empty = (
+            encode_tag(1, WIRE_SUB_MSG) + encode_varint(len(pkt_non_empty)) + pkt_non_empty
+        )
+        pkt_empty = encode_tag(1, WIRE_SUB_MSG) + encode_varint(len(pkt_empty)) + pkt_empty
+
+    # Fast-slot path
+    with pytest.raises(OmniBufDecodeError):
+        omnibuf.unmarshal(pkt_non_empty, _AuditR2SubMsgChain)
+    # Slow path
+    with pytest.raises(OmniBufDecodeError):
+        omnibuf.unmarshal(pkt_non_empty, _AuditR2SubMsgChain())
+
+    # Empty submsg array at depth 31 (array depth 32, 0 elements) is valid
+    decoded = omnibuf.unmarshal(pkt_empty, _AuditR2SubMsgChain)
+    assert isinstance(decoded, _AuditR2SubMsgChain)
+
+
+# ---------------------------------------------------------------------------
+# Audit 2026-11 Round 2: Finding 2 & 3 - Long non-ASCII strings & large other scalar arrays
+# ---------------------------------------------------------------------------
+@omnibuf_message
+class _AuditR2StrMsg:
+    s: str = omnibuf_field(1, default="")
+
+
+def test_audit_r2_f2_long_ascii_and_non_ascii_strings() -> None:
+    """Fast-slot string decode handles >64B ASCII, >64B non-ASCII, and invalid >64B UTF-8."""
+    long_ascii = "a" * 128
+    long_utf8 = "日本語テスト🚀" * 16  # > 64 UTF-8 bytes
+    for text in ("", "x", "hi", "é" * 10, long_ascii, long_utf8):
+        raw = omnibuf.marshal(_AuditR2StrMsg(s=text))
+        got = omnibuf.unmarshal(raw, _AuditR2StrMsg)
+        assert got.s == text
+
+    bad_long_utf8 = b"a" * 70 + b"\xff\xfe"
+    bad_pkt = (
+        encode_tag(1, omnibuf_wire.WIRE_STRING) + encode_varint(len(bad_long_utf8)) + bad_long_utf8
+    )
+    with pytest.raises(OmniBufDecodeError):
+        omnibuf.unmarshal(bad_pkt, _AuditR2StrMsg)
+
+
+def test_audit_r2_f3_large_other_scalar_arrays_check_signals_path() -> None:
+    """Large (>4096) bool and float64 arrays exercise CHECK_SIGNALS=true in decode_fast_array_scalar_other."""
+    n = 5000
+    msg = _AuditR2ScalarArrays(
+        f64s=[float(i) * 0.5 for i in range(n)],
+        bools=[(i % 2) == 0 for i in range(n)],
+    )
+    raw = omnibuf.marshal(msg)
+    assert len(raw) >= 4096
+    got = omnibuf.unmarshal(raw, _AuditR2ScalarArrays)
+    assert got.f64s == msg.f64s
+    assert got.bools == msg.bools

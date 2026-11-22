@@ -32,11 +32,12 @@ dependencies = [
 
 [[package]]
 name = "omnibuf-py-ext"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "itoa",
  "omnibuf",
  "pyo3",
+ "pyo3-build-config",
  "ryu",
 ]
 

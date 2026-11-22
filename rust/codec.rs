@@ -29,11 +29,370 @@ thread_local! {
     static TLS_DC_CACHE: Cell<[(usize, usize, u64); 4]> = const { Cell::new([(0, 0, 0); 4]) };
 }
 
+#[cfg(not(any(Py_GIL_DISABLED, PyPy, GraalPy, Py_LIMITED_API)))]
 const HAS_GIL: bool = core::mem::size_of::<ffi::PyObject>() == 2 * core::mem::size_of::<usize>();
+#[cfg(any(Py_GIL_DISABLED, PyPy, GraalPy, Py_LIMITED_API))]
+const HAS_GIL: bool = false;
 
 static DATACLASS_CODECS: Mutex<Vec<(Py<PyType>, Py<CompiledCodec>)>> = Mutex::new(Vec::new());
 static DATACLASS_CACHE_EPOCH: AtomicU64 = AtomicU64::new(1);
 static DATACLASS_RESOLVER: OnceLock<Py<PyAny>> = OnceLock::new();
+
+#[inline(always)]
+unsafe fn decode_varint_ptr(cur: &mut *const u8, end: *const u8) -> Option<u64> {
+    unsafe {
+        let p = *cur;
+        if p >= end {
+            return None;
+        }
+        let b0 = *p;
+        if (b0 & 1) != 0 {
+            *cur = p.add(1);
+            return Some(u64::from(b0 >> 1));
+        }
+        let rem = (end as usize).wrapping_sub(p as usize);
+        if (b0 & 2) != 0 {
+            if rem < 2 {
+                return None;
+            }
+            let raw = core::ptr::read_unaligned(p.cast::<u16>());
+            *cur = p.add(2);
+            return Some(u64::from(u16::from_le(raw) >> 2));
+        }
+        if (b0 & 4) != 0 {
+            if rem < 4 {
+                return None;
+            }
+            let raw = core::ptr::read_unaligned(p.cast::<u32>());
+            *cur = p.add(4);
+            return Some(u64::from(u32::from_le(raw) >> 3));
+        }
+        if b0 == 0 {
+            if rem < 9 {
+                return None;
+            }
+            let raw = core::ptr::read_unaligned(p.add(1).cast::<u64>());
+            *cur = p.add(9);
+            return Some(u64::from_le(raw));
+        }
+        None
+    }
+}
+
+#[inline(always)]
+unsafe fn read_len_ptr(
+    cur: &mut *const u8,
+    end: *const u8,
+    min_len: usize,
+) -> Option<(*const u8, usize)> {
+    unsafe {
+        let p = *cur;
+        if p >= end {
+            return None;
+        }
+        let b0 = *p;
+        let (len, start) = if (b0 & 1) != 0 {
+            (usize::from(b0 >> 1), p.add(1))
+        } else {
+            let mut q = p;
+            let len_u64 = decode_varint_ptr(&mut q, end)?;
+            let len = usize::try_from(len_u64).ok()?;
+            (len, q)
+        };
+        if len < min_len || len > (end as usize).wrapping_sub(start as usize) {
+            return None;
+        }
+        *cur = start.add(len);
+        Some((start, len))
+    }
+}
+
+#[inline(always)]
+unsafe fn copy_and_check_ascii(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    unsafe {
+        #[cfg(target_pointer_width = "64")]
+        {
+            const MASK64: u64 = 0x8080_8080_8080_8080u64;
+            const MASK128: u128 = 0x8080_8080_8080_8080_8080_8080_8080_8080u128;
+            if len <= 64 {
+                if len >= 16 {
+                    let last_off = len - 16;
+                    let mut off = 0usize;
+                    let mut acc: u128 = 0;
+                    while off < last_off {
+                        let v = core::ptr::read_unaligned(src.add(off).cast::<u128>());
+                        core::ptr::write_unaligned(dst.add(off).cast::<u128>(), v);
+                        acc |= v;
+                        off += 16;
+                    }
+                    let v = core::ptr::read_unaligned(src.add(last_off).cast::<u128>());
+                    core::ptr::write_unaligned(dst.add(last_off).cast::<u128>(), v);
+                    acc |= v;
+                    return (acc & MASK128) == 0;
+                }
+                if len >= 8 {
+                    let a = core::ptr::read_unaligned(src.cast::<u64>());
+                    let b = core::ptr::read_unaligned(src.add(len - 8).cast::<u64>());
+                    core::ptr::write_unaligned(dst.cast::<u64>(), a);
+                    core::ptr::write_unaligned(dst.add(len - 8).cast::<u64>(), b);
+                    return ((a | b) & MASK64) == 0;
+                }
+                if len >= 4 {
+                    let a = core::ptr::read_unaligned(src.cast::<u32>());
+                    let b = core::ptr::read_unaligned(src.add(len - 4).cast::<u32>());
+                    core::ptr::write_unaligned(dst.cast::<u32>(), a);
+                    core::ptr::write_unaligned(dst.add(len - 4).cast::<u32>(), b);
+                    return ((a | b) & 0x8080_8080u32) == 0;
+                }
+                // len is 2 or 3 (since len <= 1 is handled before calling this)
+                let a = core::ptr::read_unaligned(src.cast::<u16>());
+                let b = core::ptr::read_unaligned(src.add(len - 2).cast::<u16>());
+                core::ptr::write_unaligned(dst.cast::<u16>(), a);
+                core::ptr::write_unaligned(dst.add(len - 2).cast::<u16>(), b);
+                ((a | b) & 0x8080u16) == 0
+            } else {
+                let slice = std::slice::from_raw_parts(src, len);
+                if !slice.is_ascii() {
+                    return false;
+                }
+                core::ptr::copy_nonoverlapping(src, dst, len);
+                true
+            }
+        }
+        #[cfg(not(target_pointer_width = "64"))]
+        {
+            let slice = std::slice::from_raw_parts(src, len);
+            if !slice.is_ascii() {
+                return false;
+            }
+            core::ptr::copy_nonoverlapping(src, dst, len);
+            true
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn py_str_from_utf8_short(
+    py: Python<'_>,
+    ptr: *const u8,
+    len: usize,
+    inner: &CodecInner,
+) -> *mut ffi::PyObject {
+    unsafe {
+        if len == 0 {
+            let empty_str = inner.empty_str.as_ptr();
+            ffi::Py_INCREF(empty_str);
+            return empty_str;
+        }
+        if *ptr < 0x80 {
+            return ffi::PyUnicode_FromStringAndSize(ptr.cast::<std::os::raw::c_char>(), 1);
+        }
+        py_str_from_utf8_non_ascii(py, ptr, len)
+    }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn py_str_from_utf8_non_ascii(
+    py: Python<'_>,
+    ptr: *const u8,
+    len: usize,
+) -> *mut ffi::PyObject {
+    unsafe {
+        let bytes = std::slice::from_raw_parts(ptr, len);
+        if let Err(e) = validate_utf8(bytes) {
+            decode_err(py, e.to_string()).restore(py);
+            return std::ptr::null_mut();
+        }
+        ffi::PyUnicode_FromStringAndSize(ptr.cast::<std::os::raw::c_char>(), len as ffi::Py_ssize_t)
+    }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn py_str_from_utf8_non_ascii_drop(
+    py: Python<'_>,
+    stale_obj: *mut ffi::PyObject,
+    ptr: *const u8,
+    len: usize,
+) -> *mut ffi::PyObject {
+    unsafe {
+        ffi::Py_DECREF(stale_obj);
+        py_str_from_utf8_non_ascii(py, ptr, len)
+    }
+}
+
+#[cfg(not(any(Py_GIL_DISABLED, PyPy, GraalPy, Py_LIMITED_API, Py_3_15)))]
+#[inline(always)]
+unsafe fn py_unicode_ascii_data(obj: *mut ffi::PyObject) -> *mut u8 {
+    unsafe { obj.cast::<ffi::PyASCIIObject>().add(1).cast::<u8>() }
+}
+
+#[cfg(all(any(Py_GIL_DISABLED, Py_3_15), not(any(PyPy, GraalPy, Py_LIMITED_API))))]
+#[inline(always)]
+unsafe fn py_unicode_ascii_data(obj: *mut ffi::PyObject) -> *mut u8 {
+    unsafe { ffi::PyUnicode_1BYTE_DATA(obj) }
+}
+
+#[inline(always)]
+unsafe fn py_str_from_utf8_raw(
+    py: Python<'_>,
+    ptr: *const u8,
+    len: usize,
+    inner: &CodecInner,
+) -> *mut ffi::PyObject {
+    unsafe {
+        if len <= 1 {
+            return py_str_from_utf8_short(py, ptr, len, inner);
+        }
+        #[cfg(any(PyPy, GraalPy, Py_LIMITED_API))]
+        {
+            let slice = std::slice::from_raw_parts(ptr, len);
+            if slice.is_ascii() {
+                return ffi::PyUnicode_FromStringAndSize(
+                    ptr.cast::<std::os::raw::c_char>(),
+                    len as ffi::Py_ssize_t,
+                );
+            }
+            return py_str_from_utf8_non_ascii(py, ptr, len);
+        }
+        #[cfg(not(any(PyPy, GraalPy, Py_LIMITED_API)))]
+        {
+            if len > 64 {
+                let slice = std::slice::from_raw_parts(ptr, len);
+                if !slice.is_ascii() {
+                    return py_str_from_utf8_non_ascii(py, ptr, len);
+                }
+                let obj = ffi::PyUnicode_New(len as ffi::Py_ssize_t, 127);
+                if obj.is_null() {
+                    return std::ptr::null_mut();
+                }
+                core::ptr::copy_nonoverlapping(ptr, py_unicode_ascii_data(obj), len);
+                return obj;
+            }
+            let obj = ffi::PyUnicode_New(len as ffi::Py_ssize_t, 127);
+            if obj.is_null() {
+                return std::ptr::null_mut();
+            }
+            if copy_and_check_ascii(ptr, py_unicode_ascii_data(obj), len) {
+                return obj;
+            }
+            py_str_from_utf8_non_ascii_drop(py, obj, ptr, len)
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn py_long_from_u32_raw(v: u32) -> *mut ffi::PyObject {
+    unsafe {
+        if std::mem::size_of::<std::os::raw::c_long>() >= 8 {
+            ffi::PyLong_FromLong(v as std::os::raw::c_long)
+        } else {
+            ffi::PyLong_FromUnsignedLong(v as std::os::raw::c_ulong)
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn py_long_from_i32_raw(v: i32) -> *mut ffi::PyObject {
+    unsafe { ffi::PyLong_FromLong(v as std::os::raw::c_long) }
+}
+
+#[inline(always)]
+unsafe fn py_long_from_u64_raw(v: u64) -> *mut ffi::PyObject {
+    unsafe {
+        if std::mem::size_of::<std::os::raw::c_long>() >= 8 && v <= i64::MAX as u64 {
+            ffi::PyLong_FromLong(v as std::os::raw::c_long)
+        } else {
+            ffi::PyLong_FromUnsignedLongLong(v)
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn py_long_from_i64_raw(v: i64) -> *mut ffi::PyObject {
+    unsafe {
+        if std::mem::size_of::<std::os::raw::c_long>() >= 8 {
+            ffi::PyLong_FromLong(v as std::os::raw::c_long)
+        } else {
+            ffi::PyLong_FromLongLong(v)
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn store_slot_replace(slot: *mut *mut ffi::PyObject, rv: *mut ffi::PyObject) {
+    unsafe {
+        let old = *slot;
+        *slot = rv;
+        ffi::Py_XDECREF(old);
+    }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn fail_decref(dst_ptr: *mut ffi::PyObject) -> *mut ffi::PyObject {
+    unsafe {
+        ffi::Py_DECREF(dst_ptr);
+        std::ptr::null_mut()
+    }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn fail_decref2(a: *mut ffi::PyObject, b: *mut ffi::PyObject) -> *mut ffi::PyObject {
+    unsafe {
+        ffi::Py_DECREF(a);
+        ffi::Py_DECREF(b);
+        std::ptr::null_mut()
+    }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn fail_decode_msg(
+    py: Python<'_>,
+    dst_ptr: *mut ffi::PyObject,
+    msg: &'static str,
+) -> *mut ffi::PyObject {
+    unsafe {
+        ffi::Py_DECREF(dst_ptr);
+        decode_err(py, msg).restore(py);
+        std::ptr::null_mut()
+    }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn fail_decode_err(
+    py: Python<'_>,
+    dst_ptr: *mut ffi::PyObject,
+    err: PyErr,
+) -> *mut ffi::PyObject {
+    unsafe {
+        ffi::Py_DECREF(dst_ptr);
+        err.restore(py);
+        std::ptr::null_mut()
+    }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn fail_decref2_msg(
+    py: Python<'_>,
+    a: *mut ffi::PyObject,
+    b: *mut ffi::PyObject,
+    msg: &'static str,
+) -> *mut ffi::PyObject {
+    unsafe {
+        ffi::Py_DECREF(a);
+        ffi::Py_DECREF(b);
+        decode_err(py, msg).restore(py);
+        std::ptr::null_mut()
+    }
+}
 
 #[inline(always)]
 fn decode_varint_fast(data: &[u8], pos: usize) -> Option<(u64, usize)> {
@@ -105,122 +464,6 @@ fn parse_array_header_fast(body: &[u8]) -> Option<(u8, usize, usize)> {
     let (count_u64, w) = decode_varint_fast(body, 1)?;
     let count = usize::try_from(count_u64).ok()?;
     Some((elem_wt, count, 1 + w))
-}
-
-#[inline(always)]
-unsafe fn py_str_from_utf8_fast(
-    py: Python<'_>,
-    bytes: &[u8],
-    empty_str: *mut ffi::PyObject,
-) -> PyResult<*mut ffi::PyObject> {
-    let len = bytes.len();
-    unsafe {
-        if len == 0 {
-            ffi::Py_INCREF(empty_str);
-            return Ok(empty_str);
-        }
-        if len == 1 && *bytes.get_unchecked(0) < 0x80 {
-            let ptr =
-                ffi::PyUnicode_FromStringAndSize(bytes.as_ptr().cast::<std::os::raw::c_char>(), 1);
-            if ptr.is_null() {
-                return Err(PyErr::fetch(py));
-            }
-            return Ok(ptr);
-        }
-        if bytes.is_ascii() {
-            let ptr = ffi::PyUnicode_New(len as ffi::Py_ssize_t, 127);
-            if ptr.is_null() {
-                return Err(PyErr::fetch(py));
-            }
-            core::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                ptr.cast::<ffi::PyASCIIObject>().add(1).cast::<u8>(),
-                len,
-            );
-            return Ok(ptr);
-        }
-        validate_utf8(bytes).map_err(|e| decode_err(py, e.to_string()))?;
-        let ptr = ffi::PyUnicode_FromStringAndSize(
-            bytes.as_ptr().cast::<std::os::raw::c_char>(),
-            len as ffi::Py_ssize_t,
-        );
-        if ptr.is_null() {
-            return Err(PyErr::fetch(py));
-        }
-        Ok(ptr)
-    }
-}
-
-#[inline(always)]
-unsafe fn py_long_from_u32(py: Python<'_>, v: u32) -> PyResult<*mut ffi::PyObject> {
-    unsafe {
-        let ptr = if std::mem::size_of::<std::os::raw::c_long>() >= 8 {
-            ffi::PyLong_FromLong(v as std::os::raw::c_long)
-        } else {
-            ffi::PyLong_FromUnsignedLong(v as std::os::raw::c_ulong)
-        };
-        if ptr.is_null() {
-            Err(PyErr::fetch(py))
-        } else {
-            Ok(ptr)
-        }
-    }
-}
-
-#[inline(always)]
-unsafe fn py_long_from_i32(py: Python<'_>, v: i32) -> PyResult<*mut ffi::PyObject> {
-    unsafe {
-        let ptr = ffi::PyLong_FromLong(v as std::os::raw::c_long);
-        if ptr.is_null() {
-            Err(PyErr::fetch(py))
-        } else {
-            Ok(ptr)
-        }
-    }
-}
-
-#[inline(always)]
-unsafe fn py_long_from_u64(py: Python<'_>, v: u64) -> PyResult<*mut ffi::PyObject> {
-    unsafe {
-        let ptr = if std::mem::size_of::<std::os::raw::c_long>() >= 8 && v <= i64::MAX as u64 {
-            ffi::PyLong_FromLong(v as std::os::raw::c_long)
-        } else {
-            ffi::PyLong_FromUnsignedLongLong(v)
-        };
-        if ptr.is_null() {
-            Err(PyErr::fetch(py))
-        } else {
-            Ok(ptr)
-        }
-    }
-}
-
-#[inline(always)]
-unsafe fn py_long_from_i64(py: Python<'_>, v: i64) -> PyResult<*mut ffi::PyObject> {
-    unsafe {
-        let ptr = if std::mem::size_of::<std::os::raw::c_long>() >= 8 {
-            ffi::PyLong_FromLong(v as std::os::raw::c_long)
-        } else {
-            ffi::PyLong_FromLongLong(v)
-        };
-        if ptr.is_null() {
-            Err(PyErr::fetch(py))
-        } else {
-            Ok(ptr)
-        }
-    }
-}
-
-#[inline(always)]
-unsafe fn py_float_from_f64(py: Python<'_>, v: f64) -> PyResult<*mut ffi::PyObject> {
-    unsafe {
-        let ptr = ffi::PyFloat_FromDouble(v);
-        if ptr.is_null() {
-            Err(PyErr::fetch(py))
-        } else {
-            Ok(ptr)
-        }
-    }
 }
 
 #[inline(always)]
@@ -815,11 +1058,15 @@ enum FastKind {
 #[derive(Clone, Copy)]
 struct FastDecodeField {
     slot_offset: u16,
+    expected_tag: u16,
+    tag_mask: u16,
+    tag_len: u8,
     kind: FastKind,
     wire_type: u8,
     elem_kind: ScalarKind,
     elem_wt: u8,
     has_enum_cls: bool,
+    sub_fast_decode: bool,
     sub_codec: *const CompiledCodec,
     sub_inner: *const CodecInner,
 }
@@ -830,18 +1077,22 @@ unsafe impl Send for FastDecodeField {}
 unsafe impl Sync for FastDecodeField {}
 
 struct CodecInner {
-    fields: Vec<FieldPlan>,
+    // Hot decode cache line (56 bytes):
+    tp_alloc_fn: ffi::allocfunc,
+    cls_ptr: *mut ffi::PyTypeObject,
     fast_decode_fields: Vec<FastDecodeField>,
-    fast_tag_map: [u8; 128],
+    all_seen_mask_64: u64,
+    fast_slot_decode: bool,
+    fast_slot_encode: bool,
+    fast_alloc: bool,
+    // Secondary / cold metadata:
+    fields: Vec<FieldPlan>,
+    fast_tag_map: [u8; 256],
     dense_by_num: Vec<u16>,
     field0_wire: Vec<u8>,
-    fast_alloc: bool,
-    fast_slot_encode: bool,
-    fast_slot_decode: bool,
     tp_alloc: Option<ffi::allocfunc>,
     empty_str: Py<PyString>,
     min_wire_reserve: usize,
-    all_seen_mask_64: u64,
     has_field_intern: Py<PyString>,
     clear_field_intern: Py<PyString>,
 }
@@ -3471,7 +3722,7 @@ impl CompiledCodec {
                 }
                 budget.consume(py, count)?;
                 let dict_any = if !already_seen {
-                    let d = PyDict::new(py).into_any();
+                    let d = unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyDict_New())? };
                     unsafe {
                         let d_ptr = d.as_ptr();
                         ffi::Py_INCREF(d_ptr);
@@ -3535,6 +3786,288 @@ impl CompiledCodec {
         }
     }
 
+    #[cold]
+    #[inline(never)]
+    unsafe fn decode_fast_slot_unknown_or_field0(
+        &self,
+        py: Python<'_>,
+        data_base: *const u8,
+        cur: *const u8,
+        end: *const u8,
+        tag: u64,
+        depth: usize,
+    ) -> PyResult<*const u8> {
+        let fnum = (tag >> 4) as u32;
+        let wt = (tag & 0x0F) as u8;
+        let data = unsafe {
+            std::slice::from_raw_parts(data_base, (end as usize).wrapping_sub(data_base as usize))
+        };
+        let pos = (cur as usize).wrapping_sub(data_base as usize);
+        if fnum == 0 {
+            if wt != WIRE_SUB_MSG {
+                return Err(decode_err(
+                    py,
+                    format!("omnibuf: Field #0 requires WireSubMsg (12), got {wt}"),
+                ));
+            }
+            let next_pos =
+                validate_field0_slice(data, pos, depth).map_err(|m| decode_err(py, m))?;
+            return Ok(unsafe { data_base.add(next_pos) });
+        }
+        let next_pos = validate_unknown_value(py, data, pos, wt, depth)?;
+        Ok(unsafe { data_base.add(next_pos) })
+    }
+
+    #[cold]
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn decode_fast_slot_slow_tag_val(
+        &self,
+        py: Python<'_>,
+        inner: &CodecInner,
+        data_base: *const u8,
+        cur: *const u8,
+        end: *const u8,
+        tag: u64,
+        depth: usize,
+    ) -> PyResult<Result<(usize, u8), *const u8>> {
+        if (tag >> 4) > omnibuf_core::wire::MAX_FIELD_NUMBER {
+            return Err(decode_err(
+                py,
+                "omnibuf: field number exceeds maximum 29-bit limit",
+            ));
+        }
+        let fnum = (tag >> 4) as u32;
+        let wt = (tag & 0x0F) as u8;
+        if fnum == 0 {
+            let next_cur = unsafe {
+                self.decode_fast_slot_unknown_or_field0(py, data_base, cur, end, tag, depth)?
+            };
+            return Ok(Err(next_cur));
+        }
+        let Some(idx) = lookup_field_index(inner, fnum) else {
+            let next_cur = unsafe {
+                self.decode_fast_slot_unknown_or_field0(py, data_base, cur, end, tag, depth)?
+            };
+            return Ok(Err(next_cur));
+        };
+        let fdf_chk = unsafe { inner.fast_decode_fields.get_unchecked(idx) };
+        let wt_ok = if fdf_chk.kind == FastKind::Bool {
+            wt == WIRE_BOOL_FALSE || wt == WIRE_BOOL_TRUE
+        } else {
+            fdf_chk.wire_type == wt
+        };
+        if !wt_ok {
+            let next_cur = unsafe {
+                self.decode_fast_slot_unknown_or_field0(py, data_base, cur, end, tag, depth)?
+            };
+            return Ok(Err(next_cur));
+        }
+        Ok(Ok((idx, wt)))
+    }
+
+    #[cold]
+    #[inline(never)]
+    unsafe fn decode_fast_slot_slow_tag(
+        &self,
+        py: Python<'_>,
+        inner: &CodecInner,
+        data_base: *const u8,
+        mut cur: *const u8,
+        end: *const u8,
+        depth: usize,
+    ) -> PyResult<Result<(usize, u8, *const u8), *const u8>> {
+        let Some(tag) = (unsafe { decode_varint_ptr(&mut cur, end) }) else {
+            let pos = (cur as usize).wrapping_sub(data_base as usize);
+            return Err(decode_err(
+                py,
+                format!("omnibuf: invalid or truncated tag at byte {pos}"),
+            ));
+        };
+        match unsafe {
+            self.decode_fast_slot_slow_tag_val(py, inner, data_base, cur, end, tag, depth)?
+        } {
+            Ok((idx, wt)) => Ok(Ok((idx, wt, cur))),
+            Err(next_cur) => Ok(Err(next_cur)),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn decode_fast_array_scalar_other<const CHECK_SIGNALS: bool>(
+        py: Python<'_>,
+        inner: &CodecInner,
+        f_idx: usize,
+        fdf: &FastDecodeField,
+        lp: *mut ffi::PyObject,
+        arr_body: &[u8],
+        mut p: usize,
+        count: usize,
+    ) -> PyResult<usize> {
+        let arr_len = arr_body.len();
+        unsafe {
+            match fdf.elem_kind {
+                ScalarKind::Bool => {
+                    if arr_len - p != count {
+                        return Err(decode_err(py, "omnibuf: invalid bool array byte length"));
+                    }
+                    for i in 0..count {
+                        if CHECK_SIGNALS && (i & 0xFFF) == 0xFFF {
+                            py.check_signals()?;
+                        }
+                        let b = *arr_body.get_unchecked(p + i);
+                        if b > 1 {
+                            return Err(decode_err(
+                                py,
+                                format!("omnibuf: invalid bool byte 0x{b:02x}"),
+                            ));
+                        }
+                        let bp = if b == 1 {
+                            ffi::Py_True()
+                        } else {
+                            ffi::Py_False()
+                        };
+                        ffi::Py_INCREF(bp);
+                        ffi::PyList_SET_ITEM(lp, i as ffi::Py_ssize_t, bp);
+                    }
+                    p += count;
+                }
+                ScalarKind::Float32 => {
+                    if Some(arr_len - p) != count.checked_mul(4) {
+                        return Err(decode_err(py, "omnibuf: truncated float32 array"));
+                    }
+                    for i in 0..count {
+                        if CHECK_SIGNALS && (i & 0xFFF) == 0xFFF {
+                            py.check_signals()?;
+                        }
+                        let bits = u32::from_le(core::ptr::read_unaligned(
+                            arr_body.as_ptr().add(p).cast::<u32>(),
+                        ));
+                        p += 4;
+                        let item_ptr = ffi::PyFloat_FromDouble(f64::from(f32::from_bits(bits)));
+                        if item_ptr.is_null() {
+                            return Err(PyErr::fetch(py));
+                        }
+                        ffi::PyList_SET_ITEM(lp, i as ffi::Py_ssize_t, item_ptr);
+                    }
+                }
+                ScalarKind::Float64 => {
+                    if Some(arr_len - p) != count.checked_mul(8) {
+                        return Err(decode_err(py, "omnibuf: truncated float64 array"));
+                    }
+                    for i in 0..count {
+                        if CHECK_SIGNALS && (i & 0xFFF) == 0xFFF {
+                            py.check_signals()?;
+                        }
+                        let bits = u64::from_le(core::ptr::read_unaligned(
+                            arr_body.as_ptr().add(p).cast::<u64>(),
+                        ));
+                        p += 8;
+                        let item_ptr = ffi::PyFloat_FromDouble(f64::from_bits(bits));
+                        if item_ptr.is_null() {
+                            return Err(PyErr::fetch(py));
+                        }
+                        ffi::PyList_SET_ITEM(lp, i as ffi::Py_ssize_t, item_ptr);
+                    }
+                }
+                ScalarKind::Fixed32 => {
+                    if Some(arr_len - p) != count.checked_mul(4) {
+                        return Err(decode_err(py, "omnibuf: truncated fixed32 array"));
+                    }
+                    for i in 0..count {
+                        if CHECK_SIGNALS && (i & 0xFFF) == 0xFFF {
+                            py.check_signals()?;
+                        }
+                        let u = u32::from_le(core::ptr::read_unaligned(
+                            arr_body.as_ptr().add(p).cast::<u32>(),
+                        ));
+                        p += 4;
+                        let item_ptr = py_long_from_u32_raw(u);
+                        if item_ptr.is_null() {
+                            return Err(PyErr::fetch(py));
+                        }
+                        ffi::PyList_SET_ITEM(lp, i as ffi::Py_ssize_t, item_ptr);
+                    }
+                }
+                ScalarKind::Sfixed32 => {
+                    if Some(arr_len - p) != count.checked_mul(4) {
+                        return Err(decode_err(py, "omnibuf: truncated sfixed32 array"));
+                    }
+                    for i in 0..count {
+                        if CHECK_SIGNALS && (i & 0xFFF) == 0xFFF {
+                            py.check_signals()?;
+                        }
+                        let v = i32::from_le(core::ptr::read_unaligned(
+                            arr_body.as_ptr().add(p).cast::<i32>(),
+                        ));
+                        p += 4;
+                        let item_ptr = py_long_from_i32_raw(v);
+                        if item_ptr.is_null() {
+                            return Err(PyErr::fetch(py));
+                        }
+                        ffi::PyList_SET_ITEM(lp, i as ffi::Py_ssize_t, item_ptr);
+                    }
+                }
+                ScalarKind::Fixed64 => {
+                    if Some(arr_len - p) != count.checked_mul(8) {
+                        return Err(decode_err(py, "omnibuf: truncated fixed64 array"));
+                    }
+                    for i in 0..count {
+                        if CHECK_SIGNALS && (i & 0xFFF) == 0xFFF {
+                            py.check_signals()?;
+                        }
+                        let u = u64::from_le(core::ptr::read_unaligned(
+                            arr_body.as_ptr().add(p).cast::<u64>(),
+                        ));
+                        p += 8;
+                        let item_ptr = py_long_from_u64_raw(u);
+                        if item_ptr.is_null() {
+                            return Err(PyErr::fetch(py));
+                        }
+                        ffi::PyList_SET_ITEM(lp, i as ffi::Py_ssize_t, item_ptr);
+                    }
+                }
+                ScalarKind::Sfixed64 => {
+                    if Some(arr_len - p) != count.checked_mul(8) {
+                        return Err(decode_err(py, "omnibuf: truncated sfixed64 array"));
+                    }
+                    for i in 0..count {
+                        if CHECK_SIGNALS && (i & 0xFFF) == 0xFFF {
+                            py.check_signals()?;
+                        }
+                        let v = i64::from_le(core::ptr::read_unaligned(
+                            arr_body.as_ptr().add(p).cast::<i64>(),
+                        ));
+                        p += 8;
+                        let item_ptr = py_long_from_i64_raw(v);
+                        if item_ptr.is_null() {
+                            return Err(PyErr::fetch(py));
+                        }
+                        ffi::PyList_SET_ITEM(lp, i as ffi::Py_ssize_t, item_ptr);
+                    }
+                }
+                _ => {
+                    let fp = inner.fields.get_unchecked(f_idx);
+                    let enum_cls = match &fp.kind {
+                        FieldPlanKind::ArrayScalar { enum_cls, .. } => enum_cls.as_ref(),
+                        _ => None,
+                    };
+                    for i in 0..count {
+                        if CHECK_SIGNALS && (i & 0xFFF) == 0xFFF {
+                            py.check_signals()?;
+                        }
+                        let (item, next_p) =
+                            read_scalar_payload(py, arr_body, p, fdf.elem_kind, enum_cls, None)?;
+                        p = next_p;
+                        ffi::PyList_SET_ITEM(lp, i as ffi::Py_ssize_t, item.into_ptr());
+                    }
+                }
+            }
+        }
+        Ok(p)
+    }
+
     #[inline(always)]
     unsafe fn try_decode_pure_fast_slots_dispatch<'py>(
         &self,
@@ -3544,182 +4077,1156 @@ impl CompiledCodec {
         depth: usize,
         budget: &mut DecodeBudget,
     ) -> PyResult<Bound<'py, PyAny>> {
-        if data.len() < 4096 {
-            unsafe { self.try_decode_pure_fast_slots_impl::<false>(py, inner, data, depth, budget) }
-        } else {
-            unsafe { self.try_decode_pure_fast_slots_impl::<true>(py, inner, data, depth, budget) }
+        unsafe {
+            let start = data.as_ptr();
+            let end = start.add(data.len());
+            let raw = if data.len() < 4096 {
+                self.decode_fast_slots_raw::<false>(py, inner, start, end, depth, budget)
+            } else {
+                self.decode_fast_slots_raw::<true>(py, inner, start, end, depth, budget)
+            };
+            Bound::from_owned_ptr_or_err(py, raw)
         }
     }
 
-    #[inline]
-    unsafe fn try_decode_pure_fast_slots_impl<'py, const CHECK_SIGNALS: bool>(
-        &self,
-        py: Python<'py>,
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn decode_fast_array_scalar_raw<const CHECK_SIGNALS: bool>(
+        py: Python<'_>,
         inner: &CodecInner,
-        data: &[u8],
+        f_idx: usize,
+        fdf: &FastDecodeField,
+        dst_ptr: *mut ffi::PyObject,
+        cur: &mut *const u8,
+        end: *const u8,
         depth: usize,
         budget: &mut DecodeBudget,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let inst = self.alloc_raw_slot_instance_with(py, inner)?;
-        let dst_ptr = inst.as_ptr();
-        let empty_str = inner.empty_str.as_ptr();
-        let mut seen_64: u64 = 0;
-        let mut pos = 0usize;
-        let n = data.len();
-        let mut step = 0usize;
-
-        while pos < n {
-            if CHECK_SIGNALS {
-                step += 1;
-                if (step & 0xFFF) == 0 {
-                    py.check_signals()?;
-                }
-            }
-            let b0 = unsafe { *data.get_unchecked(pos) };
-            let (f_idx, wt): (usize, u8) = if (b0 & 1) != 0 {
-                let tag = usize::from(b0 >> 1);
-                let mapped = unsafe { *inner.fast_tag_map.get_unchecked(tag) };
-                pos += 1;
-                if mapped != u8::MAX {
-                    (usize::from(mapped), (tag & 0x0F) as u8)
-                } else {
-                    let fnum = (tag >> 4) as u32;
-                    let wt = (tag & 0x0F) as u8;
-                    if fnum == 0 {
-                        if wt != WIRE_SUB_MSG {
-                            return Err(decode_err(
-                                py,
-                                format!("omnibuf: Field #0 requires WireSubMsg (12), got {wt}"),
-                            ));
-                        }
-                        pos = validate_field0_slice(data, pos, depth)
-                            .map_err(|m| decode_err(py, m))?;
-                        continue;
-                    }
-                    pos = validate_unknown_value(py, data, pos, wt, depth)?;
-                    continue;
-                }
-            } else {
-                let (tag, tn) = decode_varint_fast(data, pos).ok_or_else(|| {
+    ) -> *mut ffi::PyObject {
+        unsafe {
+            if depth + 1 > MAX_NESTING_DEPTH {
+                return fail_decode_err(
+                    py,
+                    dst_ptr,
                     decode_err(
                         py,
-                        format!("omnibuf: invalid or truncated tag at byte {pos}"),
-                    )
-                })?;
-                if (tag >> 4) > omnibuf_core::wire::MAX_FIELD_NUMBER {
-                    return Err(decode_err(
+                        format!(
+                            "omnibuf: array nesting depth {} exceeds {MAX_NESTING_DEPTH}",
+                            depth + 1
+                        ),
+                    ),
+                );
+            }
+            let Some((arr_start, arr_len)) = read_len_ptr(cur, end, 2) else {
+                return fail_decode_msg(
+                    py,
+                    dst_ptr,
+                    "omnibuf: unexpected EOF reading length-prefixed value",
+                );
+            };
+            if *arr_start != fdf.elem_wt {
+                return fail_decode_msg(py, dst_ptr, "omnibuf: invalid array element wire type");
+            }
+            let mut p = arr_start.add(1);
+            let arr_end = arr_start.add(arr_len);
+            let Some(count_u64) = decode_varint_ptr(&mut p, arr_end) else {
+                return fail_decode_msg(py, dst_ptr, "omnibuf: invalid array header");
+            };
+            let Ok(count) = usize::try_from(count_u64) else {
+                return fail_decode_msg(py, dst_ptr, "omnibuf: invalid array header");
+            };
+            let rem = (arr_end as usize).wrapping_sub(p as usize);
+            let min_elem_bytes = scalar_elem_min_wire_bytes(fdf.elem_kind);
+            if count > rem / min_elem_bytes {
+                return fail_decode_msg(py, dst_ptr, "omnibuf: truncated array payload");
+            }
+            if count > budget.remaining {
+                return fail_decode_err(
+                    py,
+                    dst_ptr,
+                    decode_err(
                         py,
-                        "omnibuf: field number exceeds maximum 29-bit limit",
-                    ));
-                }
-                pos += tn;
-                let fnum = (tag >> 4) as u32;
-                let wt = (tag & 0x0F) as u8;
-
-                if fnum == 0 {
-                    if wt != WIRE_SUB_MSG {
-                        return Err(decode_err(
-                            py,
-                            format!("omnibuf: Field #0 requires WireSubMsg (12), got {wt}"),
-                        ));
+                        format!(
+                            "omnibuf: container element count exceeds max_elements budget ({})",
+                            budget.limit
+                        ),
+                    ),
+                );
+            }
+            budget.remaining -= count;
+            let lp = ffi::PyList_New(count as ffi::Py_ssize_t);
+            if lp.is_null() {
+                return fail_decref(dst_ptr);
+            }
+            match fdf.elem_kind {
+                ScalarKind::Uint32 => {
+                    for i in 0..count {
+                        if CHECK_SIGNALS
+                            && (i & 0xFFF) == 0xFFF
+                            && let Err(err) = py.check_signals()
+                        {
+                            ffi::Py_DECREF(lp);
+                            return fail_decode_err(py, dst_ptr, err);
+                        }
+                        let Some(v) = decode_varint_ptr(&mut p, arr_end) else {
+                            return fail_decref2_msg(
+                                py,
+                                lp,
+                                dst_ptr,
+                                "omnibuf: invalid uint32 varint",
+                            );
+                        };
+                        let item_ptr = py_long_from_u32_raw(v as u32);
+                        if item_ptr.is_null() {
+                            return fail_decref2(lp, dst_ptr);
+                        }
+                        ffi::PyList_SET_ITEM(lp, i as ffi::Py_ssize_t, item_ptr);
                     }
-                    pos = validate_field0_slice(data, pos, depth).map_err(|m| decode_err(py, m))?;
-                    continue;
                 }
-
-                let Some(idx) = lookup_field_index(inner, fnum) else {
-                    pos = validate_unknown_value(py, data, pos, wt, depth)?;
-                    continue;
-                };
-                let fdf_chk = unsafe { inner.fast_decode_fields.get_unchecked(idx) };
-                let wt_ok = if fdf_chk.kind == FastKind::Bool {
-                    wt == WIRE_BOOL_FALSE || wt == WIRE_BOOL_TRUE
-                } else {
-                    fdf_chk.wire_type == wt
-                };
-                if !wt_ok {
-                    pos = validate_unknown_value(py, data, pos, wt, depth)?;
-                    continue;
+                ScalarKind::Uint64 => {
+                    for i in 0..count {
+                        if CHECK_SIGNALS
+                            && (i & 0xFFF) == 0xFFF
+                            && let Err(err) = py.check_signals()
+                        {
+                            ffi::Py_DECREF(lp);
+                            return fail_decode_err(py, dst_ptr, err);
+                        }
+                        let Some(v) = decode_varint_ptr(&mut p, arr_end) else {
+                            return fail_decref2_msg(
+                                py,
+                                lp,
+                                dst_ptr,
+                                "omnibuf: invalid uint64 varint",
+                            );
+                        };
+                        let item_ptr = py_long_from_u64_raw(v);
+                        if item_ptr.is_null() {
+                            return fail_decref2(lp, dst_ptr);
+                        }
+                        ffi::PyList_SET_ITEM(lp, i as ffi::Py_ssize_t, item_ptr);
+                    }
                 }
-                (idx, wt)
-            };
-
-            let fdf = unsafe { inner.fast_decode_fields.get_unchecked(f_idx) };
-            let bit = 1u64 << f_idx;
-            let already_seen = (seen_64 & bit) != 0;
-            seen_64 |= bit;
-
-            let slot = unsafe {
-                dst_ptr
-                    .byte_add(usize::from(fdf.slot_offset))
-                    .cast::<*mut ffi::PyObject>()
-            };
-
-            macro_rules! store_slot {
-                ($raw_val:expr) => {
-                    unsafe {
-                        let rv: *mut ffi::PyObject = $raw_val;
-                        if !already_seen {
-                            *slot = rv;
-                        } else {
-                            let old = *slot;
-                            *slot = rv;
-                            ffi::Py_XDECREF(old);
+                ScalarKind::Sint32 => {
+                    for i in 0..count {
+                        if CHECK_SIGNALS
+                            && (i & 0xFFF) == 0xFFF
+                            && let Err(err) = py.check_signals()
+                        {
+                            ffi::Py_DECREF(lp);
+                            return fail_decode_err(py, dst_ptr, err);
+                        }
+                        let Some(v) = decode_varint_ptr(&mut p, arr_end) else {
+                            return fail_decref2_msg(
+                                py,
+                                lp,
+                                dst_ptr,
+                                "omnibuf: invalid sint32 varint",
+                            );
+                        };
+                        let item_ptr = py_long_from_i32_raw(decode_zigzag(v) as i32);
+                        if item_ptr.is_null() {
+                            return fail_decref2(lp, dst_ptr);
+                        }
+                        ffi::PyList_SET_ITEM(lp, i as ffi::Py_ssize_t, item_ptr);
+                    }
+                }
+                ScalarKind::Sint64 => {
+                    for i in 0..count {
+                        if CHECK_SIGNALS
+                            && (i & 0xFFF) == 0xFFF
+                            && let Err(err) = py.check_signals()
+                        {
+                            ffi::Py_DECREF(lp);
+                            return fail_decode_err(py, dst_ptr, err);
+                        }
+                        let Some(v) = decode_varint_ptr(&mut p, arr_end) else {
+                            return fail_decref2_msg(
+                                py,
+                                lp,
+                                dst_ptr,
+                                "omnibuf: invalid sint64 varint",
+                            );
+                        };
+                        let item_ptr = py_long_from_i64_raw(decode_zigzag(v));
+                        if item_ptr.is_null() {
+                            return fail_decref2(lp, dst_ptr);
+                        }
+                        ffi::PyList_SET_ITEM(lp, i as ffi::Py_ssize_t, item_ptr);
+                    }
+                }
+                ScalarKind::String | ScalarKind::StrAsBytes => {
+                    for i in 0..count {
+                        if CHECK_SIGNALS
+                            && (i & 0xFFF) == 0xFFF
+                            && let Err(err) = py.check_signals()
+                        {
+                            ffi::Py_DECREF(lp);
+                            return fail_decode_err(py, dst_ptr, err);
+                        }
+                        let Some((s_ptr, s_len)) = read_len_ptr(&mut p, arr_end, 0) else {
+                            return fail_decref2_msg(
+                                py,
+                                lp,
+                                dst_ptr,
+                                "omnibuf: unexpected EOF reading length-prefixed value",
+                            );
+                        };
+                        let item_ptr = py_str_from_utf8_raw(py, s_ptr, s_len, inner);
+                        if item_ptr.is_null() {
+                            return fail_decref2(lp, dst_ptr);
+                        }
+                        ffi::PyList_SET_ITEM(lp, i as ffi::Py_ssize_t, item_ptr);
+                    }
+                }
+                _ => {
+                    let arr_body = std::slice::from_raw_parts(arr_start, arr_len);
+                    let p_off = (p as usize).wrapping_sub(arr_start as usize);
+                    match Self::decode_fast_array_scalar_other::<CHECK_SIGNALS>(
+                        py, inner, f_idx, fdf, lp, arr_body, p_off, count,
+                    ) {
+                        Ok(next_off) => p = arr_start.add(next_off),
+                        Err(err) => {
+                            ffi::Py_DECREF(lp);
+                            return fail_decode_err(py, dst_ptr, err);
                         }
                     }
-                };
+                }
             }
+            if p != arr_end {
+                return fail_decref2_msg(py, lp, dst_ptr, "omnibuf: trailing array bytes");
+            }
+            lp
+        }
+    }
 
-            match fdf.kind {
-                FastKind::Bool => {
-                    let b_ptr = unsafe {
-                        let p = if wt == WIRE_BOOL_TRUE {
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn decode_fast_array_submsg_raw<const CHECK_SIGNALS: bool>(
+        py: Python<'_>,
+        fdf: &FastDecodeField,
+        dst_ptr: *mut ffi::PyObject,
+        cur: &mut *const u8,
+        end: *const u8,
+        depth: usize,
+        budget: &mut DecodeBudget,
+    ) -> *mut ffi::PyObject {
+        unsafe {
+            if depth + 1 > MAX_NESTING_DEPTH {
+                return fail_decode_err(
+                    py,
+                    dst_ptr,
+                    decode_err(
+                        py,
+                        format!(
+                            "omnibuf: array nesting depth {} exceeds {MAX_NESTING_DEPTH}",
+                            depth + 1
+                        ),
+                    ),
+                );
+            }
+            let Some((arr_start, arr_len)) = read_len_ptr(cur, end, 2) else {
+                return fail_decode_msg(
+                    py,
+                    dst_ptr,
+                    "omnibuf: unexpected EOF reading length-prefixed value",
+                );
+            };
+            if *arr_start != WIRE_SUB_MSG {
+                return fail_decode_msg(py, dst_ptr, "omnibuf: invalid submsg array header");
+            }
+            let mut p = arr_start.add(1);
+            let arr_end = arr_start.add(arr_len);
+            let Some(count_u64) = decode_varint_ptr(&mut p, arr_end) else {
+                return fail_decode_msg(py, dst_ptr, "omnibuf: invalid submsg array header");
+            };
+            let Ok(count) = usize::try_from(count_u64) else {
+                return fail_decode_msg(py, dst_ptr, "omnibuf: invalid submsg array header");
+            };
+            let rem = (arr_end as usize).wrapping_sub(p as usize);
+            if count > rem {
+                return fail_decode_msg(py, dst_ptr, "omnibuf: truncated submsg array payload");
+            }
+            if count > 0 && depth + 2 > MAX_NESTING_DEPTH {
+                return fail_decode_err(
+                    py,
+                    dst_ptr,
+                    decode_err(
+                        py,
+                        format!(
+                            "omnibuf: nesting depth {} exceeds {MAX_NESTING_DEPTH}",
+                            depth + 2
+                        ),
+                    ),
+                );
+            }
+            if count > budget.remaining {
+                return fail_decode_err(
+                    py,
+                    dst_ptr,
+                    decode_err(
+                        py,
+                        format!(
+                            "omnibuf: container element count exceeds max_elements budget ({})",
+                            budget.limit
+                        ),
+                    ),
+                );
+            }
+            budget.remaining -= count;
+            let lp = ffi::PyList_New(count as ffi::Py_ssize_t);
+            if lp.is_null() {
+                return fail_decref(dst_ptr);
+            }
+            if count > 0 {
+                let sub_c = &*fdf.sub_codec;
+                if fdf.sub_fast_decode {
+                    let sub_inner = &*fdf.sub_inner;
+                    for i in 0..count {
+                        if CHECK_SIGNALS
+                            && (i & 0xFFF) == 0xFFF
+                            && let Err(err) = py.check_signals()
+                        {
+                            ffi::Py_DECREF(lp);
+                            return fail_decode_err(py, dst_ptr, err);
+                        }
+                        let Some((elem_ptr, elem_len)) = read_len_ptr(&mut p, arr_end, 0) else {
+                            return fail_decref2_msg(
+                                py,
+                                lp,
+                                dst_ptr,
+                                "omnibuf: unexpected EOF reading length-prefixed value",
+                            );
+                        };
+                        let elem_end = elem_ptr.add(elem_len);
+                        let elem_obj = if !CHECK_SIGNALS || elem_len < 4096 {
+                            sub_c.decode_fast_slots_raw::<false>(
+                                py,
+                                sub_inner,
+                                elem_ptr,
+                                elem_end,
+                                depth + 2,
+                                budget,
+                            )
+                        } else {
+                            sub_c.decode_fast_slots_raw::<true>(
+                                py,
+                                sub_inner,
+                                elem_ptr,
+                                elem_end,
+                                depth + 2,
+                                budget,
+                            )
+                        };
+                        if elem_obj.is_null() {
+                            return fail_decref2(lp, dst_ptr);
+                        }
+                        ffi::PyList_SET_ITEM(lp, i as ffi::Py_ssize_t, elem_obj);
+                    }
+                } else {
+                    for i in 0..count {
+                        if CHECK_SIGNALS
+                            && (i & 0xFFF) == 0xFFF
+                            && let Err(err) = py.check_signals()
+                        {
+                            ffi::Py_DECREF(lp);
+                            return fail_decode_err(py, dst_ptr, err);
+                        }
+                        let Some((elem_ptr, elem_len)) = read_len_ptr(&mut p, arr_end, 0) else {
+                            return fail_decref2_msg(
+                                py,
+                                lp,
+                                dst_ptr,
+                                "omnibuf: unexpected EOF reading length-prefixed value",
+                            );
+                        };
+                        let elem_slice = std::slice::from_raw_parts(elem_ptr, elem_len);
+                        let elem_obj = match sub_c.decode_slice_budget(
+                            py,
+                            elem_slice,
+                            None,
+                            depth + 2,
+                            false,
+                            budget,
+                            None,
+                        ) {
+                            Ok(o) => o.into_ptr(),
+                            Err(err) => {
+                                ffi::Py_DECREF(lp);
+                                return fail_decode_err(py, dst_ptr, err);
+                            }
+                        };
+                        ffi::PyList_SET_ITEM(lp, i as ffi::Py_ssize_t, elem_obj);
+                    }
+                }
+            }
+            if p != arr_end {
+                return fail_decref2_msg(py, lp, dst_ptr, "omnibuf: trailing submsg array bytes");
+            }
+            lp
+        }
+    }
+
+    #[inline(never)]
+    unsafe fn decode_fast_slots_raw<const CHECK_SIGNALS: bool>(
+        &self,
+        py: Python<'_>,
+        inner: &CodecInner,
+        data_base: *const u8,
+        end: *const u8,
+        depth: usize,
+        budget: &mut DecodeBudget,
+    ) -> *mut ffi::PyObject {
+        unsafe {
+            let dst_ptr = (inner.tp_alloc_fn)(inner.cls_ptr, 0);
+            if dst_ptr.is_null() {
+                return std::ptr::null_mut();
+            }
+            let mut cur = data_base;
+
+            // Sequential in-order fast path: avoids fast_tag_map lookup, seen_64 bitmask
+            // updates, and already_seen checks for canonical field-ordered wire payloads.
+            for (f_idx, fdf) in inner.fast_decode_fields.iter().enumerate() {
+                if cur >= end {
+                    let seen_64 = (1u64 << f_idx) - 1;
+                    if seen_64 != inner.all_seen_mask_64
+                        && let Err(err) =
+                            self.decode_fast_slot_missing_defaults(py, inner, dst_ptr, seen_64)
+                    {
+                        return fail_decode_err(py, dst_ptr, err);
+                    }
+                    return dst_ptr;
+                }
+                let tag_raw: u16;
+                if fdf.tag_len == 1 {
+                    tag_raw = u16::from(*cur);
+                    if (tag_raw & fdf.tag_mask) != fdf.expected_tag {
+                        return self.decode_fast_slots_general::<CHECK_SIGNALS>(
+                            py,
+                            inner,
+                            dst_ptr,
+                            data_base,
+                            cur,
+                            end,
+                            depth,
+                            budget,
+                            (1u64 << f_idx) - 1,
+                        );
+                    }
+                    cur = cur.add(1);
+                } else if fdf.tag_len == 2 && (end as usize).wrapping_sub(cur as usize) >= 2 {
+                    tag_raw = u16::from_le(core::ptr::read_unaligned(cur.cast::<u16>()));
+                    if (tag_raw & fdf.tag_mask) != fdf.expected_tag {
+                        return self.decode_fast_slots_general::<CHECK_SIGNALS>(
+                            py,
+                            inner,
+                            dst_ptr,
+                            data_base,
+                            cur,
+                            end,
+                            depth,
+                            budget,
+                            (1u64 << f_idx) - 1,
+                        );
+                    }
+                    cur = cur.add(2);
+                } else {
+                    return self.decode_fast_slots_general::<CHECK_SIGNALS>(
+                        py,
+                        inner,
+                        dst_ptr,
+                        data_base,
+                        cur,
+                        end,
+                        depth,
+                        budget,
+                        (1u64 << f_idx) - 1,
+                    );
+                }
+
+                let slot = dst_ptr
+                    .byte_add(usize::from(fdf.slot_offset))
+                    .cast::<*mut ffi::PyObject>();
+
+                macro_rules! store_fresh {
+                    ($raw_val:expr) => {
+                        let rv: *mut ffi::PyObject = $raw_val;
+                        if rv.is_null() {
+                            return fail_decref(dst_ptr);
+                        }
+                        *slot = rv;
+                    };
+                }
+
+                match fdf.kind {
+                    FastKind::Bool => {
+                        let b_ptr = if (tag_raw & !fdf.tag_mask) != 0 {
                             ffi::Py_True()
                         } else {
                             ffi::Py_False()
                         };
-                        ffi::Py_INCREF(p);
-                        p
-                    };
-                    store_slot!(b_ptr);
+                        ffi::Py_INCREF(b_ptr);
+                        *slot = b_ptr;
+                    }
+                    FastKind::Uint32 => {
+                        let Some(v) = decode_varint_ptr(&mut cur, end) else {
+                            return fail_decode_msg(py, dst_ptr, "omnibuf: invalid uint32 varint");
+                        };
+                        store_fresh!(py_long_from_u32_raw(v as u32));
+                    }
+                    FastKind::Uint64 => {
+                        let Some(v) = decode_varint_ptr(&mut cur, end) else {
+                            return fail_decode_msg(py, dst_ptr, "omnibuf: invalid uint64 varint");
+                        };
+                        store_fresh!(py_long_from_u64_raw(v));
+                    }
+                    FastKind::Sint32 => {
+                        let Some(v) = decode_varint_ptr(&mut cur, end) else {
+                            return fail_decode_msg(py, dst_ptr, "omnibuf: invalid sint32 varint");
+                        };
+                        store_fresh!(py_long_from_i32_raw(decode_zigzag(v) as i32));
+                    }
+                    FastKind::Sint64 => {
+                        let Some(v) = decode_varint_ptr(&mut cur, end) else {
+                            return fail_decode_msg(py, dst_ptr, "omnibuf: invalid sint64 varint");
+                        };
+                        store_fresh!(py_long_from_i64_raw(decode_zigzag(v)));
+                    }
+                    FastKind::Float32 => {
+                        if (end as usize).wrapping_sub(cur as usize) < 4 {
+                            return fail_decode_msg(py, dst_ptr, "omnibuf: truncated float32");
+                        }
+                        let bits = u32::from_le(core::ptr::read_unaligned(cur.cast::<u32>()));
+                        cur = cur.add(4);
+                        store_fresh!(ffi::PyFloat_FromDouble(f64::from(f32::from_bits(bits))));
+                    }
+                    FastKind::Float64 => {
+                        if (end as usize).wrapping_sub(cur as usize) < 8 {
+                            return fail_decode_msg(py, dst_ptr, "omnibuf: truncated float64");
+                        }
+                        let bits = u64::from_le(core::ptr::read_unaligned(cur.cast::<u64>()));
+                        cur = cur.add(8);
+                        store_fresh!(ffi::PyFloat_FromDouble(f64::from_bits(bits)));
+                    }
+                    FastKind::String => {
+                        let Some((s_ptr, s_len)) = read_len_ptr(&mut cur, end, 0) else {
+                            return fail_decode_msg(
+                                py,
+                                dst_ptr,
+                                "omnibuf: unexpected EOF reading length-prefixed value",
+                            );
+                        };
+                        store_fresh!(py_str_from_utf8_raw(py, s_ptr, s_len, inner));
+                    }
+                    FastKind::SubMsg => {
+                        let Some((sub_ptr, sub_len)) = read_len_ptr(&mut cur, end, 0) else {
+                            return fail_decode_msg(
+                                py,
+                                dst_ptr,
+                                "omnibuf: unexpected EOF reading length-prefixed value",
+                            );
+                        };
+                        if depth + 1 > MAX_NESTING_DEPTH {
+                            return fail_decode_err(
+                                py,
+                                dst_ptr,
+                                decode_err(
+                                    py,
+                                    format!(
+                                        "omnibuf: nesting depth {} exceeds {MAX_NESTING_DEPTH}",
+                                        depth + 1
+                                    ),
+                                ),
+                            );
+                        }
+                        let sub_c = &*fdf.sub_codec;
+                        let sub_raw = if fdf.sub_fast_decode {
+                            let sub_inner = &*fdf.sub_inner;
+                            let sub_end = sub_ptr.add(sub_len);
+                            if !CHECK_SIGNALS || sub_len < 4096 {
+                                sub_c.decode_fast_slots_raw::<false>(
+                                    py,
+                                    sub_inner,
+                                    sub_ptr,
+                                    sub_end,
+                                    depth + 1,
+                                    budget,
+                                )
+                            } else {
+                                sub_c.decode_fast_slots_raw::<true>(
+                                    py,
+                                    sub_inner,
+                                    sub_ptr,
+                                    sub_end,
+                                    depth + 1,
+                                    budget,
+                                )
+                            }
+                        } else {
+                            let sub_slice = std::slice::from_raw_parts(sub_ptr, sub_len);
+                            match sub_c.decode_slice_budget(
+                                py,
+                                sub_slice,
+                                None,
+                                depth + 1,
+                                false,
+                                budget,
+                                None,
+                            ) {
+                                Ok(obj) => obj.into_ptr(),
+                                Err(err) => return fail_decode_err(py, dst_ptr, err),
+                            }
+                        };
+                        if sub_raw.is_null() {
+                            return fail_decref(dst_ptr);
+                        }
+                        *slot = sub_raw;
+                    }
+                    FastKind::ArrayScalar => {
+                        let lp = Self::decode_fast_array_scalar_raw::<CHECK_SIGNALS>(
+                            py, inner, f_idx, fdf, dst_ptr, &mut cur, end, depth, budget,
+                        );
+                        if lp.is_null() {
+                            return std::ptr::null_mut();
+                        }
+                        *slot = lp;
+                    }
+                    FastKind::ArraySubMsg => {
+                        let lp = Self::decode_fast_array_submsg_raw::<CHECK_SIGNALS>(
+                            py, fdf, dst_ptr, &mut cur, end, depth, budget,
+                        );
+                        if lp.is_null() {
+                            return std::ptr::null_mut();
+                        }
+                        *slot = lp;
+                    }
+                    FastKind::Fixed32 => {
+                        if (end as usize).wrapping_sub(cur as usize) < 4 {
+                            return fail_decode_msg(py, dst_ptr, "omnibuf: truncated fixed32");
+                        }
+                        let u = u32::from_le(core::ptr::read_unaligned(cur.cast::<u32>()));
+                        cur = cur.add(4);
+                        store_fresh!(py_long_from_u32_raw(u));
+                    }
+                    FastKind::Sfixed32 => {
+                        if (end as usize).wrapping_sub(cur as usize) < 4 {
+                            return fail_decode_msg(py, dst_ptr, "omnibuf: truncated sfixed32");
+                        }
+                        let i = i32::from_le(core::ptr::read_unaligned(cur.cast::<i32>()));
+                        cur = cur.add(4);
+                        store_fresh!(py_long_from_i32_raw(i));
+                    }
+                    FastKind::Fixed64 => {
+                        if (end as usize).wrapping_sub(cur as usize) < 8 {
+                            return fail_decode_msg(py, dst_ptr, "omnibuf: truncated fixed64");
+                        }
+                        let u = u64::from_le(core::ptr::read_unaligned(cur.cast::<u64>()));
+                        cur = cur.add(8);
+                        store_fresh!(py_long_from_u64_raw(u));
+                    }
+                    FastKind::Sfixed64 => {
+                        if (end as usize).wrapping_sub(cur as usize) < 8 {
+                            return fail_decode_msg(py, dst_ptr, "omnibuf: truncated sfixed64");
+                        }
+                        let i = i64::from_le(core::ptr::read_unaligned(cur.cast::<i64>()));
+                        cur = cur.add(8);
+                        store_fresh!(py_long_from_i64_raw(i));
+                    }
+                    FastKind::Bytes => {
+                        let Some((b_ptr, b_len)) = read_len_ptr(&mut cur, end, 0) else {
+                            return fail_decode_msg(
+                                py,
+                                dst_ptr,
+                                "omnibuf: unexpected EOF reading length-prefixed value",
+                            );
+                        };
+                        store_fresh!(ffi::PyBytes_FromStringAndSize(
+                            b_ptr.cast::<std::os::raw::c_char>(),
+                            b_len as ffi::Py_ssize_t,
+                        ));
+                    }
+                    FastKind::BytesAsStr => {
+                        let Some((b_ptr, b_len)) = read_len_ptr(&mut cur, end, 0) else {
+                            return fail_decode_msg(
+                                py,
+                                dst_ptr,
+                                "omnibuf: unexpected EOF reading length-prefixed value",
+                            );
+                        };
+                        if let Err(e) = validate_utf8(std::slice::from_raw_parts(b_ptr, b_len)) {
+                            return fail_decode_err(py, dst_ptr, decode_err(py, e.to_string()));
+                        }
+                        store_fresh!(ffi::PyBytes_FromStringAndSize(
+                            b_ptr.cast::<std::os::raw::c_char>(),
+                            b_len as ffi::Py_ssize_t,
+                        ));
+                    }
+                    FastKind::Enum => {
+                        if !fdf.has_enum_cls {
+                            let Some(v) = decode_varint_ptr(&mut cur, end) else {
+                                return fail_decode_msg(
+                                    py,
+                                    dst_ptr,
+                                    "omnibuf: invalid enum varint",
+                                );
+                            };
+                            store_fresh!(py_long_from_i32_raw(decode_zigzag(v) as i32));
+                        } else {
+                            let data = std::slice::from_raw_parts(
+                                data_base,
+                                (end as usize).wrapping_sub(data_base as usize),
+                            );
+                            let pos = (cur as usize).wrapping_sub(data_base as usize);
+                            match self.decode_fast_slot_cold_field(
+                                py, inner, dst_ptr, f_idx, fdf, false, data, pos, depth, budget,
+                            ) {
+                                Ok(next_pos) => cur = data_base.add(next_pos),
+                                Err(err) => return fail_decode_err(py, dst_ptr, err),
+                            }
+                        }
+                    }
+                    FastKind::Map => {
+                        let data = std::slice::from_raw_parts(
+                            data_base,
+                            (end as usize).wrapping_sub(data_base as usize),
+                        );
+                        let pos = (cur as usize).wrapping_sub(data_base as usize);
+                        match self.decode_fast_slot_cold_field(
+                            py, inner, dst_ptr, f_idx, fdf, false, data, pos, depth, budget,
+                        ) {
+                            Ok(next_pos) => cur = data_base.add(next_pos),
+                            Err(err) => return fail_decode_err(py, dst_ptr, err),
+                        }
+                    }
                 }
-                FastKind::Uint32 => {
-                    let (v, w) = decode_varint_fast(data, pos)
-                        .ok_or_else(|| decode_err(py, "omnibuf: invalid uint32 varint"))?;
-                    pos += w;
-                    let raw_val = unsafe { py_long_from_u32(py, v as u32)? };
-                    store_slot!(raw_val);
+            }
+
+            if cur == end {
+                return dst_ptr;
+            }
+            self.decode_fast_slots_general::<CHECK_SIGNALS>(
+                py,
+                inner,
+                dst_ptr,
+                data_base,
+                cur,
+                end,
+                depth,
+                budget,
+                inner.all_seen_mask_64,
+            )
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn decode_fast_slots_general<const CHECK_SIGNALS: bool>(
+        &self,
+        py: Python<'_>,
+        inner: &CodecInner,
+        dst_ptr: *mut ffi::PyObject,
+        data_base: *const u8,
+        mut cur: *const u8,
+        end: *const u8,
+        depth: usize,
+        budget: &mut DecodeBudget,
+        mut seen_64: u64,
+    ) -> *mut ffi::PyObject {
+        unsafe {
+            let mut step = 0usize;
+
+            while cur < end {
+                if CHECK_SIGNALS {
+                    step += 1;
+                    if (step & 0xFFF) == 0
+                        && let Err(err) = py.check_signals()
+                    {
+                        return fail_decode_err(py, dst_ptr, err);
+                    }
                 }
-                FastKind::Uint64 => {
-                    let (v, w) = decode_varint_fast(data, pos)
-                        .ok_or_else(|| decode_err(py, "omnibuf: invalid uint64 varint"))?;
-                    pos += w;
-                    let raw_val = unsafe { py_long_from_u64(py, v)? };
-                    store_slot!(raw_val);
-                }
-                FastKind::Sint32 => {
-                    let (v, w) = decode_varint_fast(data, pos)
-                        .ok_or_else(|| decode_err(py, "omnibuf: invalid sint32 varint"))?;
-                    pos += w;
-                    let raw_val = unsafe { py_long_from_i32(py, decode_zigzag(v) as i32)? };
-                    store_slot!(raw_val);
-                }
-                FastKind::Sint64 => {
-                    let (v, w) = decode_varint_fast(data, pos)
-                        .ok_or_else(|| decode_err(py, "omnibuf: invalid sint64 varint"))?;
-                    pos += w;
-                    let raw_val = unsafe { py_long_from_i64(py, decode_zigzag(v))? };
-                    store_slot!(raw_val);
-                }
-                FastKind::Enum => {
-                    if !fdf.has_enum_cls {
-                        let (v, w) = decode_varint_fast(data, pos)
-                            .ok_or_else(|| decode_err(py, "omnibuf: invalid enum varint"))?;
-                        pos += w;
-                        let raw_val = unsafe { py_long_from_i32(py, decode_zigzag(v) as i32)? };
-                        store_slot!(raw_val);
+                let b0 = *cur;
+                let (f_idx, wt): (usize, u8) = if (b0 & 1) != 0 {
+                    let tag = usize::from(b0 >> 1);
+                    cur = cur.add(1);
+                    let mapped = *inner.fast_tag_map.get_unchecked(tag);
+                    if mapped != u8::MAX {
+                        (usize::from(mapped), (tag & 0x0F) as u8)
                     } else {
-                        pos = self.decode_fast_slot_cold_field(
+                        match self.decode_fast_slot_unknown_or_field0(
+                            py, data_base, cur, end, tag as u64, depth,
+                        ) {
+                            Ok(next_cur) => {
+                                cur = next_cur;
+                                continue;
+                            }
+                            Err(err) => return fail_decode_err(py, dst_ptr, err),
+                        }
+                    }
+                } else if (b0 & 2) != 0 && (end as usize).wrapping_sub(cur as usize) >= 2 {
+                    let raw16 = u16::from_le(core::ptr::read_unaligned(cur.cast::<u16>()));
+                    let tag = usize::from(raw16 >> 2);
+                    cur = cur.add(2);
+                    if tag < 256 {
+                        let mapped = *inner.fast_tag_map.get_unchecked(tag);
+                        if mapped != u8::MAX {
+                            (usize::from(mapped), (tag & 0x0F) as u8)
+                        } else {
+                            match self.decode_fast_slot_unknown_or_field0(
+                                py, data_base, cur, end, tag as u64, depth,
+                            ) {
+                                Ok(next_cur) => {
+                                    cur = next_cur;
+                                    continue;
+                                }
+                                Err(err) => return fail_decode_err(py, dst_ptr, err),
+                            }
+                        }
+                    } else {
+                        match self.decode_fast_slot_slow_tag_val(
+                            py, inner, data_base, cur, end, tag as u64, depth,
+                        ) {
+                            Ok(Ok(pair)) => pair,
+                            Ok(Err(next_cur)) => {
+                                cur = next_cur;
+                                continue;
+                            }
+                            Err(err) => return fail_decode_err(py, dst_ptr, err),
+                        }
+                    }
+                } else {
+                    match self.decode_fast_slot_slow_tag(py, inner, data_base, cur, end, depth) {
+                        Ok(Ok((idx, wt, next_cur))) => {
+                            cur = next_cur;
+                            (idx, wt)
+                        }
+                        Ok(Err(next_cur)) => {
+                            cur = next_cur;
+                            continue;
+                        }
+                        Err(err) => return fail_decode_err(py, dst_ptr, err),
+                    }
+                };
+
+                let fdf = inner.fast_decode_fields.get_unchecked(f_idx);
+                let bit = 1u64 << f_idx;
+                let already_seen = (seen_64 & bit) != 0;
+                seen_64 |= bit;
+
+                let slot = dst_ptr
+                    .byte_add(usize::from(fdf.slot_offset))
+                    .cast::<*mut ffi::PyObject>();
+
+                macro_rules! store_slot {
+                    ($raw_val:expr) => {
+                        let rv: *mut ffi::PyObject = $raw_val;
+                        if rv.is_null() {
+                            return fail_decref(dst_ptr);
+                        }
+                        if !already_seen {
+                            *slot = rv;
+                        } else {
+                            store_slot_replace(slot, rv);
+                        }
+                    };
+                }
+
+                match fdf.kind {
+                    FastKind::Bool => {
+                        let b_ptr = if wt == WIRE_BOOL_TRUE {
+                            ffi::Py_True()
+                        } else {
+                            ffi::Py_False()
+                        };
+                        ffi::Py_INCREF(b_ptr);
+                        if !already_seen {
+                            *slot = b_ptr;
+                        } else {
+                            store_slot_replace(slot, b_ptr);
+                        }
+                    }
+                    FastKind::Uint32 => {
+                        let Some(v) = decode_varint_ptr(&mut cur, end) else {
+                            return fail_decode_msg(py, dst_ptr, "omnibuf: invalid uint32 varint");
+                        };
+                        store_slot!(py_long_from_u32_raw(v as u32));
+                    }
+                    FastKind::Uint64 => {
+                        let Some(v) = decode_varint_ptr(&mut cur, end) else {
+                            return fail_decode_msg(py, dst_ptr, "omnibuf: invalid uint64 varint");
+                        };
+                        store_slot!(py_long_from_u64_raw(v));
+                    }
+                    FastKind::Sint32 => {
+                        let Some(v) = decode_varint_ptr(&mut cur, end) else {
+                            return fail_decode_msg(py, dst_ptr, "omnibuf: invalid sint32 varint");
+                        };
+                        store_slot!(py_long_from_i32_raw(decode_zigzag(v) as i32));
+                    }
+                    FastKind::Sint64 => {
+                        let Some(v) = decode_varint_ptr(&mut cur, end) else {
+                            return fail_decode_msg(py, dst_ptr, "omnibuf: invalid sint64 varint");
+                        };
+                        store_slot!(py_long_from_i64_raw(decode_zigzag(v)));
+                    }
+                    FastKind::Enum => {
+                        if !fdf.has_enum_cls {
+                            let Some(v) = decode_varint_ptr(&mut cur, end) else {
+                                return fail_decode_msg(
+                                    py,
+                                    dst_ptr,
+                                    "omnibuf: invalid enum varint",
+                                );
+                            };
+                            store_slot!(py_long_from_i32_raw(decode_zigzag(v) as i32));
+                        } else {
+                            let data = std::slice::from_raw_parts(
+                                data_base,
+                                (end as usize).wrapping_sub(data_base as usize),
+                            );
+                            let pos = (cur as usize).wrapping_sub(data_base as usize);
+                            match self.decode_fast_slot_cold_field(
+                                py,
+                                inner,
+                                dst_ptr,
+                                f_idx,
+                                fdf,
+                                already_seen,
+                                data,
+                                pos,
+                                depth,
+                                budget,
+                            ) {
+                                Ok(next_pos) => cur = data_base.add(next_pos),
+                                Err(err) => return fail_decode_err(py, dst_ptr, err),
+                            }
+                        }
+                    }
+                    FastKind::Fixed32 => {
+                        if (end as usize).wrapping_sub(cur as usize) < 4 {
+                            return fail_decode_msg(py, dst_ptr, "omnibuf: truncated fixed32");
+                        }
+                        let u = u32::from_le(core::ptr::read_unaligned(cur.cast::<u32>()));
+                        cur = cur.add(4);
+                        store_slot!(py_long_from_u32_raw(u));
+                    }
+                    FastKind::Sfixed32 => {
+                        if (end as usize).wrapping_sub(cur as usize) < 4 {
+                            return fail_decode_msg(py, dst_ptr, "omnibuf: truncated sfixed32");
+                        }
+                        let i = i32::from_le(core::ptr::read_unaligned(cur.cast::<i32>()));
+                        cur = cur.add(4);
+                        store_slot!(py_long_from_i32_raw(i));
+                    }
+                    FastKind::Fixed64 => {
+                        if (end as usize).wrapping_sub(cur as usize) < 8 {
+                            return fail_decode_msg(py, dst_ptr, "omnibuf: truncated fixed64");
+                        }
+                        let u = u64::from_le(core::ptr::read_unaligned(cur.cast::<u64>()));
+                        cur = cur.add(8);
+                        store_slot!(py_long_from_u64_raw(u));
+                    }
+                    FastKind::Sfixed64 => {
+                        if (end as usize).wrapping_sub(cur as usize) < 8 {
+                            return fail_decode_msg(py, dst_ptr, "omnibuf: truncated sfixed64");
+                        }
+                        let i = i64::from_le(core::ptr::read_unaligned(cur.cast::<i64>()));
+                        cur = cur.add(8);
+                        store_slot!(py_long_from_i64_raw(i));
+                    }
+                    FastKind::Float32 => {
+                        if (end as usize).wrapping_sub(cur as usize) < 4 {
+                            return fail_decode_msg(py, dst_ptr, "omnibuf: truncated float32");
+                        }
+                        let bits = u32::from_le(core::ptr::read_unaligned(cur.cast::<u32>()));
+                        cur = cur.add(4);
+                        store_slot!(ffi::PyFloat_FromDouble(f64::from(f32::from_bits(bits))));
+                    }
+                    FastKind::Float64 => {
+                        if (end as usize).wrapping_sub(cur as usize) < 8 {
+                            return fail_decode_msg(py, dst_ptr, "omnibuf: truncated float64");
+                        }
+                        let bits = u64::from_le(core::ptr::read_unaligned(cur.cast::<u64>()));
+                        cur = cur.add(8);
+                        store_slot!(ffi::PyFloat_FromDouble(f64::from_bits(bits)));
+                    }
+                    FastKind::String => {
+                        let Some((s_ptr, s_len)) = read_len_ptr(&mut cur, end, 0) else {
+                            return fail_decode_msg(
+                                py,
+                                dst_ptr,
+                                "omnibuf: unexpected EOF reading length-prefixed value",
+                            );
+                        };
+                        store_slot!(py_str_from_utf8_raw(py, s_ptr, s_len, inner));
+                    }
+                    FastKind::Bytes => {
+                        let Some((b_ptr, b_len)) = read_len_ptr(&mut cur, end, 0) else {
+                            return fail_decode_msg(
+                                py,
+                                dst_ptr,
+                                "omnibuf: unexpected EOF reading length-prefixed value",
+                            );
+                        };
+                        let raw_val = ffi::PyBytes_FromStringAndSize(
+                            b_ptr.cast::<std::os::raw::c_char>(),
+                            b_len as ffi::Py_ssize_t,
+                        );
+                        store_slot!(raw_val);
+                    }
+                    FastKind::BytesAsStr => {
+                        let Some((b_ptr, b_len)) = read_len_ptr(&mut cur, end, 0) else {
+                            return fail_decode_msg(
+                                py,
+                                dst_ptr,
+                                "omnibuf: unexpected EOF reading length-prefixed value",
+                            );
+                        };
+                        if let Err(e) = validate_utf8(std::slice::from_raw_parts(b_ptr, b_len)) {
+                            return fail_decode_err(py, dst_ptr, decode_err(py, e.to_string()));
+                        }
+                        let raw_val = ffi::PyBytes_FromStringAndSize(
+                            b_ptr.cast::<std::os::raw::c_char>(),
+                            b_len as ffi::Py_ssize_t,
+                        );
+                        store_slot!(raw_val);
+                    }
+                    FastKind::SubMsg => {
+                        if already_seen {
+                            let data = std::slice::from_raw_parts(
+                                data_base,
+                                (end as usize).wrapping_sub(data_base as usize),
+                            );
+                            let pos = (cur as usize).wrapping_sub(data_base as usize);
+                            match self.decode_fast_slot_cold_field(
+                                py, inner, dst_ptr, f_idx, fdf, true, data, pos, depth, budget,
+                            ) {
+                                Ok(next_pos) => {
+                                    cur = data_base.add(next_pos);
+                                    continue;
+                                }
+                                Err(err) => return fail_decode_err(py, dst_ptr, err),
+                            }
+                        }
+                        let Some((sub_ptr, sub_len)) = read_len_ptr(&mut cur, end, 0) else {
+                            return fail_decode_msg(
+                                py,
+                                dst_ptr,
+                                "omnibuf: unexpected EOF reading length-prefixed value",
+                            );
+                        };
+                        if depth + 1 > MAX_NESTING_DEPTH {
+                            return fail_decode_err(
+                                py,
+                                dst_ptr,
+                                decode_err(
+                                    py,
+                                    format!(
+                                        "omnibuf: nesting depth {} exceeds {MAX_NESTING_DEPTH}",
+                                        depth + 1
+                                    ),
+                                ),
+                            );
+                        }
+                        let sub_c = &*fdf.sub_codec;
+                        let sub_raw = if fdf.sub_fast_decode {
+                            let sub_inner = &*fdf.sub_inner;
+                            let sub_end = sub_ptr.add(sub_len);
+                            if !CHECK_SIGNALS || sub_len < 4096 {
+                                sub_c.decode_fast_slots_raw::<false>(
+                                    py,
+                                    sub_inner,
+                                    sub_ptr,
+                                    sub_end,
+                                    depth + 1,
+                                    budget,
+                                )
+                            } else {
+                                sub_c.decode_fast_slots_raw::<true>(
+                                    py,
+                                    sub_inner,
+                                    sub_ptr,
+                                    sub_end,
+                                    depth + 1,
+                                    budget,
+                                )
+                            }
+                        } else {
+                            let sub_slice = std::slice::from_raw_parts(sub_ptr, sub_len);
+                            match sub_c.decode_slice_budget(
+                                py,
+                                sub_slice,
+                                None,
+                                depth + 1,
+                                false,
+                                budget,
+                                None,
+                            ) {
+                                Ok(obj) => obj.into_ptr(),
+                                Err(err) => return fail_decode_err(py, dst_ptr, err),
+                            }
+                        };
+                        if sub_raw.is_null() {
+                            return fail_decref(dst_ptr);
+                        }
+                        *slot = sub_raw;
+                    }
+                    FastKind::ArrayScalar => {
+                        if already_seen {
+                            let data = std::slice::from_raw_parts(
+                                data_base,
+                                (end as usize).wrapping_sub(data_base as usize),
+                            );
+                            let pos = (cur as usize).wrapping_sub(data_base as usize);
+                            match self.decode_fast_slot_cold_field(
+                                py, inner, dst_ptr, f_idx, fdf, true, data, pos, depth, budget,
+                            ) {
+                                Ok(next_pos) => {
+                                    cur = data_base.add(next_pos);
+                                    continue;
+                                }
+                                Err(err) => return fail_decode_err(py, dst_ptr, err),
+                            }
+                        }
+                        let lp = Self::decode_fast_array_scalar_raw::<CHECK_SIGNALS>(
+                            py, inner, f_idx, fdf, dst_ptr, &mut cur, end, depth, budget,
+                        );
+                        if lp.is_null() {
+                            return std::ptr::null_mut();
+                        }
+                        *slot = lp;
+                    }
+                    FastKind::ArraySubMsg => {
+                        if already_seen {
+                            let data = std::slice::from_raw_parts(
+                                data_base,
+                                (end as usize).wrapping_sub(data_base as usize),
+                            );
+                            let pos = (cur as usize).wrapping_sub(data_base as usize);
+                            match self.decode_fast_slot_cold_field(
+                                py, inner, dst_ptr, f_idx, fdf, true, data, pos, depth, budget,
+                            ) {
+                                Ok(next_pos) => {
+                                    cur = data_base.add(next_pos);
+                                    continue;
+                                }
+                                Err(err) => return fail_decode_err(py, dst_ptr, err),
+                            }
+                        }
+                        let lp = Self::decode_fast_array_submsg_raw::<CHECK_SIGNALS>(
+                            py, fdf, dst_ptr, &mut cur, end, depth, budget,
+                        );
+                        if lp.is_null() {
+                            return std::ptr::null_mut();
+                        }
+                        *slot = lp;
+                    }
+                    FastKind::Map => {
+                        let data = std::slice::from_raw_parts(
+                            data_base,
+                            (end as usize).wrapping_sub(data_base as usize),
+                        );
+                        let pos = (cur as usize).wrapping_sub(data_base as usize);
+                        match self.decode_fast_slot_cold_field(
                             py,
                             inner,
                             dst_ptr,
@@ -3730,567 +5237,23 @@ impl CompiledCodec {
                             pos,
                             depth,
                             budget,
-                        )?;
-                    }
-                }
-                FastKind::Fixed32 => {
-                    if pos + 4 > n {
-                        return Err(decode_err(py, "omnibuf: truncated fixed32"));
-                    }
-                    let u = u32::from_le(unsafe {
-                        core::ptr::read_unaligned(data.as_ptr().add(pos).cast::<u32>())
-                    });
-                    pos += 4;
-                    let raw_val = unsafe { py_long_from_u32(py, u)? };
-                    store_slot!(raw_val);
-                }
-                FastKind::Sfixed32 => {
-                    if pos + 4 > n {
-                        return Err(decode_err(py, "omnibuf: truncated sfixed32"));
-                    }
-                    let i = i32::from_le(unsafe {
-                        core::ptr::read_unaligned(data.as_ptr().add(pos).cast::<i32>())
-                    });
-                    pos += 4;
-                    let raw_val = unsafe { py_long_from_i32(py, i)? };
-                    store_slot!(raw_val);
-                }
-                FastKind::Fixed64 => {
-                    if pos + 8 > n {
-                        return Err(decode_err(py, "omnibuf: truncated fixed64"));
-                    }
-                    let u = u64::from_le(unsafe {
-                        core::ptr::read_unaligned(data.as_ptr().add(pos).cast::<u64>())
-                    });
-                    pos += 8;
-                    let raw_val = unsafe { py_long_from_u64(py, u)? };
-                    store_slot!(raw_val);
-                }
-                FastKind::Sfixed64 => {
-                    if pos + 8 > n {
-                        return Err(decode_err(py, "omnibuf: truncated sfixed64"));
-                    }
-                    let i = i64::from_le(unsafe {
-                        core::ptr::read_unaligned(data.as_ptr().add(pos).cast::<i64>())
-                    });
-                    pos += 8;
-                    let raw_val = unsafe { py_long_from_i64(py, i)? };
-                    store_slot!(raw_val);
-                }
-                FastKind::Float32 => {
-                    if pos + 4 > n {
-                        return Err(decode_err(py, "omnibuf: truncated float32"));
-                    }
-                    let bits = u32::from_le(unsafe {
-                        core::ptr::read_unaligned(data.as_ptr().add(pos).cast::<u32>())
-                    });
-                    pos += 4;
-                    let raw_val =
-                        unsafe { py_float_from_f64(py, f64::from(f32::from_bits(bits)))? };
-                    store_slot!(raw_val);
-                }
-                FastKind::Float64 => {
-                    if pos + 8 > n {
-                        return Err(decode_err(py, "omnibuf: truncated float64"));
-                    }
-                    let bits = u64::from_le(unsafe {
-                        core::ptr::read_unaligned(data.as_ptr().add(pos).cast::<u64>())
-                    });
-                    pos += 8;
-                    let raw_val = unsafe { py_float_from_f64(py, f64::from_bits(bits))? };
-                    store_slot!(raw_val);
-                }
-                FastKind::String => {
-                    let (s_bytes, next_pos) =
-                        read_len_slice_fast(data, pos, 0).map_err(|m| decode_err(py, m))?;
-                    pos = next_pos;
-                    let raw_val = unsafe { py_str_from_utf8_fast(py, s_bytes, empty_str)? };
-                    store_slot!(raw_val);
-                }
-                FastKind::Bytes => {
-                    let (b, next_pos) =
-                        read_len_slice_fast(data, pos, 0).map_err(|m| decode_err(py, m))?;
-                    pos = next_pos;
-                    let raw_val = PyBytes::new(py, b).into_any().into_ptr();
-                    store_slot!(raw_val);
-                }
-                FastKind::BytesAsStr => {
-                    let (b, next_pos) =
-                        read_len_slice_fast(data, pos, 0).map_err(|m| decode_err(py, m))?;
-                    validate_utf8(b).map_err(|e| decode_err(py, e.to_string()))?;
-                    pos = next_pos;
-                    let raw_val = PyBytes::new(py, b).into_any().into_ptr();
-                    store_slot!(raw_val);
-                }
-                FastKind::SubMsg => {
-                    if already_seen {
-                        pos = self.decode_fast_slot_cold_field(
-                            py, inner, dst_ptr, f_idx, fdf, true, data, pos, depth, budget,
-                        )?;
-                        continue;
-                    }
-                    let (sub_slice, next_pos) =
-                        read_len_slice_fast(data, pos, 0).map_err(|m| decode_err(py, m))?;
-                    pos = next_pos;
-                    if depth + 1 > MAX_NESTING_DEPTH {
-                        return Err(decode_err(
-                            py,
-                            format!(
-                                "omnibuf: nesting depth {} exceeds {MAX_NESTING_DEPTH}",
-                                depth + 1
-                            ),
-                        ));
-                    }
-                    let sub_c = unsafe { &*fdf.sub_codec };
-                    let sub_inner = if !fdf.sub_inner.is_null() {
-                        unsafe { &*fdf.sub_inner }
-                    } else {
-                        sub_c.inner_plan(py)?
-                    };
-                    let decoded_sub = if sub_inner.fast_slot_decode {
-                        unsafe {
-                            if !CHECK_SIGNALS {
-                                sub_c.try_decode_pure_fast_slots_impl::<false>(
-                                    py,
-                                    sub_inner,
-                                    sub_slice,
-                                    depth + 1,
-                                    budget,
-                                )?
-                            } else {
-                                sub_c.try_decode_pure_fast_slots_dispatch(
-                                    py,
-                                    sub_inner,
-                                    sub_slice,
-                                    depth + 1,
-                                    budget,
-                                )?
-                            }
+                        ) {
+                            Ok(next_pos) => cur = data_base.add(next_pos),
+                            Err(err) => return fail_decode_err(py, dst_ptr, err),
                         }
-                    } else {
-                        sub_c.decode_slice_budget(
-                            py,
-                            sub_slice,
-                            None,
-                            depth + 1,
-                            false,
-                            budget,
-                            None,
-                        )?
-                    };
-                    unsafe {
-                        *slot = decoded_sub.into_ptr();
                     }
-                }
-                FastKind::ArrayScalar => {
-                    if already_seen {
-                        pos = self.decode_fast_slot_cold_field(
-                            py, inner, dst_ptr, f_idx, fdf, true, data, pos, depth, budget,
-                        )?;
-                        continue;
-                    }
-                    if depth + 1 > MAX_NESTING_DEPTH {
-                        return Err(decode_err(
-                            py,
-                            format!(
-                                "omnibuf: array nesting depth {} exceeds {MAX_NESTING_DEPTH}",
-                                depth + 1
-                            ),
-                        ));
-                    }
-                    let (arr_body, next_pos) =
-                        read_len_slice_fast(data, pos, 2).map_err(|m| decode_err(py, m))?;
-                    pos = next_pos;
-                    let (ewt, count, mut p) =
-                        parse_array_header_fast(arr_body).ok_or_else(|| {
-                            decode_err(
-                                py,
-                                format!(
-                                    "omnibuf: invalid array header on field {}",
-                                    inner.fields[f_idx].wire_name
-                                ),
-                            )
-                        })?;
-                    if ewt != fdf.elem_wt {
-                        return Err(decode_err(
-                            py,
-                            format!(
-                                "omnibuf: invalid array element wire type on field {}",
-                                inner.fields[f_idx].wire_name
-                            ),
-                        ));
-                    }
-                    budget.consume(py, count)?;
-                    unsafe {
-                        let list_ptr = ffi::PyList_New(count as ffi::Py_ssize_t);
-                        let list = Bound::from_owned_ptr_or_err(py, list_ptr)?;
-                        let lp = list.as_ptr();
-                        let arr_len = arr_body.len();
-                        match fdf.elem_kind {
-                            ScalarKind::Uint32 => {
-                                for i in 0..count {
-                                    if CHECK_SIGNALS && (i & 0xFFF) == 0xFFF {
-                                        py.check_signals()?;
-                                    }
-                                    let (v, w) =
-                                        decode_varint_fast(arr_body, p).ok_or_else(|| {
-                                            decode_err(py, "omnibuf: invalid uint32 varint")
-                                        })?;
-                                    p += w;
-                                    let item_ptr = py_long_from_u32(py, v as u32)?;
-                                    ffi::PyList_SET_ITEM(lp, i as ffi::Py_ssize_t, item_ptr);
-                                }
-                            }
-                            ScalarKind::Uint64 => {
-                                for i in 0..count {
-                                    if CHECK_SIGNALS && (i & 0xFFF) == 0xFFF {
-                                        py.check_signals()?;
-                                    }
-                                    let (v, w) =
-                                        decode_varint_fast(arr_body, p).ok_or_else(|| {
-                                            decode_err(py, "omnibuf: invalid uint64 varint")
-                                        })?;
-                                    p += w;
-                                    let item_ptr = py_long_from_u64(py, v)?;
-                                    ffi::PyList_SET_ITEM(lp, i as ffi::Py_ssize_t, item_ptr);
-                                }
-                            }
-                            ScalarKind::Sint32 => {
-                                for i in 0..count {
-                                    if CHECK_SIGNALS && (i & 0xFFF) == 0xFFF {
-                                        py.check_signals()?;
-                                    }
-                                    let (v, w) =
-                                        decode_varint_fast(arr_body, p).ok_or_else(|| {
-                                            decode_err(py, "omnibuf: invalid sint32 varint")
-                                        })?;
-                                    p += w;
-                                    let item_ptr = py_long_from_i32(py, decode_zigzag(v) as i32)?;
-                                    ffi::PyList_SET_ITEM(lp, i as ffi::Py_ssize_t, item_ptr);
-                                }
-                            }
-                            ScalarKind::Sint64 => {
-                                for i in 0..count {
-                                    if CHECK_SIGNALS && (i & 0xFFF) == 0xFFF {
-                                        py.check_signals()?;
-                                    }
-                                    let (v, w) =
-                                        decode_varint_fast(arr_body, p).ok_or_else(|| {
-                                            decode_err(py, "omnibuf: invalid sint64 varint")
-                                        })?;
-                                    p += w;
-                                    let item_ptr = py_long_from_i64(py, decode_zigzag(v))?;
-                                    ffi::PyList_SET_ITEM(lp, i as ffi::Py_ssize_t, item_ptr);
-                                }
-                            }
-                            ScalarKind::String | ScalarKind::StrAsBytes => {
-                                for i in 0..count {
-                                    if CHECK_SIGNALS && (i & 0xFFF) == 0xFFF {
-                                        py.check_signals()?;
-                                    }
-                                    let (s_bytes, next_p) = read_len_slice_fast(arr_body, p, 0)
-                                        .map_err(|m| decode_err(py, m))?;
-                                    p = next_p;
-                                    let item_ptr = py_str_from_utf8_fast(py, s_bytes, empty_str)?;
-                                    ffi::PyList_SET_ITEM(lp, i as ffi::Py_ssize_t, item_ptr);
-                                }
-                            }
-                            ScalarKind::Bool => {
-                                if arr_len - p != count {
-                                    return Err(decode_err(
-                                        py,
-                                        "omnibuf: invalid bool array byte length",
-                                    ));
-                                }
-                                for i in 0..count {
-                                    let b = *arr_body.get_unchecked(p + i);
-                                    if b > 1 {
-                                        return Err(decode_err(
-                                            py,
-                                            format!("omnibuf: invalid bool byte 0x{b:02x}"),
-                                        ));
-                                    }
-                                    let bp = if b == 1 {
-                                        ffi::Py_True()
-                                    } else {
-                                        ffi::Py_False()
-                                    };
-                                    ffi::Py_INCREF(bp);
-                                    ffi::PyList_SET_ITEM(lp, i as ffi::Py_ssize_t, bp);
-                                }
-                                p += count;
-                            }
-                            ScalarKind::Float32 => {
-                                if Some(arr_len - p) != count.checked_mul(4) {
-                                    return Err(decode_err(py, "omnibuf: truncated float32 array"));
-                                }
-                                for i in 0..count {
-                                    let bits = u32::from_le(core::ptr::read_unaligned(
-                                        arr_body.as_ptr().add(p).cast::<u32>(),
-                                    ));
-                                    p += 4;
-                                    let item_ptr =
-                                        py_float_from_f64(py, f64::from(f32::from_bits(bits)))?;
-                                    ffi::PyList_SET_ITEM(lp, i as ffi::Py_ssize_t, item_ptr);
-                                }
-                            }
-                            ScalarKind::Float64 => {
-                                if Some(arr_len - p) != count.checked_mul(8) {
-                                    return Err(decode_err(py, "omnibuf: truncated float64 array"));
-                                }
-                                for i in 0..count {
-                                    let bits = u64::from_le(core::ptr::read_unaligned(
-                                        arr_body.as_ptr().add(p).cast::<u64>(),
-                                    ));
-                                    p += 8;
-                                    let item_ptr = py_float_from_f64(py, f64::from_bits(bits))?;
-                                    ffi::PyList_SET_ITEM(lp, i as ffi::Py_ssize_t, item_ptr);
-                                }
-                            }
-                            ScalarKind::Fixed32 => {
-                                if Some(arr_len - p) != count.checked_mul(4) {
-                                    return Err(decode_err(py, "omnibuf: truncated fixed32 array"));
-                                }
-                                for i in 0..count {
-                                    let u = u32::from_le(core::ptr::read_unaligned(
-                                        arr_body.as_ptr().add(p).cast::<u32>(),
-                                    ));
-                                    p += 4;
-                                    let item_ptr = py_long_from_u32(py, u)?;
-                                    ffi::PyList_SET_ITEM(lp, i as ffi::Py_ssize_t, item_ptr);
-                                }
-                            }
-                            ScalarKind::Sfixed32 => {
-                                if Some(arr_len - p) != count.checked_mul(4) {
-                                    return Err(decode_err(
-                                        py,
-                                        "omnibuf: truncated sfixed32 array",
-                                    ));
-                                }
-                                for i in 0..count {
-                                    let v = i32::from_le(core::ptr::read_unaligned(
-                                        arr_body.as_ptr().add(p).cast::<i32>(),
-                                    ));
-                                    p += 4;
-                                    let item_ptr = py_long_from_i32(py, v)?;
-                                    ffi::PyList_SET_ITEM(lp, i as ffi::Py_ssize_t, item_ptr);
-                                }
-                            }
-                            ScalarKind::Fixed64 => {
-                                if Some(arr_len - p) != count.checked_mul(8) {
-                                    return Err(decode_err(py, "omnibuf: truncated fixed64 array"));
-                                }
-                                for i in 0..count {
-                                    let u = u64::from_le(core::ptr::read_unaligned(
-                                        arr_body.as_ptr().add(p).cast::<u64>(),
-                                    ));
-                                    p += 8;
-                                    let item_ptr = py_long_from_u64(py, u)?;
-                                    ffi::PyList_SET_ITEM(lp, i as ffi::Py_ssize_t, item_ptr);
-                                }
-                            }
-                            ScalarKind::Sfixed64 => {
-                                if Some(arr_len - p) != count.checked_mul(8) {
-                                    return Err(decode_err(
-                                        py,
-                                        "omnibuf: truncated sfixed64 array",
-                                    ));
-                                }
-                                for i in 0..count {
-                                    let v = i64::from_le(core::ptr::read_unaligned(
-                                        arr_body.as_ptr().add(p).cast::<i64>(),
-                                    ));
-                                    p += 8;
-                                    let item_ptr = py_long_from_i64(py, v)?;
-                                    ffi::PyList_SET_ITEM(lp, i as ffi::Py_ssize_t, item_ptr);
-                                }
-                            }
-                            _ => {
-                                let fp = inner.fields.get_unchecked(f_idx);
-                                let enum_cls = match &fp.kind {
-                                    FieldPlanKind::ArrayScalar { enum_cls, .. } => {
-                                        enum_cls.as_ref()
-                                    }
-                                    _ => None,
-                                };
-                                for i in 0..count {
-                                    if (i & 0xFFF) == 0xFFF {
-                                        py.check_signals()?;
-                                    }
-                                    let (item, next_p) = read_scalar_payload(
-                                        py,
-                                        arr_body,
-                                        p,
-                                        fdf.elem_kind,
-                                        enum_cls,
-                                        None,
-                                    )?;
-                                    p = next_p;
-                                    ffi::PyList_SET_ITEM(lp, i as ffi::Py_ssize_t, item.into_ptr());
-                                }
-                            }
-                        }
-                        *slot = list.into_ptr();
-                    }
-                    if p != arr_body.len() {
-                        return Err(decode_err(
-                            py,
-                            format!(
-                                "omnibuf: trailing array bytes on field {}",
-                                inner.fields[f_idx].wire_name
-                            ),
-                        ));
-                    }
-                }
-                FastKind::ArraySubMsg => {
-                    if already_seen {
-                        pos = self.decode_fast_slot_cold_field(
-                            py, inner, dst_ptr, f_idx, fdf, true, data, pos, depth, budget,
-                        )?;
-                        continue;
-                    }
-                    if depth + 1 > MAX_NESTING_DEPTH {
-                        return Err(decode_err(
-                            py,
-                            format!(
-                                "omnibuf: array nesting depth {} exceeds {MAX_NESTING_DEPTH}",
-                                depth + 1
-                            ),
-                        ));
-                    }
-                    let (arr_body, next_pos) =
-                        read_len_slice_fast(data, pos, 2).map_err(|m| decode_err(py, m))?;
-                    pos = next_pos;
-                    let (ewt, count, mut p) =
-                        parse_array_header_fast(arr_body).ok_or_else(|| {
-                            decode_err(
-                                py,
-                                format!(
-                                    "omnibuf: invalid submsg array header on field {}",
-                                    inner.fields[f_idx].wire_name
-                                ),
-                            )
-                        })?;
-                    if ewt != WIRE_SUB_MSG {
-                        return Err(decode_err(
-                            py,
-                            format!(
-                                "omnibuf: invalid submsg array header on field {}",
-                                inner.fields[f_idx].wire_name
-                            ),
-                        ));
-                    }
-                    budget.consume(py, count)?;
-                    let sub_c = unsafe { &*fdf.sub_codec };
-                    unsafe {
-                        let list_ptr = ffi::PyList_New(count as ffi::Py_ssize_t);
-                        let list = Bound::from_owned_ptr_or_err(py, list_ptr)?;
-                        let lp = list.as_ptr();
-                        if count > 0 {
-                            if depth + 2 > MAX_NESTING_DEPTH {
-                                return Err(decode_err(
-                                    py,
-                                    format!(
-                                        "omnibuf: nesting depth {} exceeds {MAX_NESTING_DEPTH}",
-                                        depth + 2
-                                    ),
-                                ));
-                            }
-                            let sub_inner = if !fdf.sub_inner.is_null() {
-                                &*fdf.sub_inner
-                            } else {
-                                sub_c.inner_plan(py)?
-                            };
-                            if sub_inner.fast_slot_decode {
-                                for i in 0..count {
-                                    if CHECK_SIGNALS && (i & 0xFFF) == 0xFFF {
-                                        py.check_signals()?;
-                                    }
-                                    let (elem_slice, next_p) = read_len_slice_fast(arr_body, p, 0)
-                                        .map_err(|m| decode_err(py, m))?;
-                                    p = next_p;
-                                    let elem_obj = if !CHECK_SIGNALS {
-                                        sub_c.try_decode_pure_fast_slots_impl::<false>(
-                                            py,
-                                            sub_inner,
-                                            elem_slice,
-                                            depth + 2,
-                                            budget,
-                                        )?
-                                    } else {
-                                        sub_c.try_decode_pure_fast_slots_dispatch(
-                                            py,
-                                            sub_inner,
-                                            elem_slice,
-                                            depth + 2,
-                                            budget,
-                                        )?
-                                    };
-                                    ffi::PyList_SET_ITEM(
-                                        lp,
-                                        i as ffi::Py_ssize_t,
-                                        elem_obj.into_ptr(),
-                                    );
-                                }
-                            } else {
-                                for i in 0..count {
-                                    if CHECK_SIGNALS && (i & 0xFFF) == 0xFFF {
-                                        py.check_signals()?;
-                                    }
-                                    let (elem_slice, next_p) = read_len_slice_fast(arr_body, p, 0)
-                                        .map_err(|m| decode_err(py, m))?;
-                                    p = next_p;
-                                    let elem_obj = sub_c.decode_slice_budget(
-                                        py,
-                                        elem_slice,
-                                        None,
-                                        depth + 2,
-                                        false,
-                                        budget,
-                                        None,
-                                    )?;
-                                    ffi::PyList_SET_ITEM(
-                                        lp,
-                                        i as ffi::Py_ssize_t,
-                                        elem_obj.into_ptr(),
-                                    );
-                                }
-                            }
-                        }
-                        *slot = list.into_ptr();
-                    }
-                    if p != arr_body.len() {
-                        return Err(decode_err(
-                            py,
-                            format!(
-                                "omnibuf: trailing submsg array bytes on field {}",
-                                inner.fields[f_idx].wire_name
-                            ),
-                        ));
-                    }
-                }
-                FastKind::Map => {
-                    pos = self.decode_fast_slot_cold_field(
-                        py,
-                        inner,
-                        dst_ptr,
-                        f_idx,
-                        fdf,
-                        already_seen,
-                        data,
-                        pos,
-                        depth,
-                        budget,
-                    )?;
                 }
             }
-        }
 
-        if seen_64 != inner.all_seen_mask_64 {
-            self.decode_fast_slot_missing_defaults(py, inner, dst_ptr, seen_64)?;
-        }
+            if seen_64 != inner.all_seen_mask_64
+                && let Err(err) =
+                    self.decode_fast_slot_missing_defaults(py, inner, dst_ptr, seen_64)
+            {
+                return fail_decode_err(py, dst_ptr, err);
+            }
 
-        Ok(inst)
+            dst_ptr
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4503,6 +5466,14 @@ impl CompiledCodec {
                             ),
                         ));
                     }
+                    let rem = arr_body.len().saturating_sub(p);
+                    let min_elem_bytes = scalar_elem_min_wire_bytes(*elem_kind);
+                    if count > rem / min_elem_bytes {
+                        return Err(decode_err(
+                            py,
+                            format!("omnibuf: truncated array payload on field {}", fp.wire_name),
+                        ));
+                    }
                     budget.consume(py, count)?;
 
                     if self.pbpy_mode {
@@ -4622,6 +5593,25 @@ impl CompiledCodec {
                             format!(
                                 "omnibuf: invalid submsg array header on field {}",
                                 fp.wire_name
+                            ),
+                        ));
+                    }
+                    let rem = arr_body.len().saturating_sub(p);
+                    if count > rem {
+                        return Err(decode_err(
+                            py,
+                            format!(
+                                "omnibuf: truncated submsg array payload on field {}",
+                                fp.wire_name
+                            ),
+                        ));
+                    }
+                    if count > 0 && depth + 2 > MAX_NESTING_DEPTH {
+                        return Err(decode_err(
+                            py,
+                            format!(
+                                "omnibuf: nesting depth {} exceeds {MAX_NESTING_DEPTH}",
+                                depth + 2
                             ),
                         ));
                     }
@@ -5325,7 +6315,7 @@ impl CompiledCodec {
             });
 
         let mut fast_decode_fields = Vec::with_capacity(fields.len());
-        let mut fast_tag_map = [u8::MAX; 128];
+        let mut fast_tag_map = [u8::MAX; 256];
         if fast_slot_decode {
             for fp in &fields {
                 let (fk, elem_kind, elem_wt, has_enum_cls, sub_codec) = match &fp.kind {
@@ -5393,17 +6383,46 @@ impl CompiledCodec {
                 } else {
                     std::ptr::null()
                 };
+                let sub_fast_decode =
+                    !sub_inner.is_null() && unsafe { (*sub_inner).fast_slot_decode };
+                let (expected_tag, tag_mask, tag_len) = if fk == FastKind::Bool {
+                    if fp.tag_false_len == 1 {
+                        (u16::from(fp.tag_false_bytes[0]), 0xFFFDu16, 1u8)
+                    } else if fp.tag_false_len == 2 {
+                        (
+                            u16::from_le_bytes([fp.tag_false_bytes[0], fp.tag_false_bytes[1]]),
+                            0xFFFBu16,
+                            2u8,
+                        )
+                    } else {
+                        (0u16, 0xFFFFu16, 0u8)
+                    }
+                } else if fp.tag_len == 1 {
+                    (u16::from(fp.tag_bytes[0]), 0xFFFFu16, 1u8)
+                } else if fp.tag_len == 2 {
+                    (
+                        u16::from_le_bytes([fp.tag_bytes[0], fp.tag_bytes[1]]),
+                        0xFFFFu16,
+                        2u8,
+                    )
+                } else {
+                    (0u16, 0xFFFFu16, 0u8)
+                };
                 fast_decode_fields.push(FastDecodeField {
                     slot_offset: fp.slot_offset as u16,
+                    expected_tag,
+                    tag_mask,
+                    tag_len,
                     kind: fk,
                     wire_type: fp.wire_type,
                     elem_kind,
                     elem_wt,
                     has_enum_cls,
+                    sub_fast_decode,
                     sub_codec,
                     sub_inner,
                 });
-                if fp.field_num >= 1 && fp.field_num <= 7 {
+                if fp.field_num >= 1 && fp.field_num <= 15 {
                     if fk == FastKind::Bool {
                         fast_tag_map[((fp.field_num << 4) | u32::from(WIRE_BOOL_FALSE)) as usize] =
                             fp.index as u8;
@@ -5427,6 +6446,8 @@ impl CompiledCodec {
             fast_slot_encode,
             fast_slot_decode,
             tp_alloc,
+            tp_alloc_fn: tp_alloc.unwrap_or(ffi::PyType_GenericAlloc),
+            cls_ptr: self.cls.as_ptr().cast::<ffi::PyTypeObject>(),
             empty_str: PyString::intern(py, "").unbind(),
             min_wire_reserve,
             all_seen_mask_64,

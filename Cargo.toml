@@ -1,6 +1,6 @@
 [package]
 name = "omnibuf-py-ext"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -16,6 +16,9 @@ omnibuf_core = { package = "omnibuf", version = "0.1.4", default-features = fals
 pyo3 = { version = "0.30", features = ["extension-module"] }
 ryu = "1.0"
 itoa = "1.0"
+
+[build-dependencies]
+pyo3-build-config = "0.30"
 
 [profile.dev]
 opt-level = 3
