@@ -22,9 +22,9 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "omnibuf"
-version = "0.1.4"
+version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f1b0782bb8593e61a5da9ed8d92c20d5fd9a48382b3369dabdcc0a2d4b29352"
+checksum = "5c437f0659799c9034d9d5c945d85ccb39ffae4c3cafaff5abcf96b10b792484"
 dependencies = [
  "itoa",
  "ryu",
