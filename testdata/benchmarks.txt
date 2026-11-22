@@ -8,67 +8,67 @@ Methodology: Full decode reads all 11 fields; mutations check city and increment
 
 | Codec / Operation | Latency (ns/op) | Throughput (ops/sec) | Wire Size (B) | vs Baseline |
 |---|---:|---:|---:|---:|
-| OmniBuf (Generated) | 411 ns | 2,434,328 | 366 | 1.00x (baseline) |
-| OmniBuf (@dataclass) | 418 ns | 2,393,272 | 366 | 1.00x (baseline) |
-| protobuf-py | 931 ns | 1,073,726 | 341 | 2.27x slower |
-| google.protobuf (upb) | 432 ns | 2,316,944 | 341 | 1.05x slower |
-| msgspec | 625 ns | 1,598,872 | 634 | 1.52x slower |
-| msgpack | 1,699 ns | 588,747 | 634 | 4.13x slower |
-| json (stdlib) | 4,859 ns | 205,825 | 874 | 11.83x slower |
+| OmniBuf (Generated) | 420 ns | 2,383,487 | 366 | 1.00x (baseline) |
+| OmniBuf (@dataclass) | 430 ns | 2,323,633 | 366 | 1.00x (baseline) |
+| protobuf-py | 958 ns | 1,043,753 | 341 | 2.28x slower |
+| google.protobuf (upb) | 441 ns | 2,268,487 | 341 | 1.05x slower |
+| msgspec | 637 ns | 1,568,910 | 634 | 1.52x slower |
+| msgpack | 1,698 ns | 588,929 | 634 | 4.05x slower |
+| json (stdlib) | 4,911 ns | 203,645 | 874 | 11.70x slower |
 
 ### 2. Full Message Decode Speed
 
 | Codec / Operation | Latency (ns/op) | Throughput (ops/sec) | vs Baseline |
 |---|---:|---:|---:|
-| OmniBuf (Generated) | 1,942 ns | 514,938 | 1.00x (baseline) |
-| OmniBuf (@dataclass) | 1,949 ns | 513,019 | 1.00x (baseline) |
-| protobuf-py | 3,348 ns | 298,702 | 1.72x slower |
-| google.protobuf (upb) | 4,518 ns | 221,341 | 2.33x slower |
-| msgspec | 2,106 ns | 474,780 | 1.08x slower |
-| msgpack | 3,917 ns | 255,297 | 2.02x slower |
-| json (stdlib) | 6,193 ns | 161,474 | 3.19x slower |
+| OmniBuf (Generated) | 2,117 ns | 472,272 | 1.00x (baseline) |
+| OmniBuf (@dataclass) | 2,054 ns | 486,787 | 1.00x (baseline) |
+| protobuf-py | 3,199 ns | 312,554 | 1.51x slower |
+| google.protobuf (upb) | 4,676 ns | 213,849 | 2.21x slower |
+| msgspec | 2,201 ns | 454,270 | 1.04x slower |
+| msgpack | 4,170 ns | 239,793 | 1.97x slower |
+| json (stdlib) | 6,247 ns | 160,087 | 2.95x slower |
 
 ### 3. Read a Single Nested Field
 
 | Codec / Operation | Latency (ns/op) | Throughput (ops/sec) | vs Baseline |
 |---|---:|---:|---:|
-| OmniBuf (Generated) | 502 ns | 1,992,585 | 1.00x (baseline) |
-| protobuf-py | 2,165 ns | 461,793 | 4.31x slower |
-| google.protobuf (upb) | 783 ns | 1,277,714 | 1.56x slower |
-| msgspec | 1,159 ns | 862,635 | 2.31x slower |
-| msgpack | 2,928 ns | 341,540 | 5.83x slower |
-| json (stdlib) | 4,828 ns | 207,104 | 9.62x slower |
+| OmniBuf (Generated) | 519 ns | 1,926,316 | 1.00x (baseline) |
+| protobuf-py | 2,183 ns | 458,188 | 4.20x slower |
+| google.protobuf (upb) | 798 ns | 1,253,674 | 1.54x slower |
+| msgspec | 1,185 ns | 843,785 | 2.28x slower |
+| msgpack | 2,795 ns | 357,803 | 5.38x slower |
+| json (stdlib) | 4,905 ns | 203,854 | 9.45x slower |
 
 ### 4. Selective Single-Field Mutation
 
 | Codec / Operation | Latency (ns/op) | Throughput (ops/sec) | vs Baseline |
 |---|---:|---:|---:|
-| OmniBuf (Generated) | 808 ns | 1,237,574 | 1.00x (baseline) |
-| protobuf-py | 3,230 ns | 309,645 | 4.00x slower |
-| google.protobuf (upb) | 1,356 ns | 737,454 | 1.68x slower |
-| msgspec | 1,826 ns | 547,587 | 2.26x slower |
-| msgpack | 4,529 ns | 220,783 | 5.61x slower |
-| json (stdlib) | 9,857 ns | 101,447 | 12.20x slower |
+| OmniBuf (Generated) | 823 ns | 1,215,231 | 1.00x (baseline) |
+| protobuf-py | 3,255 ns | 307,238 | 3.96x slower |
+| google.protobuf (upb) | 1,373 ns | 728,556 | 1.67x slower |
+| msgspec | 1,854 ns | 539,506 | 2.25x slower |
+| msgpack | 4,626 ns | 216,191 | 5.62x slower |
+| json (stdlib) | 10,061 ns | 99,393 | 12.23x slower |
 
 ### 5. Large Embedded Message Encode
 
 | Codec / Operation | Latency (ns/op) | Throughput (ops/sec) | Wire Size (B) | vs Baseline |
 |---|---:|---:|---:|---:|
-| OmniBuf (Generated) | 2,138 ns | 467,756 | 39256 | 1.00x (baseline) |
-| OmniBuf (@dataclass) | 2,040 ns | 490,134 | 39256 | 1.05x faster |
-| protobuf-py | 3,162 ns | 316,209 | 39227 | 1.48x slower |
-| google.protobuf (upb) | 2,230 ns | 448,480 | 39227 | 1.04x slower |
-| msgspec | 1,946 ns | 513,972 | 39516 | 1.10x faster |
-| msgpack | 3,286 ns | 304,336 | 39516 | 1.54x slower |
-| json (stdlib) | 67,099 ns | 14,903 | 39752 | 31.39x slower |
+| OmniBuf (Generated) | 2,203 ns | 454,002 | 39256 | 1.00x (baseline) |
+| OmniBuf (@dataclass) | 2,186 ns | 457,496 | 39256 | 1.00x (baseline) |
+| protobuf-py | 3,398 ns | 294,295 | 39227 | 1.54x slower |
+| google.protobuf (upb) | 2,254 ns | 443,743 | 39227 | 1.00x (baseline) |
+| msgspec | 1,893 ns | 528,320 | 39516 | 1.16x faster |
+| msgpack | 3,306 ns | 302,513 | 39516 | 1.50x slower |
+| json (stdlib) | 69,407 ns | 14,408 | 39752 | 31.51x slower |
 
 ### 6. Embedded Message Growth
 
 | Codec / Operation | Latency (ns/op) | Throughput (ops/sec) | vs Baseline |
 |---|---:|---:|---:|
-| OmniBuf (Generated) | 2,768 ns | 361,334 | 1.00x (baseline) |
-| protobuf-py | 13,707 ns | 72,956 | 4.95x slower |
-| google.protobuf (upb) | 4,409 ns | 226,821 | 1.59x slower |
-| msgspec | 7,074 ns | 141,368 | 2.56x slower |
-| msgpack | 18,675 ns | 53,547 | 6.75x slower |
-| json (stdlib) | 64,558 ns | 15,490 | 23.33x slower |
+| OmniBuf (Generated) | 2,606 ns | 383,767 | 1.00x (baseline) |
+| protobuf-py | 14,033 ns | 71,261 | 5.39x slower |
+| google.protobuf (upb) | 4,689 ns | 213,247 | 1.80x slower |
+| msgspec | 7,222 ns | 138,466 | 2.77x slower |
+| msgpack | 19,173 ns | 52,157 | 7.36x slower |
+| json (stdlib) | 64,748 ns | 15,445 | 24.85x slower |
