@@ -13,7 +13,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 omnibuf_core = { package = "omnibuf", version = "0.1.2", default-features = false }
-pyo3 = { version = "0.28", features = ["extension-module"] }
+pyo3 = { version = "0.30", features = ["extension-module"] }
 ryu = "1.0"
 itoa = "1.0"
 
