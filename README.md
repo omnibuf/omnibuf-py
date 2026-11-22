@@ -148,16 +148,7 @@ payload_json = omnibuf.decode_blind_json(raw)
 
 ## Benchmarks
 
-`benchmarks/bench.py` measures `PeerUpdate` across six categories:
-
-- Full Message Encode Speed
-- Full Message Decode Speed
-- Read a Single Nested Field
-- Selective Single-Field Mutation
-- Large Embedded Message Encode
-- Embedded Message Growth
-
-Methodology: canonical `PeerUpdate` carries 11 fields (`366 B` in OmniBuf, `341 B` in Protobuf). Full decode materializes and reads all 11 fields across every codec. Mutation benchmarks check `location.city == "Frankfurt"` before incrementing `sequence` or growing `location.datacenter` past `16 KiB` ahead of 32 trailing `Neighbor` entries.
+Python benchmark results, methodology, and cross-language comparisons live at [omnibuf.com/benchmarks?lang=py](https://omnibuf.com/benchmarks?lang=py) (all languages at [omnibuf.com/benchmarks](https://omnibuf.com/benchmarks)). Run `just bench` to execute `benchmarks/bench.py` locally and update [`testdata/benchmarks.json`](testdata/benchmarks.json).
 
 ## Development Workflow
 
