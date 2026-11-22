@@ -5304,7 +5304,8 @@ impl CompiledCodec {
                 Some(a) => std::ptr::fn_addr_eq(a, ffi::PyType_GenericAlloc as ffi::allocfunc),
                 None => false,
             };
-            if same_new && ((*cls_ptr).tp_flags & ffi::Py_TPFLAGS_IS_ABSTRACT) == 0 && same_alloc {
+            let tp_flags = ffi::PyType_GetFlags(cls_ptr);
+            if same_new && (tp_flags & ffi::Py_TPFLAGS_IS_ABSTRACT) == 0 && same_alloc {
                 (*cls_ptr).tp_alloc
             } else {
                 None
