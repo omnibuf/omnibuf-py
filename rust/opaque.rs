@@ -12,13 +12,27 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBool, PyBytes, PyDict, PyFloat, PyList, PyString, PyTuple, PyType};
 
 use crate::codec::{
-    CompiledCodec, ScalarKind, extract_bool, extract_f64, extract_i64, extract_u64,
-    read_scalar_payload,
+    CompiledCodec, DecodeSliceOpts, ScalarKind, extract_bool, extract_f64, extract_i64,
+    extract_u64, read_scalar_payload,
 };
 use crate::{
     ByteSliceOwner, DecodeBudget, LeafBytes, create_readonly_memoryview_slice, decode_err,
     encode_err, read_field0_checked, validate_field0_slice, validate_message_slice,
 };
+
+#[inline]
+fn py_u64(py: Python<'_>, v: u64) -> PyResult<Bound<'_, PyAny>> {
+    // SAFETY: GIL is held (`py`); `PyLong_FromUnsignedLongLong` returns a new reference or null
+    // with a Python exception set, which `from_owned_ptr_or_err` handles safely.
+    unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromUnsignedLongLong(v)) }
+}
+
+#[inline]
+fn py_i64(py: Python<'_>, v: i64) -> PyResult<Bound<'_, PyAny>> {
+    // SAFETY: GIL is held (`py`); `PyLong_FromLongLong` returns a new reference or null with a
+    // Python exception set, which `from_owned_ptr_or_err` handles safely.
+    unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromLongLong(v)) }
+}
 
 #[derive(Clone, Copy)]
 struct FieldDirEntry {
@@ -67,18 +81,10 @@ impl FastDirty {
         match self {
             Self::Cleared(_) => Ok(py.None().into_bound(py)),
             Self::Bool(_, b) => Ok(PyBool::new(py, *b).to_owned().into_any()),
-            Self::Uint(_, u) | Self::Fixed64(_, u) => unsafe {
-                Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromUnsignedLongLong(*u))
-            },
-            Self::Fixed32(_, u) => unsafe {
-                Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromUnsignedLongLong(u64::from(*u)))
-            },
-            Self::Sint(_, i, _) | Self::Sfixed64(_, i) => unsafe {
-                Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromLongLong(*i))
-            },
-            Self::Sfixed32(_, i) => unsafe {
-                Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromLongLong(i64::from(*i)))
-            },
+            Self::Uint(_, u) | Self::Fixed64(_, u) => py_u64(py, *u),
+            Self::Fixed32(_, u) => py_u64(py, u64::from(*u)),
+            Self::Sint(_, i, _) | Self::Sfixed64(_, i) => py_i64(py, *i),
+            Self::Sfixed32(_, i) => py_i64(py, i64::from(*i)),
             Self::Float32(_, f) => Ok(PyFloat::new(py, f64::from(*f)).into_any()),
             Self::Float64(_, f) => Ok(PyFloat::new(py, *f).into_any()),
             Self::Str(_, s) => Ok(PyString::new(py, s).into_any()),
@@ -785,6 +791,9 @@ impl OpaqueView {
             only_start + field_buf.len() + (src_len - only_end)
         };
 
+        // SAFETY: GIL is held (`py`). `PyBytes_FromStringAndSize(NULL, total_len)` allocates a
+        // fresh uninitialized `PyBytes` buffer of `total_len` bytes that is uniquely owned here;
+        // all three copy regions are non-overlapping and sum to `total_len`.
         let out_bytes: Bound<'py, PyBytes> = unsafe {
             let ptr =
                 ffi::PyBytes_FromStringAndSize(std::ptr::null(), total_len as ffi::Py_ssize_t);
@@ -935,7 +944,7 @@ impl OpaqueView {
         let entries = self.ensure_dir(py)?;
         let v = checked_read_uint(py, entries, self.backing.as_slice(py), fnum, &[])?
             .map_or(0, |u| u64::from(u as u32));
-        unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromUnsignedLongLong(v)) }
+        py_u64(py, v)
     }
 
     #[pyo3(signature = (fnum, siblings=None))]
@@ -954,9 +963,7 @@ impl OpaqueView {
         else {
             return Ok(py.None().into_bound(py));
         };
-        unsafe {
-            Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromUnsignedLongLong(u64::from(u as u32)))
-        }
+        py_u64(py, u64::from(u as u32))
     }
 
     pub fn _get_uint64<'py>(&self, py: Python<'py>, fnum: u32) -> PyResult<Bound<'py, PyAny>> {
@@ -965,7 +972,7 @@ impl OpaqueView {
         }
         let entries = self.ensure_dir(py)?;
         let v = checked_read_uint(py, entries, self.backing.as_slice(py), fnum, &[])?.unwrap_or(0);
-        unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromUnsignedLongLong(v)) }
+        py_u64(py, v)
     }
 
     #[pyo3(signature = (fnum, siblings=None))]
@@ -984,7 +991,7 @@ impl OpaqueView {
         else {
             return Ok(py.None().into_bound(py));
         };
-        unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromUnsignedLongLong(u)) }
+        py_u64(py, u)
     }
 
     pub fn _get_sint32<'py>(&self, py: Python<'py>, fnum: u32) -> PyResult<Bound<'py, PyAny>> {
@@ -994,7 +1001,7 @@ impl OpaqueView {
         let entries = self.ensure_dir(py)?;
         let v = checked_read_sint(py, entries, self.backing.as_slice(py), fnum, &[])?
             .map_or(0, |i| i64::from(i as i32));
-        unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromLongLong(v)) }
+        py_i64(py, v)
     }
 
     #[pyo3(signature = (fnum, siblings=None))]
@@ -1013,7 +1020,7 @@ impl OpaqueView {
         else {
             return Ok(py.None().into_bound(py));
         };
-        unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromLongLong(i64::from(i as i32))) }
+        py_i64(py, i64::from(i as i32))
     }
 
     pub fn _get_sint64<'py>(&self, py: Python<'py>, fnum: u32) -> PyResult<Bound<'py, PyAny>> {
@@ -1022,7 +1029,7 @@ impl OpaqueView {
         }
         let entries = self.ensure_dir(py)?;
         let v = checked_read_sint(py, entries, self.backing.as_slice(py), fnum, &[])?.unwrap_or(0);
-        unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromLongLong(v)) }
+        py_i64(py, v)
     }
 
     #[pyo3(signature = (fnum, siblings=None))]
@@ -1041,7 +1048,7 @@ impl OpaqueView {
         else {
             return Ok(py.None().into_bound(py));
         };
-        unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromLongLong(i)) }
+        py_i64(py, i)
     }
 
     pub fn _get_bool<'py>(&self, py: Python<'py>, fnum: u32) -> PyResult<Bound<'py, PyAny>> {
@@ -1079,7 +1086,7 @@ impl OpaqueView {
         let v = u64::from(
             checked_read_fixed32(py, entries, self.backing.as_slice(py), fnum, &[])?.unwrap_or(0),
         );
-        unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromUnsignedLongLong(v)) }
+        py_u64(py, v)
     }
 
     #[pyo3(signature = (fnum, siblings=None))]
@@ -1098,7 +1105,7 @@ impl OpaqueView {
         else {
             return Ok(py.None().into_bound(py));
         };
-        unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromUnsignedLongLong(u64::from(u))) }
+        py_u64(py, u64::from(u))
     }
 
     pub fn _get_sfixed32<'py>(&self, py: Python<'py>, fnum: u32) -> PyResult<Bound<'py, PyAny>> {
@@ -1109,7 +1116,7 @@ impl OpaqueView {
         let v = i64::from(
             checked_read_sfixed32(py, entries, self.backing.as_slice(py), fnum, &[])?.unwrap_or(0),
         );
-        unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromLongLong(v)) }
+        py_i64(py, v)
     }
 
     #[pyo3(signature = (fnum, siblings=None))]
@@ -1128,7 +1135,7 @@ impl OpaqueView {
         else {
             return Ok(py.None().into_bound(py));
         };
-        unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromLongLong(i64::from(i))) }
+        py_i64(py, i64::from(i))
     }
 
     pub fn _get_fixed64<'py>(&self, py: Python<'py>, fnum: u32) -> PyResult<Bound<'py, PyAny>> {
@@ -1138,7 +1145,7 @@ impl OpaqueView {
         let entries = self.ensure_dir(py)?;
         let v =
             checked_read_fixed64(py, entries, self.backing.as_slice(py), fnum, &[])?.unwrap_or(0);
-        unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromUnsignedLongLong(v)) }
+        py_u64(py, v)
     }
 
     #[pyo3(signature = (fnum, siblings=None))]
@@ -1157,7 +1164,7 @@ impl OpaqueView {
         else {
             return Ok(py.None().into_bound(py));
         };
-        unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromUnsignedLongLong(u)) }
+        py_u64(py, u)
     }
 
     pub fn _get_sfixed64<'py>(&self, py: Python<'py>, fnum: u32) -> PyResult<Bound<'py, PyAny>> {
@@ -1167,7 +1174,7 @@ impl OpaqueView {
         let entries = self.ensure_dir(py)?;
         let v =
             checked_read_sfixed64(py, entries, self.backing.as_slice(py), fnum, &[])?.unwrap_or(0);
-        unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromLongLong(v)) }
+        py_i64(py, v)
     }
 
     #[pyo3(signature = (fnum, siblings=None))]
@@ -1186,7 +1193,7 @@ impl OpaqueView {
         else {
             return Ok(py.None().into_bound(py));
         };
-        unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromLongLong(i)) }
+        py_i64(py, i)
     }
 
     pub fn _get_float32<'py>(&self, py: Python<'py>, fnum: u32) -> PyResult<Bound<'py, PyAny>> {
@@ -1254,6 +1261,7 @@ impl OpaqueView {
         }
         let entries = self.ensure_dir(py)?;
         if let Some(s) = checked_read_str(py, entries, self.backing.as_slice(py), fnum, &[])? {
+            // SAFETY: GIL is held (`py`); `s` is validated UTF-8 and valid for `s.len()` bytes.
             unsafe {
                 Bound::from_owned_ptr_or_err(
                     py,
@@ -1283,6 +1291,7 @@ impl OpaqueView {
         let Some(s) = checked_read_str(py, entries, self.backing.as_slice(py), fnum, &sibs)? else {
             return Ok(py.None().into_bound(py));
         };
+        // SAFETY: GIL is held (`py`); `s` is validated UTF-8 and valid for `s.len()` bytes.
         unsafe {
             Bound::from_owned_ptr_or_err(
                 py,
@@ -1328,7 +1337,10 @@ impl OpaqueView {
 
     pub fn _get_bytes_view<'py>(&self, py: Python<'py>, fnum: u32) -> PyResult<Bound<'py, PyAny>> {
         if let Some(d) = self.find_dirty(py, fnum)? {
+            // SAFETY: GIL is held (`py`) and `d` is a valid `PyObject`; `cast_into_unchecked`
+            // is guarded by `PyBytes_CheckExact`.
             let pb = if unsafe { ffi::PyBytes_CheckExact(d.as_ptr()) != 0 } {
+                // SAFETY: `PyBytes_CheckExact` just confirmed `d` is an exact `PyBytes`.
                 unsafe { d.cast_into_unchecked::<PyBytes>() }
             } else {
                 let leaf = LeafBytes::extract(py, &d)?;
@@ -1360,7 +1372,9 @@ impl OpaqueView {
             if d.is_none() {
                 return Ok(py.None().into_bound(py));
             }
+            // SAFETY: GIL is held (`py`) and `d` is a valid `PyObject`.
             let pb = if unsafe { ffi::PyBytes_CheckExact(d.as_ptr()) != 0 } {
+                // SAFETY: `PyBytes_CheckExact` just confirmed `d` is an exact `PyBytes`.
                 unsafe { d.cast_into_unchecked::<PyBytes>() }
             } else {
                 let leaf = LeafBytes::extract(py, &d)?;
@@ -1406,11 +1420,13 @@ impl OpaqueView {
             let decoded = sub_codec.decode_slice_budget(
                 py,
                 body,
-                result.as_ref(),
-                1,
-                result.is_some(),
+                DecodeSliceOpts {
+                    out: result.as_ref(),
+                    depth: 1,
+                    merge: result.is_some(),
+                    zc_owner: None,
+                },
                 &mut budget,
-                None,
             )?;
             result = Some(decoded);
         }
@@ -1567,11 +1583,8 @@ impl OpaqueView {
                 let elem_obj = sub_codec.decode_slice_budget(
                     py,
                     elem_slice,
-                    None,
-                    2,
-                    false,
+                    DecodeSliceOpts::fresh(2),
                     &mut budget,
-                    None,
                 )?;
                 out.append(elem_obj)?;
             }
@@ -1650,8 +1663,12 @@ impl OpaqueView {
                 let (v_obj, after_v) = if let Some(sc) = sub_codec {
                     let (v_slice, vp) = read_len_slice(body, after_k, 0)
                         .map_err(|e| decode_err(py, e.to_string()))?;
-                    let msg_v =
-                        sc.decode_slice_budget(py, v_slice, None, 2, false, &mut budget, None)?;
+                    let msg_v = sc.decode_slice_budget(
+                        py,
+                        v_slice,
+                        DecodeSliceOpts::fresh(2),
+                        &mut budget,
+                    )?;
                     (msg_v, vp)
                 } else {
                     read_scalar_payload(py, body, after_k, val_scalar_kind.unwrap(), None, None)?
@@ -1900,6 +1917,8 @@ impl OpaqueView {
             }
             return Err(encode_err(py, "omnibuf: string value cannot be None"));
         }
+        // SAFETY: GIL is held (`py`); `PyUnicode_AsUTF8AndSize` returns either null (with a Python
+        // error set) or a pointer valid for `size` UTF-8 bytes tied to `val`'s lifetime.
         let s = unsafe {
             let mut size: ffi::Py_ssize_t = 0;
             let utf8_ptr = ffi::PyUnicode_AsUTF8AndSize(val.as_ptr(), &mut size);

@@ -21,6 +21,64 @@ use crate::{
     extract_max_elements, validate_field0_slice, validate_unknown_value,
 };
 
+struct MapEncodeSpec<'a> {
+    fp: &'a FieldPlan,
+    key_kind: ScalarKind,
+    val_plan: &'a MapValPlan,
+}
+
+#[derive(Clone, Copy)]
+struct WirePtrs {
+    base: *const u8,
+    cur: *const u8,
+    end: *const u8,
+}
+
+#[derive(Clone, Copy)]
+struct FastSlotTarget<'a> {
+    inner: &'a CodecInner,
+    dst_ptr: *mut ffi::PyObject,
+}
+
+#[derive(Clone, Copy)]
+struct FastFieldRef<'a> {
+    idx: usize,
+    fdf: &'a FastDecodeField,
+    already_seen: bool,
+}
+
+#[derive(Clone, Copy)]
+struct SliceCursor<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+#[derive(Clone, Copy)]
+struct FastArrayField<'a> {
+    inner: &'a CodecInner,
+    f_idx: usize,
+    fdf: &'a FastDecodeField,
+}
+
+pub(crate) struct DecodeSliceOpts<'a, 'py> {
+    pub out: Option<&'a Bound<'py, PyAny>>,
+    pub depth: usize,
+    pub merge: bool,
+    pub zc_owner: Option<(&'a ByteSliceOwner, usize)>,
+}
+
+impl<'a, 'py> DecodeSliceOpts<'a, 'py> {
+    #[inline]
+    pub(crate) fn fresh(depth: usize) -> Self {
+        Self {
+            out: None,
+            depth,
+            merge: false,
+            zc_owner: None,
+        }
+    }
+}
+
 thread_local! {
     static TLS_ENCODER: RefCell<Encoder> = RefCell::new(Encoder::new(4096));
     // Stores Copy `(cls_ptr, codec_obj_ptr, epoch)` tuples for GIL-protected lookup.
@@ -40,6 +98,7 @@ static DATACLASS_RESOLVER: OnceLock<Py<PyAny>> = OnceLock::new();
 
 #[inline(always)]
 unsafe fn decode_varint_ptr(cur: &mut *const u8, end: *const u8) -> Option<u64> {
+    // SAFETY: Caller guarantees `*cur <= end` within one allocation; every read checks `rem` before dereferencing.
     unsafe {
         let p = *cur;
         if p >= end {
@@ -85,6 +144,7 @@ unsafe fn read_len_ptr(
     end: *const u8,
     min_len: usize,
 ) -> Option<(*const u8, usize)> {
+    // SAFETY: Caller guarantees `*cur <= end` within one allocation; length is checked against `end - start`.
     unsafe {
         let p = *cur;
         if p >= end {
@@ -109,6 +169,7 @@ unsafe fn read_len_ptr(
 
 #[inline(always)]
 unsafe fn copy_and_check_ascii(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    // SAFETY: Caller guarantees `src` is valid for `len` bytes, `dst` is writable for `len` bytes (`len >= 2`), and they do not overlap.
     unsafe {
         #[cfg(target_pointer_width = "64")]
         {
@@ -179,6 +240,7 @@ unsafe fn py_str_from_utf8_short(
     len: usize,
     inner: &CodecInner,
 ) -> *mut ffi::PyObject {
+    // SAFETY: Caller holds the GIL (`py`) and `ptr` is valid for `len` bytes (`len <= 1`).
     unsafe {
         if len == 0 {
             let empty_str = inner.empty_str.as_ptr();
@@ -199,6 +261,7 @@ unsafe fn py_str_from_utf8_non_ascii(
     ptr: *const u8,
     len: usize,
 ) -> *mut ffi::PyObject {
+    // SAFETY: Caller holds the GIL (`py`) and `ptr` is valid for `len` bytes; UTF-8 is validated before `PyUnicode_FromStringAndSize`.
     unsafe {
         let bytes = std::slice::from_raw_parts(ptr, len);
         if let Err(e) = validate_utf8(bytes) {
@@ -217,6 +280,7 @@ unsafe fn py_str_from_utf8_non_ascii_drop(
     ptr: *const u8,
     len: usize,
 ) -> *mut ffi::PyObject {
+    // SAFETY: Caller holds the GIL (`py`), owns `stale_obj`, and `ptr` is valid for `len` bytes.
     unsafe {
         ffi::Py_DECREF(stale_obj);
         py_str_from_utf8_non_ascii(py, ptr, len)
@@ -226,12 +290,14 @@ unsafe fn py_str_from_utf8_non_ascii_drop(
 #[cfg(not(any(Py_GIL_DISABLED, PyPy, GraalPy, Py_LIMITED_API, Py_3_15)))]
 #[inline(always)]
 unsafe fn py_unicode_ascii_data(obj: *mut ffi::PyObject) -> *mut u8 {
+    // SAFETY: Caller passes a freshly allocated compact ASCII `PyUnicodeObject` whose 1-byte buffer immediately follows `PyASCIIObject`.
     unsafe { obj.cast::<ffi::PyASCIIObject>().add(1).cast::<u8>() }
 }
 
 #[cfg(all(any(Py_GIL_DISABLED, Py_3_15), not(any(PyPy, GraalPy, Py_LIMITED_API))))]
 #[inline(always)]
 unsafe fn py_unicode_ascii_data(obj: *mut ffi::PyObject) -> *mut u8 {
+    // SAFETY: Caller holds the Python runtime and passes a freshly allocated compact ASCII `PyUnicodeObject`.
     unsafe { ffi::PyUnicode_1BYTE_DATA(obj) }
 }
 
@@ -242,6 +308,7 @@ unsafe fn py_str_from_utf8_raw(
     len: usize,
     inner: &CodecInner,
 ) -> *mut ffi::PyObject {
+    // SAFETY: Caller holds the GIL (`py`), `ptr` is valid for `len` bytes, and `PyUnicode_New(len, 127)` allocates a writable `len`-byte ASCII buffer.
     unsafe {
         if len <= 1 {
             return py_str_from_utf8_short(py, ptr, len, inner);
@@ -285,6 +352,7 @@ unsafe fn py_str_from_utf8_raw(
 
 #[inline(always)]
 unsafe fn py_long_from_u32_raw(v: u32) -> *mut ffi::PyObject {
+    // SAFETY: Caller holds the GIL; CPython `PyLong_From*` returns a new owned reference or null with an exception set.
     unsafe {
         if std::mem::size_of::<std::os::raw::c_long>() >= 8 {
             ffi::PyLong_FromLong(v as std::os::raw::c_long)
@@ -296,11 +364,13 @@ unsafe fn py_long_from_u32_raw(v: u32) -> *mut ffi::PyObject {
 
 #[inline(always)]
 unsafe fn py_long_from_i32_raw(v: i32) -> *mut ffi::PyObject {
+    // SAFETY: Caller holds the GIL; `PyLong_FromLong` returns a new owned reference or null with an exception set.
     unsafe { ffi::PyLong_FromLong(v as std::os::raw::c_long) }
 }
 
 #[inline(always)]
 unsafe fn py_long_from_u64_raw(v: u64) -> *mut ffi::PyObject {
+    // SAFETY: Caller holds the GIL; CPython `PyLong_From*` returns a new owned reference or null with an exception set.
     unsafe {
         if std::mem::size_of::<std::os::raw::c_long>() >= 8 && v <= i64::MAX as u64 {
             ffi::PyLong_FromLong(v as std::os::raw::c_long)
@@ -312,6 +382,7 @@ unsafe fn py_long_from_u64_raw(v: u64) -> *mut ffi::PyObject {
 
 #[inline(always)]
 unsafe fn py_long_from_i64_raw(v: i64) -> *mut ffi::PyObject {
+    // SAFETY: Caller holds the GIL; CPython `PyLong_From*` returns a new owned reference or null with an exception set.
     unsafe {
         if std::mem::size_of::<std::os::raw::c_long>() >= 8 {
             ffi::PyLong_FromLong(v as std::os::raw::c_long)
@@ -324,6 +395,7 @@ unsafe fn py_long_from_i64_raw(v: i64) -> *mut ffi::PyObject {
 #[cold]
 #[inline(never)]
 unsafe fn store_slot_replace(slot: *mut *mut ffi::PyObject, rv: *mut ffi::PyObject) {
+    // SAFETY: Caller holds the GIL; `slot` points to a valid `PyObject*` slot and `rv` is a new owned reference.
     unsafe {
         let old = *slot;
         *slot = rv;
@@ -334,6 +406,7 @@ unsafe fn store_slot_replace(slot: *mut *mut ffi::PyObject, rv: *mut ffi::PyObje
 #[cold]
 #[inline(never)]
 unsafe fn fail_decref(dst_ptr: *mut ffi::PyObject) -> *mut ffi::PyObject {
+    // SAFETY: Caller holds the GIL and transfers ownership of the non-null `dst_ptr` to be decref'd on error.
     unsafe {
         ffi::Py_DECREF(dst_ptr);
         std::ptr::null_mut()
@@ -343,6 +416,7 @@ unsafe fn fail_decref(dst_ptr: *mut ffi::PyObject) -> *mut ffi::PyObject {
 #[cold]
 #[inline(never)]
 unsafe fn fail_decref2(a: *mut ffi::PyObject, b: *mut ffi::PyObject) -> *mut ffi::PyObject {
+    // SAFETY: Caller holds the GIL and transfers ownership of both non-null `PyObject*` pointers to be decref'd on error.
     unsafe {
         ffi::Py_DECREF(a);
         ffi::Py_DECREF(b);
@@ -357,6 +431,7 @@ unsafe fn fail_decode_msg(
     dst_ptr: *mut ffi::PyObject,
     msg: &'static str,
 ) -> *mut ffi::PyObject {
+    // SAFETY: Caller holds the GIL (`py`) and transfers ownership of the non-null `dst_ptr` to be decref'd on error.
     unsafe {
         ffi::Py_DECREF(dst_ptr);
         decode_err(py, msg).restore(py);
@@ -371,6 +446,7 @@ unsafe fn fail_decode_err(
     dst_ptr: *mut ffi::PyObject,
     err: PyErr,
 ) -> *mut ffi::PyObject {
+    // SAFETY: Caller holds the GIL (`py`) and transfers ownership of the non-null `dst_ptr` to be decref'd on error.
     unsafe {
         ffi::Py_DECREF(dst_ptr);
         err.restore(py);
@@ -386,6 +462,7 @@ unsafe fn fail_decref2_msg(
     b: *mut ffi::PyObject,
     msg: &'static str,
 ) -> *mut ffi::PyObject {
+    // SAFETY: Caller holds the GIL (`py`) and transfers ownership of both non-null `PyObject*` pointers to be decref'd on error.
     unsafe {
         ffi::Py_DECREF(a);
         ffi::Py_DECREF(b);
@@ -400,6 +477,7 @@ fn decode_varint_fast(data: &[u8], pos: usize) -> Option<(u64, usize)> {
         return None;
     }
     let rem = data.len() - pos;
+    // SAFETY: `pos < data.len()` is checked above, and each multi-byte unaligned read checks `rem`.
     unsafe {
         let ptr = data.as_ptr().add(pos);
         let b0 = *ptr;
@@ -447,6 +525,7 @@ fn read_len_slice_fast(
     if end > data.len() {
         return Err("omnibuf: unexpected EOF reading length-prefixed value");
     }
+    // SAFETY: `start <= end <= data.len()` is verified directly above.
     Ok((unsafe { data.get_unchecked(start..end) }, end))
 }
 
@@ -468,6 +547,7 @@ fn parse_array_header_fast(body: &[u8]) -> Option<(u8, usize, usize)> {
 
 #[inline(always)]
 unsafe fn put_varint_inline(ptr: *mut u8, v: u64) -> usize {
+    // SAFETY: Caller guarantees `ptr` is writable for up to 9 bytes.
     unsafe {
         if v <= 127 {
             *ptr = ((v as u8) << 1) | 1;
@@ -494,6 +574,7 @@ unsafe fn slot_submsg_min_wire_size(
     inner: &CodecInner,
     obj_ptr: *mut ffi::PyObject,
 ) -> usize {
+    // SAFETY: Caller holds the GIL; `Py_IS_TYPE(obj_ptr, cls_ptr)` confirms exact class match before reading verified slot offsets.
     unsafe {
         if obj_ptr.is_null() || !inner.fast_slot_encode || ffi::Py_IS_TYPE(obj_ptr, cls_ptr) == 0 {
             return 0;
@@ -531,6 +612,7 @@ fn backpatch_container_fast(dst: &mut Vec<u8>, len_pos: usize) {
     let sub_len = dst.len() - (len_pos + 2);
     if sub_len <= 16_383 {
         let u = (((sub_len as u16) << 2) | 2).to_le();
+        // SAFETY: `len_pos + 2 <= dst.len()`, so the 2-byte length placeholder is within the initialized `Vec`.
         unsafe {
             core::ptr::write_unaligned(dst.as_mut_ptr().add(len_pos).cast::<u16>(), u);
         }
@@ -544,6 +626,7 @@ fn backpatch_container_len4(dst: &mut Vec<u8>, len_pos: usize) {
     let sub_len = dst.len() - (len_pos + 4);
     if sub_len <= 536_870_911 {
         let u = (((sub_len as u32) << 3) | 4).to_le();
+        // SAFETY: `len_pos + 4 <= dst.len()`, so the 4-byte length placeholder is within the initialized `Vec`.
         unsafe {
             core::ptr::write_unaligned(dst.as_mut_ptr().add(len_pos).cast::<u32>(), u);
         }
@@ -560,6 +643,7 @@ fn backpatch_container_len4(dst: &mut Vec<u8>, len_pos: usize) {
 fn write_raw_tag_and_len4_placeholder(dst: &mut Vec<u8>, tag_bytes: [u8; 9], tag_len: u8) -> usize {
     let tlen = usize::from(tag_len).min(9);
     dst.reserve(13);
+    // SAFETY: `dst.reserve(13)` ensures capacity for the 9-byte tag copy and 4-byte placeholder before `set_len`.
     unsafe {
         let len = dst.len();
         let ptr = dst.as_mut_ptr().add(len);
@@ -593,6 +677,7 @@ fn scalar_elem_min_wire_bytes(kind: ScalarKind) -> usize {
 fn write_raw_tag(dst: &mut Vec<u8>, tag_bytes: [u8; 9], tag_len: u8) {
     let tlen = usize::from(tag_len).min(9);
     dst.reserve(9);
+    // SAFETY: `dst.reserve(9)` ensures capacity for the 9-byte tag copy before `set_len(len + tlen)`.
     unsafe {
         let len = dst.len();
         core::ptr::copy_nonoverlapping(tag_bytes.as_ptr(), dst.as_mut_ptr().add(len), 9);
@@ -604,6 +689,7 @@ fn write_raw_tag(dst: &mut Vec<u8>, tag_bytes: [u8; 9], tag_len: u8) {
 fn write_raw_tag_and_len_placeholder(dst: &mut Vec<u8>, tag_bytes: [u8; 9], tag_len: u8) -> usize {
     let tlen = usize::from(tag_len).min(9);
     dst.reserve(11);
+    // SAFETY: `dst.reserve(11)` ensures capacity for the 9-byte tag copy and 2-byte placeholder before `set_len`.
     unsafe {
         let len = dst.len();
         let ptr = dst.as_mut_ptr().add(len);
@@ -619,6 +705,7 @@ fn write_raw_tag_and_len_placeholder(dst: &mut Vec<u8>, tag_bytes: [u8; 9], tag_
 fn write_raw_tagged_varint(dst: &mut Vec<u8>, tag_bytes: [u8; 9], tag_len: u8, v: u64) {
     let tlen = usize::from(tag_len).min(9);
     dst.reserve(18);
+    // SAFETY: `dst.reserve(18)` ensures capacity for up to 9 tag bytes plus up to 9 varint bytes before `set_len`.
     unsafe {
         let len = dst.len();
         let ptr = dst.as_mut_ptr().add(len);
@@ -632,6 +719,7 @@ fn write_raw_tagged_varint(dst: &mut Vec<u8>, tag_bytes: [u8; 9], tag_len: u8, v
 fn write_raw_tagged_fixed4(dst: &mut Vec<u8>, tag_bytes: [u8; 9], tag_len: u8, val: [u8; 4]) {
     let tlen = usize::from(tag_len).min(9);
     dst.reserve(13);
+    // SAFETY: `dst.reserve(13)` ensures capacity for up to 9 tag bytes plus 4 fixed bytes before `set_len`.
     unsafe {
         let len = dst.len();
         let ptr = dst.as_mut_ptr().add(len);
@@ -645,6 +733,7 @@ fn write_raw_tagged_fixed4(dst: &mut Vec<u8>, tag_bytes: [u8; 9], tag_len: u8, v
 fn write_raw_tagged_fixed8(dst: &mut Vec<u8>, tag_bytes: [u8; 9], tag_len: u8, val: [u8; 8]) {
     let tlen = usize::from(tag_len).min(9);
     dst.reserve(17);
+    // SAFETY: `dst.reserve(17)` ensures capacity for up to 9 tag bytes plus 8 fixed bytes before `set_len`.
     unsafe {
         let len = dst.len();
         let ptr = dst.as_mut_ptr().add(len);
@@ -665,6 +754,7 @@ unsafe fn write_raw_tagged_bytes(
 ) {
     let tlen = usize::from(tag_len).min(9);
     dst.reserve(blen.checked_add(18).expect("omnibuf: buffer size overflow"));
+    // SAFETY: `dst.reserve(blen + 18)` ensures capacity; caller guarantees `src_ptr` is valid for `blen` bytes and does not alias `dst`.
     unsafe {
         let len = dst.len();
         let ptr = dst.as_mut_ptr().add(len);
@@ -680,6 +770,7 @@ unsafe fn write_raw_tagged_bytes(
 #[inline(always)]
 unsafe fn write_raw_bytes_elem(dst: &mut Vec<u8>, src_ptr: *const u8, blen: usize) {
     dst.reserve(blen.checked_add(9).expect("omnibuf: buffer size overflow"));
+    // SAFETY: `dst.reserve(blen + 9)` ensures capacity; caller guarantees `src_ptr` is valid for `blen` bytes and does not alias `dst`.
     unsafe {
         let len = dst.len();
         let ptr = dst.as_mut_ptr().add(len);
@@ -761,6 +852,7 @@ impl ScalarKind {
 /// any Python dunder methods (`__index__`, `__int__`, `__float__`, `__bool__`, `__buffer__`).
 #[inline]
 unsafe fn is_exact_primitive(kind: ScalarKind, ptr: *mut ffi::PyObject) -> bool {
+    // SAFETY: Caller holds the GIL and passes a valid non-null `PyObject*`.
     unsafe {
         match kind {
             ScalarKind::Bool => ptr == ffi::Py_True() || ptr == ffi::Py_False(),
@@ -808,6 +900,7 @@ impl FieldAccess {
         py: Python<'py>,
         obj_ptr: *mut ffi::PyObject,
     ) -> PyResult<Bound<'py, PyAny>> {
+        // SAFETY: GIL is held (`py`); `obj_ptr` is a valid `PyObject*`, and `direct_offset` is guarded by `Py_IS_TYPE` against the verified owner class.
         unsafe {
             match self {
                 Self::Slot(sb) => {
@@ -837,6 +930,7 @@ impl FieldAccess {
         py: Python<'py>,
         obj_ptr: *mut ffi::PyObject,
     ) -> PyResult<Option<Bound<'py, PyAny>>> {
+        // SAFETY: GIL is held (`py`); `obj_ptr` is a valid `PyObject*`, and `direct_offset` is guarded by `Py_IS_TYPE` against the verified owner class.
         unsafe {
             match self {
                 Self::Slot(sb) => {
@@ -890,6 +984,7 @@ impl FieldAccess {
         obj_ptr: *mut ffi::PyObject,
         val_ptr: *mut ffi::PyObject,
     ) -> PyResult<()> {
+        // SAFETY: GIL is held (`py`); `obj_ptr` and `val_ptr` are valid `PyObject*`s, and `direct_offset` is guarded by `Py_IS_TYPE`.
         unsafe {
             if let Self::Slot(sb) = self
                 && sb.direct_writable
@@ -923,6 +1018,7 @@ impl FieldAccess {
         obj_ptr: *mut ffi::PyObject,
         val_obj: Bound<'py, PyAny>,
     ) -> PyResult<()> {
+        // SAFETY: GIL is held (`py`); `obj_ptr` is a valid `PyObject*`, `val_obj` transfers an owned reference, and `direct_offset` is guarded by `Py_IS_TYPE`.
         unsafe {
             if let Self::Slot(sb) = self
                 && sb.direct_writable
@@ -1126,6 +1222,7 @@ pub(crate) fn extract_enum_i64(
     ptr: *mut ffi::PyObject,
     field_name: &str,
 ) -> PyResult<i64> {
+    // SAFETY: GIL is held (`py`) and `ptr` is a valid non-null `PyObject*`.
     unsafe {
         if ffi::PyBool_Check(ptr) != 0 {
             return Err(encode_err(
@@ -1156,6 +1253,7 @@ pub(crate) fn extract_i64(
     ptr: *mut ffi::PyObject,
     field_name: &str,
 ) -> PyResult<i64> {
+    // SAFETY: GIL is held (`py`) and `ptr` is a valid non-null `PyObject*`.
     unsafe {
         if ffi::PyLong_CheckExact(ptr) != 0 {
             let mut overflow: std::os::raw::c_int = 0;
@@ -1205,6 +1303,7 @@ pub(crate) fn extract_u64(
     ptr: *mut ffi::PyObject,
     field_name: &str,
 ) -> PyResult<u64> {
+    // SAFETY: GIL is held (`py`) and `ptr` is a valid non-null `PyObject*`.
     unsafe {
         if ffi::PyLong_CheckExact(ptr) != 0 {
             let mut overflow: std::os::raw::c_int = 0;
@@ -1264,6 +1363,7 @@ pub(crate) fn extract_f64(
     ptr: *mut ffi::PyObject,
     field_name: &str,
 ) -> PyResult<f64> {
+    // SAFETY: GIL is held (`py`) and `ptr` is a valid non-null `PyObject*`.
     unsafe {
         if ffi::PyFloat_CheckExact(ptr) != 0 {
             return Ok(ffi::PyFloat_AS_DOUBLE(ptr));
@@ -1294,6 +1394,7 @@ pub(crate) fn extract_f64(
 
 #[inline]
 pub(crate) fn extract_bool(py: Python<'_>, ptr: *mut ffi::PyObject) -> PyResult<bool> {
+    // SAFETY: GIL is held (`py`) and `ptr` is a valid non-null `PyObject*`.
     unsafe {
         if ptr == ffi::Py_True() {
             return Ok(true);
@@ -1403,6 +1504,7 @@ pub(crate) fn write_scalar_payload(
             let v = extract_f64(py, ptr, field_name)?;
             dst.extend_from_slice(&v.to_bits().to_le_bytes());
         }
+        // SAFETY: GIL is held (`py`) and `ptr` is a valid `PyObject*`; `PyUnicode_AsUTF8AndSize` returns a UTF-8 buffer valid for `size` bytes while `ptr` is alive.
         ScalarKind::String | ScalarKind::StrAsBytes => unsafe {
             let mut size: ffi::Py_ssize_t = 0;
             let utf8_ptr = ffi::PyUnicode_AsUTF8AndSize(ptr, &mut size);
@@ -1416,20 +1518,24 @@ pub(crate) fn write_scalar_payload(
             write_raw_bytes_elem(dst, utf8_ptr.cast::<u8>(), size as usize);
         },
         ScalarKind::Bytes => {
+            // SAFETY: GIL is held (`py`) and `ptr` is a valid non-null `PyObject*`.
             let obj = unsafe { Borrowed::from_ptr(py, ptr) };
             let borrowed = LeafBytes::extract(py, &obj)
                 .map_err(|err| encode_err(py, format!("omnibuf: field {field_name}: {err}")))?;
             let slice = borrowed.as_slice();
+            // SAFETY: `slice` is a valid borrowed byte slice that does not alias `dst`.
             unsafe {
                 write_raw_bytes_elem(dst, slice.as_ptr(), slice.len());
             }
         }
         ScalarKind::BytesAsStr => {
+            // SAFETY: GIL is held (`py`) and `ptr` is a valid non-null `PyObject*`.
             let obj = unsafe { Borrowed::from_ptr(py, ptr) };
             let borrowed = LeafBytes::extract(py, &obj)
                 .map_err(|err| encode_err(py, format!("omnibuf: field {field_name}: {err}")))?;
             let slice = borrowed.as_slice();
             validate_utf8(slice).map_err(|e| encode_err(py, e.to_string()))?;
+            // SAFETY: `slice` is a valid borrowed byte slice that does not alias `dst`.
             unsafe {
                 write_raw_bytes_elem(dst, slice.as_ptr(), slice.len());
             }
@@ -1473,6 +1579,7 @@ pub(crate) fn read_scalar_payload<'py>(
                     .ok_or_else(|| decode_err(py, "omnibuf: invalid uint32 varint"))?
             };
             let u32_val = u64::from(v as u32);
+            // SAFETY: GIL is held (`py`); `PyLong_FromUnsignedLongLong` returns a new owned reference or null with an exception set.
             let obj = unsafe {
                 Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromUnsignedLongLong(u32_val))?
             };
@@ -1488,6 +1595,7 @@ pub(crate) fn read_scalar_payload<'py>(
                     .ok_or_else(|| decode_err(py, "omnibuf: invalid uint64 varint"))?
             };
             let obj =
+                // SAFETY: GIL is held (`py`); `PyLong_FromUnsignedLongLong` returns a new owned reference or null with an exception set.
                 unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromUnsignedLongLong(v))? };
             Ok((obj, pos + w))
         }
@@ -1502,6 +1610,7 @@ pub(crate) fn read_scalar_payload<'py>(
             };
             let i32_val = i64::from(decode_zigzag(v) as i32);
             let obj =
+                // SAFETY: GIL is held (`py`); `PyLong_FromLongLong` returns a new owned reference or null with an exception set.
                 unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromLongLong(i32_val))? };
             Ok((obj, pos + w))
         }
@@ -1515,11 +1624,13 @@ pub(crate) fn read_scalar_payload<'py>(
             };
             let i32_val = i64::from(decode_zigzag(v) as i32);
             let obj =
+                // SAFETY: GIL is held (`py`); `PyLong_FromLongLong` returns a new owned reference or null with an exception set.
                 unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromLongLong(i32_val))? };
             if let Some(e_cls) = enum_cls {
                 let wrapped = match e_cls.bind(py).call1((&obj,)) {
                     Ok(w_obj) => w_obj,
                     Err(err) if err.is_instance_of::<PyValueError>(py) => {
+                        // SAFETY: GIL is held (`py`); `PyType_Check` guards casting `e_cls` to `*mut PyTypeObject`.
                         let is_int_enum = unsafe {
                             ffi::PyType_Check(e_cls.as_ptr()) != 0
                                 && ffi::PyType_IsSubtype(
@@ -1554,6 +1665,7 @@ pub(crate) fn read_scalar_payload<'py>(
             };
             let i64_val = decode_zigzag(v);
             let obj =
+                // SAFETY: GIL is held (`py`); `PyLong_FromLongLong` returns a new owned reference or null with an exception set.
                 unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromLongLong(i64_val))? };
             Ok((obj, pos + w))
         }
@@ -1565,6 +1677,7 @@ pub(crate) fn read_scalar_payload<'py>(
                 .unwrap();
             let u = u64::from(u32::from_le_bytes(raw));
             let obj =
+                // SAFETY: GIL is held (`py`); `PyLong_FromUnsignedLongLong` returns a new owned reference or null with an exception set.
                 unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromUnsignedLongLong(u))? };
             Ok((obj, pos + 4))
         }
@@ -1575,6 +1688,7 @@ pub(crate) fn read_scalar_payload<'py>(
                 .try_into()
                 .unwrap();
             let i = i64::from(i32::from_le_bytes(raw));
+            // SAFETY: GIL is held (`py`); `PyLong_FromLongLong` returns a new owned reference or null with an exception set.
             let obj = unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromLongLong(i))? };
             Ok((obj, pos + 4))
         }
@@ -1586,6 +1700,7 @@ pub(crate) fn read_scalar_payload<'py>(
                 .unwrap();
             let u = u64::from_le_bytes(raw);
             let obj =
+                // SAFETY: GIL is held (`py`); `PyLong_FromUnsignedLongLong` returns a new owned reference or null with an exception set.
                 unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromUnsignedLongLong(u))? };
             Ok((obj, pos + 8))
         }
@@ -1596,6 +1711,7 @@ pub(crate) fn read_scalar_payload<'py>(
                 .try_into()
                 .unwrap();
             let i = i64::from_le_bytes(raw);
+            // SAFETY: GIL is held (`py`); `PyLong_FromLongLong` returns a new owned reference or null with an exception set.
             let obj = unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyLong_FromLongLong(i))? };
             Ok((obj, pos + 8))
         }
@@ -1620,6 +1736,7 @@ pub(crate) fn read_scalar_payload<'py>(
         ScalarKind::String | ScalarKind::StrAsBytes => {
             let (s, next_pos) =
                 read_str_slice(data, pos).map_err(|e| decode_err(py, e.to_string()))?;
+            // SAFETY: GIL is held (`py`); `s` is validated UTF-8 and valid for `s.len()` bytes.
             let obj = unsafe {
                 Bound::from_owned_ptr_or_err(
                     py,
@@ -1672,6 +1789,7 @@ fn extract_sortable_key(
     field_name: &str,
 ) -> PyResult<SortableMapKey> {
     match kind {
+        // SAFETY: GIL is held (`py`) and `ptr` is a valid `PyObject*`; `PyUnicode_AsUTF8AndSize` returns a UTF-8 buffer valid for `size` bytes.
         ScalarKind::String | ScalarKind::StrAsBytes => unsafe {
             let mut size: ffi::Py_ssize_t = 0;
             let utf8_ptr = ffi::PyUnicode_AsUTF8AndSize(ptr, &mut size);
@@ -1820,6 +1938,7 @@ impl CompiledCodec {
         if schema_depth + 3 > MAX_NESTING_DEPTH {
             return Ok(meta);
         }
+        // SAFETY: GIL is held (`py`) and `obj_ptr` is a valid non-null `PyObject*`.
         let obj_bound = unsafe { Borrowed::from_ptr(py, obj_ptr) };
         for fp in &inner.fields {
             match &fp.kind {
@@ -1968,6 +2087,7 @@ impl CompiledCodec {
         py: Python<'py>,
         inner: &CodecInner,
     ) -> PyResult<Bound<'py, PyAny>> {
+        // SAFETY: GIL is held (`py`); `self.cls` is a valid `PyTypeObject` whose `tp_alloc` returns a new owned reference or null with an exception set.
         unsafe {
             let cls_ptr = self.cls.as_ptr().cast::<ffi::PyTypeObject>();
             if let Some(alloc_fn) = inner.tp_alloc {
@@ -1988,6 +2108,7 @@ impl CompiledCodec {
         if let Some(inner) = self.inner.get() {
             return self.alloc_raw_slot_instance_with(py, inner);
         }
+        // SAFETY: GIL is held (`py`); `self.cls` is a valid `PyTypeObject` whose `tp_new` returns a new owned reference or null with an exception set.
         unsafe {
             let cls_ptr = self.cls.as_ptr().cast::<ffi::PyTypeObject>();
             let Some(new_fn) = (*cls_ptr).tp_new else {
@@ -2107,6 +2228,7 @@ impl CompiledCodec {
                 format!("omnibuf: nesting depth {depth} exceeds limit {MAX_NESTING_DEPTH}"),
             )));
         }
+        // SAFETY: Caller holds the GIL (`py`); `Py_IS_TYPE` confirms exact class match before reading verified slot offsets and exact primitives.
         unsafe {
             if obj_ptr.is_null()
                 || !inner.fast_slot_encode
@@ -2473,6 +2595,7 @@ impl CompiledCodec {
         kind: ScalarKind,
         val_ptr: *mut ffi::PyObject,
     ) -> Option<PyResult<()>> {
+        // SAFETY: Caller holds the GIL (`py`) and `val_ptr` is a valid `PyObject*`; CPython exact-type checks guard all fast-path reads.
         unsafe {
             match kind {
                 ScalarKind::Bool => {
@@ -2714,6 +2837,7 @@ impl CompiledCodec {
         let buf = enc.buf_mut();
         let len_pos = buf.len();
         let use_len4;
+        // SAFETY: Caller holds the GIL (`py`) and verified `PyList_CheckExact(list_ptr)`; elements are read via exact-type checks or snapshotted before Python callbacks.
         unsafe {
             let n = ffi::PyList_GET_SIZE(list_ptr) as usize;
             use_len4 = 2usize
@@ -2861,6 +2985,7 @@ impl CompiledCodec {
         fp.write_tag_to(enc.buf_mut());
         let len_pos = enc.buf_mut().len();
         let use_len4;
+        // SAFETY: Caller holds the GIL (`py`) and verified `PyList_CheckExact(list_ptr)`; sub-message pointers are snapshotted before any Python callbacks.
         unsafe {
             let n = ffi::PyList_GET_SIZE(list_ptr) as usize;
             use_len4 = 2usize.saturating_add(n) > 16_383;
@@ -3022,6 +3147,7 @@ impl CompiledCodec {
                         ),
                     ));
                 }
+                // SAFETY: GIL is held (`py`) and `ptr` is a valid non-null `PyObject*`.
                 if unsafe { ffi::PyList_CheckExact(ptr) != 0 } {
                     return Self::encode_list_scalar_fast(py, enc, fp, *elem_kind, *elem_wt, ptr);
                 }
@@ -3085,6 +3211,7 @@ impl CompiledCodec {
                     ));
                 }
                 let sub = codec.get();
+                // SAFETY: GIL is held (`py`) and `ptr` is a valid non-null `PyObject*`.
                 if unsafe { ffi::PyList_CheckExact(ptr) != 0 } {
                     return Self::encode_list_submsg_fast(
                         py,
@@ -3169,6 +3296,7 @@ impl CompiledCodec {
                     MapValPlan::SubMsg(_) => 1,
                 };
                 let entry_min = scalar_elem_min_wire_bytes(*key_kind) + val_min;
+                // SAFETY: GIL is held (`py`) and `ptr` is a valid non-null `PyObject*`; `PyDict_Next` is guarded by `PyDict_CheckExact` and snapshots entries before callbacks.
                 unsafe {
                     if ffi::PyDict_CheckExact(ptr) != 0 {
                         let count = ffi::PyDict_Size(ptr) as usize;
@@ -3267,9 +3395,11 @@ impl CompiledCodec {
                             self.write_snapshot_map_entries(
                                 py,
                                 enc,
-                                fp,
-                                *key_kind,
-                                val_plan,
+                                MapEncodeSpec {
+                                    fp,
+                                    key_kind: *key_kind,
+                                    val_plan,
+                                },
                                 raw_pairs,
                                 deterministic,
                                 depth,
@@ -3306,9 +3436,11 @@ impl CompiledCodec {
                         self.write_snapshot_map_entries(
                             py,
                             enc,
-                            fp,
-                            *key_kind,
-                            val_plan,
+                            MapEncodeSpec {
+                                fp,
+                                key_kind: *key_kind,
+                                val_plan,
+                            },
                             raw_pairs,
                             deterministic,
                             depth,
@@ -3325,18 +3457,20 @@ impl CompiledCodec {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn write_snapshot_map_entries(
         &self,
         py: Python<'_>,
         enc: &mut Encoder,
-        fp: &FieldPlan,
-        key_kind: ScalarKind,
-        val_plan: &MapValPlan,
+        spec: MapEncodeSpec<'_>,
         raw_pairs: Vec<(Bound<'_, PyAny>, Bound<'_, PyAny>)>,
         deterministic: bool,
         depth: usize,
     ) -> PyResult<()> {
+        let MapEncodeSpec {
+            fp,
+            key_kind,
+            val_plan,
+        } = spec;
         let n_entries = raw_pairs.len();
         let ordered_pairs: Vec<(Bound<'_, PyAny>, Bound<'_, PyAny>)> =
             if deterministic && n_entries > 1 {
@@ -3394,10 +3528,14 @@ impl CompiledCodec {
         let inner = self.inner_plan(py)?;
         if HAS_GIL
             && let Some(res) =
-                unsafe { self.try_encode_pure_fast_slots(py, enc.buf_mut(), inner, obj_ptr, depth) }
+                // SAFETY: GIL is held (`py`, `HAS_GIL`) and `obj_ptr` is a valid `PyObject*`.
+                unsafe {
+                    self.try_encode_pure_fast_slots(py, enc.buf_mut(), inner, obj_ptr, depth)
+                }
         {
             return res;
         }
+        // SAFETY: GIL is held (`py`) and `obj_ptr` is a valid non-null `PyObject*`.
         let obj_bound = unsafe { Borrowed::from_ptr(py, obj_ptr) };
 
         for fp in &inner.fields {
@@ -3457,7 +3595,17 @@ impl CompiledCodec {
         merge: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let mut budget = DecodeBudget::default_budget();
-        self.decode_slice_budget(py, data, out, depth, merge, &mut budget, None)
+        self.decode_slice_budget(
+            py,
+            data,
+            DecodeSliceOpts {
+                out,
+                depth,
+                merge,
+                zc_owner: None,
+            },
+            &mut budget,
+        )
     }
 
     #[cold]
@@ -3473,6 +3621,7 @@ impl CompiledCodec {
             if (seen_64 & (1u64 << fp.index)) == 0
                 && let Some(def_val) = fp.make_default(py)?
             {
+                // SAFETY: GIL is held (`py`); `dst_ptr` is a fresh instance of `self.cls`, `fp.slot_offset` is verified, and the slot is currently null.
                 unsafe {
                     let slot = dst_ptr
                         .byte_add(fp.slot_offset)
@@ -3486,21 +3635,25 @@ impl CompiledCodec {
 
     #[cold]
     #[inline(never)]
-    #[allow(clippy::too_many_arguments)]
     fn decode_fast_slot_cold_field(
         &self,
         py: Python<'_>,
-        inner: &CodecInner,
-        dst_ptr: *mut ffi::PyObject,
-        f_idx: usize,
-        fdf: &FastDecodeField,
-        already_seen: bool,
-        data: &[u8],
-        pos: usize,
+        target: FastSlotTarget<'_>,
+        field: FastFieldRef<'_>,
+        cursor: SliceCursor<'_>,
         depth: usize,
         budget: &mut DecodeBudget,
     ) -> PyResult<usize> {
+        let FastSlotTarget { inner, dst_ptr } = target;
+        let FastFieldRef {
+            idx: f_idx,
+            fdf,
+            already_seen,
+        } = field;
+        let SliceCursor { data, pos } = cursor;
+        // SAFETY: `f_idx` is a valid index into `inner.fast_decode_fields`, which has the same length as `inner.fields`.
         let fp = unsafe { inner.fields.get_unchecked(f_idx) };
+        // SAFETY: `dst_ptr` is a valid instance of `self.cls` and `fdf.slot_offset` is a verified `PyMemberDef` offset.
         let slot = unsafe {
             dst_ptr
                 .byte_add(usize::from(fdf.slot_offset))
@@ -3514,6 +3667,7 @@ impl CompiledCodec {
                 };
                 let (val_obj, next_pos) =
                     read_scalar_payload(py, data, pos, ScalarKind::Enum, enum_cls, None)?;
+                // SAFETY: GIL is held (`py`); `slot` is a verified slot on `dst_ptr` and `rv` is a new owned reference.
                 unsafe {
                     let rv = val_obj.into_ptr();
                     if !already_seen {
@@ -3529,19 +3683,23 @@ impl CompiledCodec {
             FastKind::SubMsg => {
                 let (sub_slice, next_pos) =
                     read_len_slice_fast(data, pos, 0).map_err(|m| decode_err(py, m))?;
+                // SAFETY: `fdf.sub_codec` points to a `CompiledCodec` kept alive by `inner.fields`.
                 let sub_c = unsafe { &*fdf.sub_codec };
                 let cur_sub = fp.access.get_optional(py, dst_ptr)?;
                 let sub_merge = cur_sub.is_some();
                 let decoded_sub = sub_c.decode_slice_budget(
                     py,
                     sub_slice,
-                    cur_sub.as_ref(),
-                    depth + 1,
-                    sub_merge,
+                    DecodeSliceOpts {
+                        out: cur_sub.as_ref(),
+                        depth: depth + 1,
+                        merge: sub_merge,
+                        zc_owner: None,
+                    },
                     budget,
-                    None,
                 )?;
                 if cur_sub.is_none() {
+                    // SAFETY: GIL is held (`py`); `slot` is a verified slot on `dst_ptr` and `rv` is a new owned reference.
                     unsafe {
                         let rv = decoded_sub.into_ptr();
                         let old = *slot;
@@ -3599,6 +3757,7 @@ impl CompiledCodec {
                     let (item, next_p) =
                         read_scalar_payload(py, arr_body, p, fdf.elem_kind, enum_cls, None)?;
                     p = next_p;
+                    // SAFETY: GIL is held (`py`); `list` is a valid `PyList` and `item` is a valid `PyObject`.
                     unsafe {
                         if ffi::PyList_Append(list.as_ptr(), item.as_ptr()) != 0 {
                             return Err(PyErr::fetch(py));
@@ -3644,6 +3803,7 @@ impl CompiledCodec {
                     ));
                 }
                 budget.consume(py, count)?;
+                // SAFETY: `fdf.sub_codec` points to a `CompiledCodec` kept alive by `inner.fields`.
                 let sub_c = unsafe { &*fdf.sub_codec };
                 let cur_opt = fp.access.get_optional(py, dst_ptr)?;
                 let list = match cur_opt {
@@ -3664,12 +3824,10 @@ impl CompiledCodec {
                     let elem_obj = sub_c.decode_slice_budget(
                         py,
                         elem_slice,
-                        None,
-                        depth + 2,
-                        false,
+                        DecodeSliceOpts::fresh(depth + 2),
                         budget,
-                        None,
                     )?;
+                    // SAFETY: GIL is held (`py`); `list` is a valid `PyList` and `elem_obj` is a valid `PyObject`.
                     unsafe {
                         if ffi::PyList_Append(list.as_ptr(), elem_obj.as_ptr()) != 0 {
                             return Err(PyErr::fetch(py));
@@ -3722,7 +3880,9 @@ impl CompiledCodec {
                 }
                 budget.consume(py, count)?;
                 let dict_any = if !already_seen {
+                    // SAFETY: GIL is held (`py`); `PyDict_New` returns a new owned reference or null with an exception set.
                     let d = unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyDict_New())? };
+                    // SAFETY: GIL is held (`py`); `slot` is an uninitialized verified slot on `dst_ptr` and `Py_INCREF` transfers an owned reference.
                     unsafe {
                         let d_ptr = d.as_ptr();
                         ffi::Py_INCREF(d_ptr);
@@ -3756,16 +3916,14 @@ impl CompiledCodec {
                             let msg_v = sub_c.get().decode_slice_budget(
                                 py,
                                 v_slice,
-                                None,
-                                depth + 2,
-                                false,
+                                DecodeSliceOpts::fresh(depth + 2),
                                 budget,
-                                None,
                             )?;
                             (msg_v, vp)
                         }
                     };
                     p = after_v;
+                    // SAFETY: GIL is held (`py`); `dict_any`, `k_obj`, and `v_obj` are valid `PyObject`s.
                     unsafe {
                         if ffi::PyDict_SetItem(dict_any.as_ptr(), k_obj.as_ptr(), v_obj.as_ptr())
                             != 0
@@ -3799,6 +3957,7 @@ impl CompiledCodec {
     ) -> PyResult<*const u8> {
         let fnum = (tag >> 4) as u32;
         let wt = (tag & 0x0F) as u8;
+        // SAFETY: Caller guarantees `data_base <= cur <= end` within one byte slice.
         let data = unsafe {
             std::slice::from_raw_parts(data_base, (end as usize).wrapping_sub(data_base as usize))
         };
@@ -3812,25 +3971,29 @@ impl CompiledCodec {
             }
             let next_pos =
                 validate_field0_slice(data, pos, depth).map_err(|m| decode_err(py, m))?;
+            // SAFETY: `next_pos <= data.len()`, so `data_base.add(next_pos) <= end` stays within the slice.
             return Ok(unsafe { data_base.add(next_pos) });
         }
         let next_pos = validate_unknown_value(py, data, pos, wt, depth)?;
+        // SAFETY: `next_pos <= data.len()`, so `data_base.add(next_pos) <= end` stays within the slice.
         Ok(unsafe { data_base.add(next_pos) })
     }
 
     #[cold]
     #[inline(never)]
-    #[allow(clippy::too_many_arguments)]
     unsafe fn decode_fast_slot_slow_tag_val(
         &self,
         py: Python<'_>,
         inner: &CodecInner,
-        data_base: *const u8,
-        cur: *const u8,
-        end: *const u8,
+        ptrs: WirePtrs,
         tag: u64,
         depth: usize,
     ) -> PyResult<Result<(usize, u8), *const u8>> {
+        let WirePtrs {
+            base: data_base,
+            cur,
+            end,
+        } = ptrs;
         if (tag >> 4) > omnibuf_core::wire::MAX_FIELD_NUMBER {
             return Err(decode_err(
                 py,
@@ -3840,17 +4003,20 @@ impl CompiledCodec {
         let fnum = (tag >> 4) as u32;
         let wt = (tag & 0x0F) as u8;
         if fnum == 0 {
+            // SAFETY: Caller guarantees `data_base <= cur <= end` within one byte slice.
             let next_cur = unsafe {
                 self.decode_fast_slot_unknown_or_field0(py, data_base, cur, end, tag, depth)?
             };
             return Ok(Err(next_cur));
         }
         let Some(idx) = lookup_field_index(inner, fnum) else {
+            // SAFETY: Caller guarantees `data_base <= cur <= end` within one byte slice.
             let next_cur = unsafe {
                 self.decode_fast_slot_unknown_or_field0(py, data_base, cur, end, tag, depth)?
             };
             return Ok(Err(next_cur));
         };
+        // SAFETY: `idx` was returned by `lookup_field_index(inner, fnum)`, so `idx < inner.fast_decode_fields.len()`.
         let fdf_chk = unsafe { inner.fast_decode_fields.get_unchecked(idx) };
         let wt_ok = if fdf_chk.kind == FastKind::Bool {
             wt == WIRE_BOOL_FALSE || wt == WIRE_BOOL_TRUE
@@ -3858,6 +4024,7 @@ impl CompiledCodec {
             fdf_chk.wire_type == wt
         };
         if !wt_ok {
+            // SAFETY: Caller guarantees `data_base <= cur <= end` within one byte slice.
             let next_cur = unsafe {
                 self.decode_fast_slot_unknown_or_field0(py, data_base, cur, end, tag, depth)?
             };
@@ -3877,6 +4044,7 @@ impl CompiledCodec {
         end: *const u8,
         depth: usize,
     ) -> PyResult<Result<(usize, u8, *const u8), *const u8>> {
+        // SAFETY: Caller guarantees `data_base <= cur <= end` within one byte slice.
         let Some(tag) = (unsafe { decode_varint_ptr(&mut cur, end) }) else {
             let pos = (cur as usize).wrapping_sub(data_base as usize);
             return Err(decode_err(
@@ -3884,8 +4052,19 @@ impl CompiledCodec {
                 format!("omnibuf: invalid or truncated tag at byte {pos}"),
             ));
         };
+        // SAFETY: Caller guarantees `data_base <= cur <= end` within one byte slice.
         match unsafe {
-            self.decode_fast_slot_slow_tag_val(py, inner, data_base, cur, end, tag, depth)?
+            self.decode_fast_slot_slow_tag_val(
+                py,
+                inner,
+                WirePtrs {
+                    base: data_base,
+                    cur,
+                    end,
+                },
+                tag,
+                depth,
+            )?
         } {
             Ok((idx, wt)) => Ok(Ok((idx, wt, cur))),
             Err(next_cur) => Ok(Err(next_cur)),
@@ -3894,18 +4073,17 @@ impl CompiledCodec {
 
     #[cold]
     #[inline(never)]
-    #[allow(clippy::too_many_arguments)]
     unsafe fn decode_fast_array_scalar_other<const CHECK_SIGNALS: bool>(
         py: Python<'_>,
-        inner: &CodecInner,
-        f_idx: usize,
-        fdf: &FastDecodeField,
+        field: FastArrayField<'_>,
         lp: *mut ffi::PyObject,
         arr_body: &[u8],
         mut p: usize,
         count: usize,
     ) -> PyResult<usize> {
+        let FastArrayField { inner, f_idx, fdf } = field;
         let arr_len = arr_body.len();
+        // SAFETY: Caller holds the GIL (`py`), `lp` is a fresh `PyList` of length `count`, and bounds are checked before every read.
         unsafe {
             match fdf.elem_kind {
                 ScalarKind::Bool => {
@@ -4077,6 +4255,7 @@ impl CompiledCodec {
         depth: usize,
         budget: &mut DecodeBudget,
     ) -> PyResult<Bound<'py, PyAny>> {
+        // SAFETY: Caller holds the GIL (`py`) and `inner.fast_slot_decode` is true; `start..end` spans `data`.
         unsafe {
             let start = data.as_ptr();
             let end = start.add(data.len());
@@ -4090,18 +4269,17 @@ impl CompiledCodec {
     }
 
     #[inline(never)]
-    #[allow(clippy::too_many_arguments)]
     unsafe fn decode_fast_array_scalar_raw<const CHECK_SIGNALS: bool>(
         py: Python<'_>,
-        inner: &CodecInner,
-        f_idx: usize,
-        fdf: &FastDecodeField,
+        field: FastArrayField<'_>,
         dst_ptr: *mut ffi::PyObject,
         cur: &mut *const u8,
         end: *const u8,
         depth: usize,
         budget: &mut DecodeBudget,
     ) -> *mut ffi::PyObject {
+        let FastArrayField { inner, f_idx, fdf } = field;
+        // SAFETY: Caller holds the GIL (`py`), `dst_ptr` is an owned instance, and `*cur <= end` within one byte slice.
         unsafe {
             if depth + 1 > MAX_NESTING_DEPTH {
                 return fail_decode_err(
@@ -4282,7 +4460,12 @@ impl CompiledCodec {
                     let arr_body = std::slice::from_raw_parts(arr_start, arr_len);
                     let p_off = (p as usize).wrapping_sub(arr_start as usize);
                     match Self::decode_fast_array_scalar_other::<CHECK_SIGNALS>(
-                        py, inner, f_idx, fdf, lp, arr_body, p_off, count,
+                        py,
+                        FastArrayField { inner, f_idx, fdf },
+                        lp,
+                        arr_body,
+                        p_off,
+                        count,
                     ) {
                         Ok(next_off) => p = arr_start.add(next_off),
                         Err(err) => {
@@ -4300,7 +4483,6 @@ impl CompiledCodec {
     }
 
     #[inline(never)]
-    #[allow(clippy::too_many_arguments)]
     unsafe fn decode_fast_array_submsg_raw<const CHECK_SIGNALS: bool>(
         py: Python<'_>,
         fdf: &FastDecodeField,
@@ -4310,6 +4492,7 @@ impl CompiledCodec {
         depth: usize,
         budget: &mut DecodeBudget,
     ) -> *mut ffi::PyObject {
+        // SAFETY: Caller holds the GIL (`py`), `dst_ptr` is an owned instance, and `*cur <= end` within one byte slice.
         unsafe {
             if depth + 1 > MAX_NESTING_DEPTH {
                 return fail_decode_err(
@@ -4443,11 +4626,8 @@ impl CompiledCodec {
                         let elem_obj = match sub_c.decode_slice_budget(
                             py,
                             elem_slice,
-                            None,
-                            depth + 2,
-                            false,
+                            DecodeSliceOpts::fresh(depth + 2),
                             budget,
-                            None,
                         ) {
                             Ok(o) => o.into_ptr(),
                             Err(err) => {
@@ -4476,6 +4656,7 @@ impl CompiledCodec {
         depth: usize,
         budget: &mut DecodeBudget,
     ) -> *mut ffi::PyObject {
+        // SAFETY: Caller holds the GIL (`py`), `inner.fast_slot_decode` is true, and `data_base <= end` spans one byte slice.
         unsafe {
             let dst_ptr = (inner.tp_alloc_fn)(inner.cls_ptr, 0);
             if dst_ptr.is_null() {
@@ -4502,11 +4683,12 @@ impl CompiledCodec {
                     if (tag_raw & fdf.tag_mask) != fdf.expected_tag {
                         return self.decode_fast_slots_general::<CHECK_SIGNALS>(
                             py,
-                            inner,
-                            dst_ptr,
-                            data_base,
-                            cur,
-                            end,
+                            FastSlotTarget { inner, dst_ptr },
+                            WirePtrs {
+                                base: data_base,
+                                cur,
+                                end,
+                            },
                             depth,
                             budget,
                             (1u64 << f_idx) - 1,
@@ -4518,11 +4700,12 @@ impl CompiledCodec {
                     if (tag_raw & fdf.tag_mask) != fdf.expected_tag {
                         return self.decode_fast_slots_general::<CHECK_SIGNALS>(
                             py,
-                            inner,
-                            dst_ptr,
-                            data_base,
-                            cur,
-                            end,
+                            FastSlotTarget { inner, dst_ptr },
+                            WirePtrs {
+                                base: data_base,
+                                cur,
+                                end,
+                            },
                             depth,
                             budget,
                             (1u64 << f_idx) - 1,
@@ -4532,11 +4715,12 @@ impl CompiledCodec {
                 } else {
                     return self.decode_fast_slots_general::<CHECK_SIGNALS>(
                         py,
-                        inner,
-                        dst_ptr,
-                        data_base,
-                        cur,
-                        end,
+                        FastSlotTarget { inner, dst_ptr },
+                        WirePtrs {
+                            base: data_base,
+                            cur,
+                            end,
+                        },
                         depth,
                         budget,
                         (1u64 << f_idx) - 1,
@@ -4666,11 +4850,8 @@ impl CompiledCodec {
                             match sub_c.decode_slice_budget(
                                 py,
                                 sub_slice,
-                                None,
-                                depth + 1,
-                                false,
+                                DecodeSliceOpts::fresh(depth + 1),
                                 budget,
-                                None,
                             ) {
                                 Ok(obj) => obj.into_ptr(),
                                 Err(err) => return fail_decode_err(py, dst_ptr, err),
@@ -4683,7 +4864,13 @@ impl CompiledCodec {
                     }
                     FastKind::ArrayScalar => {
                         let lp = Self::decode_fast_array_scalar_raw::<CHECK_SIGNALS>(
-                            py, inner, f_idx, fdf, dst_ptr, &mut cur, end, depth, budget,
+                            py,
+                            FastArrayField { inner, f_idx, fdf },
+                            dst_ptr,
+                            &mut cur,
+                            end,
+                            depth,
+                            budget,
                         );
                         if lp.is_null() {
                             return std::ptr::null_mut();
@@ -4777,7 +4964,16 @@ impl CompiledCodec {
                             );
                             let pos = (cur as usize).wrapping_sub(data_base as usize);
                             match self.decode_fast_slot_cold_field(
-                                py, inner, dst_ptr, f_idx, fdf, false, data, pos, depth, budget,
+                                py,
+                                FastSlotTarget { inner, dst_ptr },
+                                FastFieldRef {
+                                    idx: f_idx,
+                                    fdf,
+                                    already_seen: false,
+                                },
+                                SliceCursor { data, pos },
+                                depth,
+                                budget,
                             ) {
                                 Ok(next_pos) => cur = data_base.add(next_pos),
                                 Err(err) => return fail_decode_err(py, dst_ptr, err),
@@ -4791,7 +4987,16 @@ impl CompiledCodec {
                         );
                         let pos = (cur as usize).wrapping_sub(data_base as usize);
                         match self.decode_fast_slot_cold_field(
-                            py, inner, dst_ptr, f_idx, fdf, false, data, pos, depth, budget,
+                            py,
+                            FastSlotTarget { inner, dst_ptr },
+                            FastFieldRef {
+                                idx: f_idx,
+                                fdf,
+                                already_seen: false,
+                            },
+                            SliceCursor { data, pos },
+                            depth,
+                            budget,
                         ) {
                             Ok(next_pos) => cur = data_base.add(next_pos),
                             Err(err) => return fail_decode_err(py, dst_ptr, err),
@@ -4805,11 +5010,12 @@ impl CompiledCodec {
             }
             self.decode_fast_slots_general::<CHECK_SIGNALS>(
                 py,
-                inner,
-                dst_ptr,
-                data_base,
-                cur,
-                end,
+                FastSlotTarget { inner, dst_ptr },
+                WirePtrs {
+                    base: data_base,
+                    cur,
+                    end,
+                },
                 depth,
                 budget,
                 inner.all_seen_mask_64,
@@ -4819,19 +5025,22 @@ impl CompiledCodec {
 
     #[cold]
     #[inline(never)]
-    #[allow(clippy::too_many_arguments)]
     unsafe fn decode_fast_slots_general<const CHECK_SIGNALS: bool>(
         &self,
         py: Python<'_>,
-        inner: &CodecInner,
-        dst_ptr: *mut ffi::PyObject,
-        data_base: *const u8,
-        mut cur: *const u8,
-        end: *const u8,
+        target: FastSlotTarget<'_>,
+        ptrs: WirePtrs,
         depth: usize,
         budget: &mut DecodeBudget,
         mut seen_64: u64,
     ) -> *mut ffi::PyObject {
+        let FastSlotTarget { inner, dst_ptr } = target;
+        let WirePtrs {
+            base: data_base,
+            mut cur,
+            end,
+        } = ptrs;
+        // SAFETY: Caller holds the GIL (`py`), `dst_ptr` is an owned instance with verified slot offsets, and `data_base <= cur <= end` spans one byte slice.
         unsafe {
             let mut step = 0usize;
 
@@ -4883,7 +5092,15 @@ impl CompiledCodec {
                         }
                     } else {
                         match self.decode_fast_slot_slow_tag_val(
-                            py, inner, data_base, cur, end, tag as u64, depth,
+                            py,
+                            inner,
+                            WirePtrs {
+                                base: data_base,
+                                cur,
+                                end,
+                            },
+                            tag as u64,
+                            depth,
                         ) {
                             Ok(Ok(pair)) => pair,
                             Ok(Err(next_cur)) => {
@@ -4986,13 +5203,13 @@ impl CompiledCodec {
                             let pos = (cur as usize).wrapping_sub(data_base as usize);
                             match self.decode_fast_slot_cold_field(
                                 py,
-                                inner,
-                                dst_ptr,
-                                f_idx,
-                                fdf,
-                                already_seen,
-                                data,
-                                pos,
+                                FastSlotTarget { inner, dst_ptr },
+                                FastFieldRef {
+                                    idx: f_idx,
+                                    fdf,
+                                    already_seen,
+                                },
+                                SliceCursor { data, pos },
                                 depth,
                                 budget,
                             ) {
@@ -5098,7 +5315,16 @@ impl CompiledCodec {
                             );
                             let pos = (cur as usize).wrapping_sub(data_base as usize);
                             match self.decode_fast_slot_cold_field(
-                                py, inner, dst_ptr, f_idx, fdf, true, data, pos, depth, budget,
+                                py,
+                                FastSlotTarget { inner, dst_ptr },
+                                FastFieldRef {
+                                    idx: f_idx,
+                                    fdf,
+                                    already_seen: true,
+                                },
+                                SliceCursor { data, pos },
+                                depth,
+                                budget,
                             ) {
                                 Ok(next_pos) => {
                                     cur = data_base.add(next_pos);
@@ -5155,11 +5381,8 @@ impl CompiledCodec {
                             match sub_c.decode_slice_budget(
                                 py,
                                 sub_slice,
-                                None,
-                                depth + 1,
-                                false,
+                                DecodeSliceOpts::fresh(depth + 1),
                                 budget,
-                                None,
                             ) {
                                 Ok(obj) => obj.into_ptr(),
                                 Err(err) => return fail_decode_err(py, dst_ptr, err),
@@ -5178,7 +5401,16 @@ impl CompiledCodec {
                             );
                             let pos = (cur as usize).wrapping_sub(data_base as usize);
                             match self.decode_fast_slot_cold_field(
-                                py, inner, dst_ptr, f_idx, fdf, true, data, pos, depth, budget,
+                                py,
+                                FastSlotTarget { inner, dst_ptr },
+                                FastFieldRef {
+                                    idx: f_idx,
+                                    fdf,
+                                    already_seen: true,
+                                },
+                                SliceCursor { data, pos },
+                                depth,
+                                budget,
                             ) {
                                 Ok(next_pos) => {
                                     cur = data_base.add(next_pos);
@@ -5188,7 +5420,13 @@ impl CompiledCodec {
                             }
                         }
                         let lp = Self::decode_fast_array_scalar_raw::<CHECK_SIGNALS>(
-                            py, inner, f_idx, fdf, dst_ptr, &mut cur, end, depth, budget,
+                            py,
+                            FastArrayField { inner, f_idx, fdf },
+                            dst_ptr,
+                            &mut cur,
+                            end,
+                            depth,
+                            budget,
                         );
                         if lp.is_null() {
                             return std::ptr::null_mut();
@@ -5203,7 +5441,16 @@ impl CompiledCodec {
                             );
                             let pos = (cur as usize).wrapping_sub(data_base as usize);
                             match self.decode_fast_slot_cold_field(
-                                py, inner, dst_ptr, f_idx, fdf, true, data, pos, depth, budget,
+                                py,
+                                FastSlotTarget { inner, dst_ptr },
+                                FastFieldRef {
+                                    idx: f_idx,
+                                    fdf,
+                                    already_seen: true,
+                                },
+                                SliceCursor { data, pos },
+                                depth,
+                                budget,
                             ) {
                                 Ok(next_pos) => {
                                     cur = data_base.add(next_pos);
@@ -5228,13 +5475,13 @@ impl CompiledCodec {
                         let pos = (cur as usize).wrapping_sub(data_base as usize);
                         match self.decode_fast_slot_cold_field(
                             py,
-                            inner,
-                            dst_ptr,
-                            f_idx,
-                            fdf,
-                            already_seen,
-                            data,
-                            pos,
+                            FastSlotTarget { inner, dst_ptr },
+                            FastFieldRef {
+                                idx: f_idx,
+                                fdf,
+                                already_seen,
+                            },
+                            SliceCursor { data, pos },
                             depth,
                             budget,
                         ) {
@@ -5256,17 +5503,19 @@ impl CompiledCodec {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn decode_slice_budget<'py>(
         &self,
         py: Python<'py>,
         data: &[u8],
-        out: Option<&Bound<'py, PyAny>>,
-        depth: usize,
-        merge: bool,
+        opts: DecodeSliceOpts<'_, 'py>,
         budget: &mut DecodeBudget,
-        zc_owner: Option<(&ByteSliceOwner, usize)>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let DecodeSliceOpts {
+            out,
+            depth,
+            merge,
+            zc_owner,
+        } = opts;
         if depth > MAX_NESTING_DEPTH {
             return Err(decode_err(
                 py,
@@ -5276,6 +5525,7 @@ impl CompiledCodec {
         let inner = self.inner_plan(py)?;
 
         if HAS_GIL && inner.fast_slot_decode && out.is_none() && !merge && zc_owner.is_none() {
+            // SAFETY: GIL is held (`py`, `HAS_GIL`) and `inner.fast_slot_decode` is true.
             return unsafe {
                 self.try_decode_pure_fast_slots_dispatch(py, inner, data, depth, budget)
             };
@@ -5359,6 +5609,7 @@ impl CompiledCodec {
                 for &sib_idx in &fp.oneof_siblings {
                     inner.fields[sib_idx]
                         .access
+                        // SAFETY: GIL is held (`py`); `Py_None()` returns the immortal `None` singleton pointer.
                         .set(py, dst_ptr, unsafe { ffi::Py_None() })?;
                     if sib_idx < 64 {
                         seen_64 &= !(1u64 << sib_idx);
@@ -5420,11 +5671,13 @@ impl CompiledCodec {
                     let decoded_sub = codec.get().decode_slice_budget(
                         py,
                         sub_slice,
-                        cur_sub.as_ref(),
-                        depth + 1,
-                        sub_merge,
+                        DecodeSliceOpts {
+                            out: cur_sub.as_ref(),
+                            depth: depth + 1,
+                            merge: sub_merge,
+                            zc_owner: sub_zc,
+                        },
                         budget,
-                        sub_zc,
                     )?;
                     if cur_sub.is_none() || self.pbpy_mode {
                         fp.access.set_owned(py, dst_ptr, decoded_sub)?;
@@ -5497,6 +5750,7 @@ impl CompiledCodec {
                             target_list.call_method1("append", (item,))?;
                         }
                     } else if !already_seen {
+                        // SAFETY: GIL is held (`py`); `list` has exact length `count` and each index `0..count` is initialized once with an owned reference.
                         unsafe {
                             let list_ptr = ffi::PyList_New(count as ffi::Py_ssize_t);
                             let list = Bound::from_owned_ptr_or_err(py, list_ptr)?;
@@ -5544,6 +5798,7 @@ impl CompiledCodec {
                                 arr_zc,
                             )?;
                             p = next_p;
+                            // SAFETY: GIL is held (`py`); `list` is a valid `PyList` and `item` is a valid `PyObject`.
                             unsafe {
                                 if ffi::PyList_Append(list.as_ptr(), item.as_ptr()) != 0 {
                                     return Err(PyErr::fetch(py));
@@ -5633,15 +5888,13 @@ impl CompiledCodec {
                             let elem_obj = sub_c.decode_slice_budget(
                                 py,
                                 elem_slice,
-                                None,
-                                depth + 2,
-                                false,
+                                DecodeSliceOpts::fresh(depth + 2),
                                 budget,
-                                None,
                             )?;
                             target_list.call_method1("append", (elem_obj,))?;
                         }
                     } else if !already_seen {
+                        // SAFETY: GIL is held (`py`); `list` has exact length `count` and each index `0..count` is initialized once with an owned reference.
                         unsafe {
                             let list_ptr = ffi::PyList_New(count as ffi::Py_ssize_t);
                             let list = Bound::from_owned_ptr_or_err(py, list_ptr)?;
@@ -5662,11 +5915,13 @@ impl CompiledCodec {
                                 let elem_obj = sub_c.decode_slice_budget(
                                     py,
                                     elem_slice,
-                                    None,
-                                    depth + 2,
-                                    false,
+                                    DecodeSliceOpts {
+                                        out: None,
+                                        depth: depth + 2,
+                                        merge: false,
+                                        zc_owner: elem_zc,
+                                    },
                                     budget,
-                                    elem_zc,
                                 )?;
                                 ffi::PyList_SET_ITEM(
                                     list.as_ptr(),
@@ -5703,12 +5958,15 @@ impl CompiledCodec {
                             let elem_obj = sub_c.decode_slice_budget(
                                 py,
                                 elem_slice,
-                                None,
-                                depth + 2,
-                                false,
+                                DecodeSliceOpts {
+                                    out: None,
+                                    depth: depth + 2,
+                                    merge: false,
+                                    zc_owner: elem_zc,
+                                },
                                 budget,
-                                elem_zc,
                             )?;
+                            // SAFETY: GIL is held (`py`); `list` is a valid `PyList` and `elem_obj` is a valid `PyObject`.
                             unsafe {
                                 if ffi::PyList_Append(list.as_ptr(), elem_obj.as_ptr()) != 0 {
                                     return Err(PyErr::fetch(py));
@@ -5794,11 +6052,8 @@ impl CompiledCodec {
                                     let msg_v = sub_c.get().decode_slice_budget(
                                         py,
                                         v_slice,
-                                        None,
-                                        depth + 2,
-                                        false,
+                                        DecodeSliceOpts::fresh(depth + 2),
                                         budget,
-                                        None,
                                     )?;
                                     (msg_v, vp)
                                 }
@@ -5852,16 +6107,19 @@ impl CompiledCodec {
                                     let msg_v = sub_c.get().decode_slice_budget(
                                         py,
                                         v_slice,
-                                        None,
-                                        depth + 2,
-                                        false,
+                                        DecodeSliceOpts {
+                                            out: None,
+                                            depth: depth + 2,
+                                            merge: false,
+                                            zc_owner: v_zc,
+                                        },
                                         budget,
-                                        v_zc,
                                     )?;
                                     (msg_v, vp)
                                 }
                             };
                             p = after_v;
+                            // SAFETY: GIL is held (`py`); `dict_any`, `k_obj`, and `v_obj` are valid `PyObject`s.
                             unsafe {
                                 if ffi::PyDict_SetItem(
                                     dict_any.as_ptr(),
@@ -6042,6 +6300,7 @@ impl CompiledCodec {
             let (access, slot_offset) = if !self.pbpy_mode
                 && let Ok(descr_obj) = cls_dict.get_item(&attr)
             {
+                // SAFETY: GIL is held (`py`); `PyMemberDescr_Type` and `PyType_IsSubtype` checks verify descriptor layout and class ownership before reading the offset.
                 unsafe {
                     let descr_type = ffi::Py_TYPE(descr_obj.as_ptr());
                     if descr_type == std::ptr::addr_of_mut!(ffi::PyMemberDescr_Type)
@@ -6283,6 +6542,7 @@ impl CompiledCodec {
             (1u64 << fields.len()) - 1
         };
 
+        // SAFETY: GIL is held (`py`) and `self.cls` is a valid `PyTypeObject`.
         let tp_alloc = unsafe {
             let cls_ptr = self.cls.as_ptr().cast::<ffi::PyTypeObject>();
             let base_new = ffi::PyBaseObject_Type.tp_new;
@@ -6379,11 +6639,13 @@ impl CompiledCodec {
                     ),
                 };
                 let sub_inner = if !sub_codec.is_null() {
+                    // SAFETY: `sub_codec` is a non-null pointer to a `CompiledCodec` kept alive by `fields`.
                     unsafe { (*sub_codec).inner.get() }.map_or(std::ptr::null(), std::ptr::from_ref)
                 } else {
                     std::ptr::null()
                 };
                 let sub_fast_decode =
+                    // SAFETY: `sub_inner` is a non-null pointer to a `CodecInner` owned by `sub_codec`.
                     !sub_inner.is_null() && unsafe { (*sub_inner).fast_slot_decode };
                 let (expected_tag, tag_mask, tag_len) = if fk == FastKind::Bool {
                     if fp.tag_false_len == 1 {
@@ -6499,10 +6761,12 @@ impl CompiledCodec {
             && out.is_none()
             && max_elements.is_none()
             && !zero_copy_bytes
+            // SAFETY: GIL is held (`py`) and `data` is a valid `PyObject`.
             && unsafe { ffi::PyBytes_CheckExact(data.as_ptr()) != 0 }
             && let Some(inner) = self.inner.get()
             && inner.fast_slot_decode
         {
+            // SAFETY: GIL is held (`py`) and `PyBytes_CheckExact` confirmed `data` is an immutable `PyBytes`.
             let slice = unsafe {
                 let obj_ptr = data.as_ptr();
                 let len = ffi::PyBytes_Size(obj_ptr) as usize;
@@ -6513,6 +6777,7 @@ impl CompiledCodec {
                 }
             };
             let mut budget = DecodeBudget::default_budget();
+            // SAFETY: GIL is held (`py`, `HAS_GIL`) and `inner.fast_slot_decode` is true.
             return unsafe {
                 self.try_decode_pure_fast_slots_dispatch(py, inner, slice, 0, &mut budget)
             };
@@ -6527,15 +6792,27 @@ impl CompiledCodec {
             return self.decode_slice_budget(
                 py,
                 slice,
-                out,
-                0,
-                false,
+                DecodeSliceOpts {
+                    out,
+                    depth: 0,
+                    merge: false,
+                    zc_owner: Some((&owner, 0)),
+                },
                 &mut budget,
-                Some((&owner, 0)),
             );
         }
         let input = InputBytes::extract(py, data)?;
-        self.decode_slice_budget(py, input.as_slice(), out, 0, false, &mut budget, None)
+        self.decode_slice_budget(
+            py,
+            input.as_slice(),
+            DecodeSliceOpts {
+                out,
+                depth: 0,
+                merge: false,
+                zc_owner: None,
+            },
+            &mut budget,
+        )
     }
 
     #[pyo3(signature = (data, out=None, depth=0, merge=false, *, max_elements=None, zero_copy_bytes=false))]
@@ -6560,15 +6837,27 @@ impl CompiledCodec {
             return self.decode_slice_budget(
                 py,
                 slice,
-                out,
-                depth,
-                merge,
+                DecodeSliceOpts {
+                    out,
+                    depth,
+                    merge,
+                    zc_owner: Some((&owner, 0)),
+                },
                 &mut budget,
-                Some((&owner, 0)),
             );
         }
         let input = InputBytes::extract(py, data)?;
-        self.decode_slice_budget(py, input.as_slice(), out, depth, merge, &mut budget, None)
+        self.decode_slice_budget(
+            py,
+            input.as_slice(),
+            DecodeSliceOpts {
+                out,
+                depth,
+                merge,
+                zc_owner: None,
+            },
+            &mut budget,
+        )
     }
 }
 
@@ -6629,6 +6918,7 @@ fn resolve_dataclass_codec_slow<'py>(
     let resolver = DATACLASS_RESOLVER
         .get()
         .ok_or_else(|| encode_err(py, "omnibuf: dataclass codec resolver not initialized"))?;
+    // SAFETY: GIL is held (`py`) and `cls_obj_ptr` is a valid `PyTypeObject` pointer from `Py_TYPE`.
     let cls_bound = unsafe { Borrowed::from_ptr(py, cls_obj_ptr).cast_unchecked::<PyType>() };
     let resolved = resolver.bind(py).call1((&*cls_bound,))?;
     let codec = resolved.cast::<CompiledCodec>()?.clone();
@@ -6715,6 +7005,7 @@ pub fn marshal_dataclass_py<'py>(
     self_describing: bool,
 ) -> PyResult<Bound<'py, PyBytes>> {
     let msg_ptr = msg.as_ptr();
+    // SAFETY: GIL is held (`py`) and `msg_ptr` is a valid non-null `PyObject*`.
     let cls_ptr = unsafe { ffi::Py_TYPE(msg_ptr) };
     let codec = lookup_or_resolve_dataclass_codec(py, cls_ptr)?;
     codec
@@ -6740,6 +7031,7 @@ pub fn unmarshal_dataclass_py<'py>(
     let cls_ptr = if is_type {
         target_ptr.cast::<ffi::PyTypeObject>()
     } else {
+        // SAFETY: GIL is held (`py`) and `target_ptr` is a valid non-null `PyObject*`.
         unsafe { ffi::Py_TYPE(target_ptr) }
     };
     let codec = lookup_or_resolve_dataclass_codec(py, cls_ptr)?;
@@ -6747,10 +7039,12 @@ pub fn unmarshal_dataclass_py<'py>(
         && is_type
         && max_elements.is_none()
         && !zero_copy_bytes
+        // SAFETY: GIL is held (`py`) and `packet` is a valid `PyObject`.
         && unsafe { ffi::PyBytes_CheckExact(packet.as_ptr()) != 0 }
         && let Some(inner) = codec.get().inner.get()
         && inner.fast_slot_decode
     {
+        // SAFETY: GIL is held (`py`) and `PyBytes_CheckExact` confirmed `packet` is an immutable `PyBytes`.
         let slice = unsafe {
             let obj_ptr = packet.as_ptr();
             let len = ffi::PyBytes_Size(obj_ptr) as usize;
@@ -6760,6 +7054,7 @@ pub fn unmarshal_dataclass_py<'py>(
                 std::slice::from_raw_parts(ffi::PyBytes_AS_STRING(obj_ptr).cast::<u8>(), len)
             }
         };
+        // SAFETY: GIL is held (`py`, `HAS_GIL`) and `inner.fast_slot_decode` is true.
         return unsafe {
             codec
                 .get()
@@ -6773,15 +7068,25 @@ pub fn unmarshal_dataclass_py<'py>(
         return codec.get().decode_slice_budget(
             py,
             slice,
-            out_inst,
-            0,
-            false,
+            DecodeSliceOpts {
+                out: out_inst,
+                depth: 0,
+                merge: false,
+                zc_owner: Some((&owner, 0)),
+            },
             &mut budget,
-            Some((&owner, 0)),
         );
     }
     let input = InputBytes::extract(py, packet)?;
-    codec
-        .get()
-        .decode_slice_budget(py, input.as_slice(), out_inst, 0, false, &mut budget, None)
+    codec.get().decode_slice_budget(
+        py,
+        input.as_slice(),
+        DecodeSliceOpts {
+            out: out_inst,
+            depth: 0,
+            merge: false,
+            zc_owner: None,
+        },
+        &mut budget,
+    )
 }

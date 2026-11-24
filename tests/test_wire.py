@@ -1,4 +1,4 @@
-"""Unit tests for OmniBuf v0.1 Prefix-Varint, ZigZag, UTF-8, float32, locate_field, and splice_fields."""
+"""Unit tests for OmniBuf v1 DRAFT-1 Prefix-Varint, ZigZag, UTF-8, float32, locate_field, and splice_fields."""
 
 from __future__ import annotations
 
@@ -6,8 +6,11 @@ import math
 import struct
 
 import pytest
+from google.protobuf import descriptor_pb2
 
 import omnibuf
+from omnibuf import wire as omnibuf_wire
+from omnibuf.gen.omnibuf.bench import peer_omnibuf_pb
 from omnibuf.wire import (
     INT32_MAX,
     INT32_MIN,
@@ -16,6 +19,10 @@ from omnibuf.wire import (
     MAX_FIELD_NUMBER,
     TZCNT_WIDTH_TABLE,
     UINT64_MAX,
+    WIRE_ARRAY,
+    WIRE_BOOL_FALSE,
+    WIRE_FIXED32,
+    WIRE_FIXED64,
     WIRE_STRING,
     WIRE_SUB_MSG,
     WIRE_UINT,
@@ -36,6 +43,8 @@ from omnibuf.wire import (
     locate_field,
     round_float32_shortest,
     splice_fields,
+    validate_message,
+    validate_value,
     varint_size,
 )
 
@@ -189,3 +198,93 @@ def test_locate_field_and_aliased_splice() -> None:
     assert loc3_after.ok
     v3_after, _ = decode_varint(loc3_after.val_slice)
     assert v3_after == 999
+
+
+def test_locate_field_offset_rejects_corrupt_field0() -> None:
+    """locate_field_offset and opaque_get_uint32 (#65536) must reject packets with corrupt Field #0."""
+    corrupt_field0 = bytes([0x19, 0x05, 0x21, 0x02])
+    pkt = corrupt_field0 + encode_tag(65536, WIRE_UINT) + encode_varint(42)
+
+    assert omnibuf_wire.locate_field_offset(pkt, 65536) == (-1, 0)
+    with pytest.raises(OmniBufDecodeError):
+        omnibuf.opaque_get_uint32(pkt, 65536, default=0)
+
+
+def test_validate_message_and_splice_reject_invalid_utf8() -> None:
+    """Python validate_message fallback and splice_fields_encode must reject invalid UTF-8."""
+    bad_utf8 = encode_tag(1, WIRE_STRING) + encode_varint(2) + b"\xff\xfe"
+    with pytest.raises(OmniBufDecodeError):
+        validate_message(bad_utf8, depth=0, limit_depth=16)
+    with pytest.raises(OmniBufDecodeError):
+        validate_message(bad_utf8, depth=1, limit_depth=omnibuf_wire.MAX_NESTING_DEPTH)
+    with pytest.raises(OmniBufDecodeError):
+        omnibuf.opaque.splice_dirty_fields(None, bad_utf8, {2}, lambda _out, _f: None)
+
+
+def test_splice_fields_many_replacements() -> None:
+    """splice_fields with many replacements must produce exact expected wire output."""
+    enc = omnibuf.Encoder()
+    for i in range(1, 201):
+        enc.write_uint32(i, i)
+    src = enc.finish()
+    reps = [SpliceField(i, encode_tag(i, WIRE_UINT) + encode_varint(i * 10)) for i in range(1, 201)]
+    out = splice_fields(None, src, reps)
+    validate_message(out)
+    assert omnibuf.opaque_get_uint32(out, 1) == 10
+    assert omnibuf.opaque_get_uint32(out, 200) == 2000
+
+
+def test_unknown_wire_string_invalid_utf8_rejected() -> None:
+    """Skipped/unknown WireString fields with invalid UTF-8 must be rejected consistently."""
+    from omnibuf.protobuf_codec import unmarshal_proto
+
+    bad_str_field = encode_tag(99, WIRE_STRING) + encode_varint(2) + b"\xff\xfe"
+
+    # 1. Decoder.skip_field
+    dec = omnibuf.Decoder(bad_str_field)
+    tag = dec.read_tag()
+    assert tag == (99, WIRE_STRING)
+    with pytest.raises(OmniBufDecodeError):
+        dec.skip_field(tag[0], tag[1])
+
+    # 2. field0.decode_schema_meta (unknown WireString field inside SchemaMeta)
+    with pytest.raises(OmniBufDecodeError):
+        omnibuf.decode_schema_meta(bad_str_field)
+
+    # 3. wire.validate_field0_at / _validate_schema_meta_body
+    f0_pkt = encode_tag(0, WIRE_SUB_MSG) + encode_varint(len(bad_str_field)) + bad_str_field
+    with pytest.raises(OmniBufDecodeError):
+        omnibuf_wire.validate_field0_at(f0_pkt, 1, WIRE_SUB_MSG)
+    with pytest.raises(OmniBufDecodeError):
+        validate_message(f0_pkt, depth=0, limit_depth=16)
+
+    # 4. google.protobuf unknown WireString field in unmarshal_proto
+    with pytest.raises(OmniBufDecodeError):
+        unmarshal_proto(bad_str_field, descriptor_pb2.FileDescriptorProto)
+
+
+def test_fixed_width_wire_array_rejects_trailing_bytes_and_unknown_string_skips_by_length() -> None:
+    for elem_wt, elem_bytes in (
+        (WIRE_BOOL_FALSE, b"\x01"),
+        (WIRE_FIXED32, b"\x01\x02\x03\x04"),
+        (WIRE_FIXED64, b"\x01\x02\x03\x04\x05\x06\x07\x08"),
+    ):
+        # Claim count=1 (varint 0x03) plus 1 extra trailing byte
+        body = bytes([elem_wt, 0x03]) + elem_bytes + b"\x00"
+        pkt = encode_tag(99, WIRE_ARRAY) + encode_varint(len(body)) + body
+        with pytest.raises(OmniBufDecodeError):
+            validate_message(pkt)
+        with pytest.raises(OmniBufDecodeError):
+            peer_omnibuf_pb.unmarshal_peer_update(pkt)
+
+    # Spec §7: Unreferenced unknown WIRE_STRING skips by byte length in schema-aware decode,
+    # whereas schema-less decode_blind validates UTF-8 on every string field!
+    tag_bytes = encode_tag(99, WIRE_STRING)
+    unknown_bad_utf8 = tag_bytes + encode_varint(2) + b"\xff\xfe"
+    assert validate_value(memoryview(unknown_bad_utf8), len(tag_bytes), WIRE_STRING, 0) == len(
+        unknown_bad_utf8
+    )
+    dec_peer = peer_omnibuf_pb.unmarshal_peer_update(unknown_bad_utf8)
+    assert dec_peer.asn == 0
+    with pytest.raises(OmniBufDecodeError):
+        omnibuf.decode_blind(unknown_bad_utf8)

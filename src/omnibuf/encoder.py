@@ -1,4 +1,4 @@
-"""Single-pass OmniBuf v0.1 binary Encoder with dynamic container length backpatching."""
+"""Single-pass OmniBuf v1 DRAFT-1 binary Encoder with dynamic container length backpatching."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import operator
 import struct
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TypeVar
+from typing import Any, TypeVar
 
 from .wire import (
     INT32_MAX,
@@ -98,7 +98,7 @@ class _ContainerFrame:
 
 
 class Encoder:
-    """Single-pass OmniBuf v0.1 writer backed by a growable bytearray and container stack."""
+    """Single-pass OmniBuf v1 DRAFT-1 writer backed by a growable bytearray and container stack."""
 
     __slots__ = ("_buf", "_frames")
 
@@ -657,6 +657,18 @@ class Encoder:
             self.write_elem_string(key)
             self.write_elem_uint(val)
         self.end_map()
+
+    @staticmethod
+    def marshal_dataclass(
+        msg: Any,
+        *,
+        deterministic: bool = False,
+        self_describing: bool = False,
+    ) -> bytes:
+        """Encodes an @omnibuf_message dataclass instance into OmniBuf v1 wire bytes."""
+        from .dataclass_codec import marshal
+
+        return marshal(msg, deterministic=deterministic, self_describing=self_describing)
 
 
 __all__ = [

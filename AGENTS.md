@@ -18,7 +18,7 @@ Tools are pinned in `mise.toml` (`python = "3.14.7"`, `uv`, `just = "1.58.0"`, `
 ## Architecture
 
 - `rust/lib.rs`, `rust/codec.rs`, `rust/opaque.rs`, `rust/blind.rs`: Compiled PyO3 + Rust extension (`omnibuf._omnibuf_ext`, typed in `src/omnibuf/_omnibuf_ext.pyi`) backed by `omnibuf-rs`. Uses `LeafBytes` (`Py_buffer` RAII guard) and `InputBytes` (upfront snapshot for mutable buffers) for UAF-safe buffer handling.
-- `src/omnibuf/wire.py`: OmniBuf v0.1 Prefix-Varint (`TZCNT_WIDTH_TABLE`), ZigZag 32/64, container length backpatching, strict UTF-8, shortest round-trip `float32`, `locate_field`, and aliased-safe `splice_fields`.
+- `src/omnibuf/wire.py`: OmniBuf v1 DRAFT-1 Prefix-Varint (`TZCNT_WIDTH_TABLE`), ZigZag 32/64, container length backpatching, strict UTF-8, shortest round-trip `float32`, `locate_field`, and aliased-safe `splice_fields`.
 - `src/omnibuf/encoder.py` & `src/omnibuf/decoder.py`: Streaming single-pass writer and depth-bounded reader (`MAX_CONTAINER_DEPTH = 32`).
 - `src/omnibuf/field0.py` & `src/omnibuf/blind.py`: `SchemaMeta` encoding/merging and two-pass `decode_blind` / `decode_blind_json`.
 - `src/omnibuf/protobuf_codec.py`: Compiled reflection codec with primary support for `protobuf-py` (`bufbuild/protobuf-py` `_pb.py` messages and `DescMessage` descriptors) and lazy optional compatibility for `google.protobuf` (`_pb2.py`).

@@ -1,4 +1,4 @@
-"""Cursor-based OmniBuf v0.1 binary Decoder enforcing depth, UTF-8, and container invariants."""
+"""Cursor-based OmniBuf v1 DRAFT-1 binary Decoder enforcing depth, UTF-8, and container invariants."""
 
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ _T = TypeVar("_T")
 
 
 class Decoder:
-    """Streaming cursor over an OmniBuf v0.1 byte buffer with strict structural validation."""
+    """Streaming cursor over an OmniBuf v1 DRAFT-1 byte buffer with strict structural validation."""
 
     __slots__ = ("_mv", "_pos", "_end", "_depth", "_max_depth")
 

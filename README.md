@@ -1,184 +1,49 @@
-# omnibuf
+# omnibuf-py
 
-[![CI](https://github.com/omnibuf/omnibuf-py/actions/workflows/ci.yml/badge.svg)](https://github.com/omnibuf/omnibuf-py/actions/workflows/ci.yml)
-[![Wire Spec: v0.1](https://img.shields.io/badge/spec-v0.1-111111?style=flat&labelColor=111111&color=FF4F18)](https://omnibuf.com/spec)
-[![Website](https://img.shields.io/badge/website-omnibuf.com-111111?style=flat&labelColor=111111&color=D4FF33)](https://omnibuf.com/py)
+[![OmniBuf Spec: v1 DRAFT-1](https://img.shields.io/badge/OmniBuf%20Spec-v1%20DRAFT--1-FF4F18)](https://omnibuf.com/spec)
 
-Explicit-typed, header-hop binary wire codec for Python.
+Python 3.11+ implementation of the [OmniBuf v1 DRAFT-1 wire specification](https://omnibuf.com/spec), backed by a compiled Rust PyO3 extension. Documentation and benchmarks live at [omnibuf.com/py](https://omnibuf.com/py).
 
-`omnibuf` implements **[OmniBuf Wire Specification v0.1](https://omnibuf.com/spec)** for Python 3.11+ backed by a compiled Rust extension. Every package distribution ships strict type annotations (`py.typed`), `buf` CLI code generation, native [`protobuf-py`](https://github.com/bufbuild/protobuf-py) support, `@omnibuf_message` dataclasses, lazy `Opaque` views, and schema-less `Field #0` inspection.
-
-## Highlights
-
-- **Prefix-Varint Framing**: A single leading byte fixes integer width (`1`, `2`, `4`, or `9` bytes) through trailing-zero count. Reserved markers (`(b & 0x07) == 0` with `b != 0`) fail immediately during decode.
-- **16 Explicit Wire Types**: Distinct 4-bit tags separate signed integers, unsigned integers, booleans, 32-bit and 64-bit floats, UTF-8 strings, raw bytes, sub-messages, typed arrays, typed maps, and extended payloads.
-- **Four Integration Tiers**:
-  - `protoc-gen-omnibuf-py` codegen emitting slotted dataclasses, compiled codecs, `oneof` tracking, and lazy `Opaque<Message>` views
-  - Direct `marshal` and `unmarshal` over `protobuf-py` (`_pb.py` classes and `DescMessage` descriptors), plus optional `google.protobuf` (`_pb2.py`) support
-  - Annotated Python dataclasses via `@omnibuf_message`, `omnibuf_field(...)`, and `enum.IntEnum` or integer-valued `enum.Enum` types
-  - Schema-less `decode_blind` and `decode_blind_json` driven by embedded `Field #0` metadata
-- **758/758 Conformance Verified**: Passes the entire cross-language OmniBuf conformance suite with zero skips.
-
-## Installation
+## Install
 
 ```bash
-uv add omnibuf protobuf-py protobuf-py-ext
+uv add omnibuf
 ```
 
-Projects that run `protoc-gen-omnibuf-py` or decode legacy `google.protobuf` `_pb2` classes install the `protobuf` extra alongside `protoc-gen-py`:
+For `protoc-gen-omnibuf-py` or legacy `google.protobuf` `_pb2` classes, install the `protobuf` extra (`uv add "omnibuf[protobuf]"`).
 
-```bash
-uv add "omnibuf[protobuf]"
-uv add --dev protoc-gen-py
-```
-
-## Code Generation with Buf
-
-Add `buf.yaml` and `buf.gen.yaml` at the repository root:
-
-```yaml
-# buf.yaml
-version: v2
-modules:
-  - path: proto
-lint:
-  use:
-    - STANDARD
-  except:
-    - PACKAGE_VERSION_SUFFIX
-breaking:
-  use:
-    - FILE
-```
-
-```yaml
-# buf.gen.yaml
-version: v2
-plugins:
-  - local: ["uv", "run", "--no-sync", "protoc-gen-py"]
-    out: src/omnibuf/gen
-  - local: ["uv", "run", "--no-sync", "protoc-gen-omnibuf-py"]
-    out: src/omnibuf/gen
-```
-
-Run `buf lint` and `buf generate`. Buf emits `<name>_pb.py` (`protobuf-py`) and `<name>_omnibuf_pb.py` (`omnibuf`) modules in one pass.
-
-## Usage
-
-### 1. `protobuf-py` Messages
-
-`omnibuf.marshal` and `omnibuf.unmarshal` accept `protobuf-py` generated `_pb.py` message classes, instances, and `DescMessage` descriptors directly.
+## Quick Usage
 
 ```python
 import omnibuf
-from omnibuf.gen.omnibuf.bench import peer_pb
-
-msg = peer_pb.PeerUpdate(
-    asn=64512,
-    router_id="edge-rtr-fra01.core.backbone.net",
-    active=True,
-    rssi_dbm=-62,
-    location=peer_pb.Location(region="eu-central-1", city="Frankfurt", rack=42),
-    sequence=9876543210,
-)
-
-packet = omnibuf.marshal(msg, deterministic=True)
-decoded = omnibuf.unmarshal(packet, peer_pb.PeerUpdate)
-assert decoded.location.city == "Frankfurt"
-```
-
-### 2. Generated Codecs and Lazy `Opaque` Views
-
-`protoc-gen-omnibuf-py` emits slotted dataclasses paired with `Opaque<Message>` views. `Opaque` views hop across length headers in `O(1)` time per field. Nested slices read directly from `bytes` buffers, and single-field edits splice into existing wire bytes.
-
-```python
-from omnibuf.gen.omnibuf.bench import peer_omnibuf_pb
-
-view = peer_omnibuf_pb.OpaquePeerUpdate(packet)
-loc = view.opaque_location()
-assert loc is not None
-assert loc.get_city() == "Frankfurt"
-
-view.set_sequence(9876543211)
-updated_packet = view.marshal()
-```
-
-### 3. Annotated Python Dataclasses
-
-Pure Python schemas declare wire field numbers with `@omnibuf_message`, `omnibuf_field`, and explicit scalar aliases (`Uint32`, `Uint64`, `Sint32`, `Sint64`, `Fixed32`, `Sfixed32`, `Fixed64`, `Sfixed64`, `Float32`, `Float64`).
-
-```python
-import omnibuf
-from omnibuf import Float32, Sint32, Uint32, Uint64, omnibuf_field, omnibuf_message
-
-
-@omnibuf_message("Location")
-class Location:
-    region: str = omnibuf_field(1, default="")
-    city: str = omnibuf_field(3, default="")
-    rack: Uint32 = omnibuf_field(4, default=0)
-    latitude: Float32 = omnibuf_field(5, default=0.0)
+from omnibuf import Sint32, Uint32, Uint64, omnibuf_field, omnibuf_message
 
 
 @omnibuf_message("PeerSummary")
 class PeerSummary:
     asn: Uint32 = omnibuf_field(1, default=0)
     rssi_dbm: Sint32 = omnibuf_field(5, default=0)
-    location: Location = omnibuf_field(9, default_factory=Location)
     sequence: Uint64 = omnibuf_field(11, default=0)
 
 
-raw = omnibuf.marshal(
-    PeerSummary(asn=64512, rssi_dbm=-62, location=Location(city="Frankfurt"), sequence=7),
-    self_describing=True,
-)
+raw = omnibuf.marshal(PeerSummary(asn=64512, rssi_dbm=-62, sequence=7), self_describing=True)
 restored = omnibuf.unmarshal(raw, PeerSummary)
 ```
 
-### 4. Schema-less Inspection via `Field #0`
+## Implementation Details
 
-Self-describing packets embed recursive field names inside `Field #0`. `decode_blind` and `decode_blind_json` resolve `Field #0` metadata in two passes, format shortest round-trip `float32` decimals, encode raw bytes as Base64, and preserve full 64-bit integer precision.
+- **Rust PyO3 core**: Wire encoding, decoding, and `Field #0` inspection run in a native Rust extension with strict `py.typed` annotations for Python 3.11+.
+- **Dataclass schemas**: `@omnibuf_message` and `omnibuf_field` annotate Python classes with explicit scalar aliases (`Uint32`, `Uint64`, `Sint32`, `Sint64`, `Float32`, `Float64`) and `IntEnum` support.
+- **`protobuf-py` interop**: `omnibuf.marshal` and `omnibuf.unmarshal` work directly on `protobuf-py` `_pb.py` classes and `DescMessage` descriptors, with optional `google.protobuf` `_pb2.py` support.
+- **Codegen**: `protoc-gen-omnibuf-py` emits slotted dataclasses, compiled codecs, and lazy `Opaque` views for in-place wire splicing.
+- **Blind decode**: `decode_blind` and `decode_blind_json` decode packets with embedded `Field #0` metadata.
 
-```python
-import omnibuf
-
-payload_dict = omnibuf.decode_blind(raw)
-payload_json = omnibuf.decode_blind_json(raw)
-```
-
-## Benchmarks
-
-Python benchmark results, methodology, and cross-language comparisons live at [omnibuf.com/benchmarks?lang=py](https://omnibuf.com/benchmarks?lang=py) (all languages at [omnibuf.com/benchmarks](https://omnibuf.com/benchmarks)). Run `just bench` to execute `benchmarks/bench.py` locally and update [`testdata/benchmarks.json`](testdata/benchmarks.json).
-
-## Development Workflow
-
-Toolchains (`python`, `rust`, `uv`, `buf`, `just`) are pinned in `mise.toml`:
+## Development
 
 ```bash
-just install      # Build Rust extension and sync .venv
-just proto        # Run buf lint and buf generate
-just fmt          # Format Rust and Python sources
-just lint         # Run buf lint, cargo clippy, ruff check, and strict mypy
-just test         # Run pytest suite
-just conformance  # Run all 758 cross-language conformance cases
-just bench        # Run PeerUpdate benchmarks -> testdata/benchmarks.json
-just ci           # Run fmt-check, lint, test, and conformance
+just install && just test && just conformance
 ```
 
 ## License
 
-Released under the [Apache 2.0 License](./LICENSE).
-
-## Runtime safety and ownership
-
-The Rust extension retains immutable input bytes and snapshots mutable inputs
-before decoding that can invoke Python callbacks. Direct slot access validates
-the descriptor's declaring class. Optional attribute access suppresses only
-`AttributeError`; other getter failures propagate.
-
-The extension's dataclass lookup cache holds at most 128 owning entries. An
-active operation retains its codec across cache eviction and Python callbacks.
-Python schema metadata caches still retain registered classes for recursive
-type resolution. Avoid generating unbounded distinct message classes in a
-long-running process. Schema classes and type annotations are trusted code;
-resolving annotations and calling factories can execute Python.
+Apache-2.0. See [LICENSE](./LICENSE).

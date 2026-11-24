@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import pytest
 
+import omnibuf
 from omnibuf import (
     MAX_CONTAINER_DEPTH,
     WIRE_ARRAY,
     WIRE_BOOL_FALSE,
+    WIRE_BYTES,
     WIRE_EXTENDED,
     WIRE_SINT,
     WIRE_STRING,
@@ -17,7 +19,9 @@ from omnibuf import (
     Encoder,
     OmniBufDecodeError,
     OmniBufEncodeError,
+    validate_message,
 )
+from omnibuf.conformance import AnnotatedPeerUpdate
 from omnibuf.wire import encode_tag, encode_varint
 
 
@@ -122,3 +126,68 @@ def test_decoder_rejects_trailing_container_bytes_and_bad_bool_byte() -> None:
     assert dec_b.read_tag() == (1, WIRE_ARRAY)
     with pytest.raises(OmniBufDecodeError):
         dec_b.read_bool_array()
+
+
+def test_string_rejected_for_bool_fields() -> None:
+    """Passing non-bool `'false'` to a bool field or Encoder.write_bool must raise, not encode True."""
+    bad_dc = AnnotatedPeerUpdate(active="false")  # type: ignore[arg-type]
+    with pytest.raises((TypeError, OmniBufEncodeError)):
+        omnibuf.marshal(bad_dc)
+
+    enc = Encoder()
+    with pytest.raises((TypeError, OmniBufEncodeError)):
+        enc.write_bool(1, "false")  # type: ignore[arg-type]
+
+
+def test_encoder_rejects_mismatched_array_element_count() -> None:
+    """Encoder.end_array() / finish() must raise OmniBufEncodeError when fewer elements were written."""
+    enc = Encoder()
+    enc.begin_array(1, WIRE_UINT, 5)
+    with pytest.raises(OmniBufEncodeError):
+        enc.end_array()
+        enc.finish()
+
+
+def test_encoder_handles_non_byte_memoryview() -> None:
+    """Encoder must use byte length (nbytes) for non-byte memoryviews (itemsize > 1)."""
+    import array
+
+    arr = array.array("I", [0x11223344, 0x55667788])
+    mv = memoryview(arr)
+    expected = arr.tobytes()
+    assert len(mv) == 2
+    assert mv.nbytes == 8
+
+    enc = Encoder()
+    enc.write_bytes(1, mv)
+    enc.write_extended(2, 0x07, mv)
+    enc.begin_array(3, WIRE_BYTES, 1)
+    enc.write_elem_bytes(mv)
+    enc.end_array()
+    pkt = enc.finish()
+
+    validate_message(pkt)
+    assert omnibuf.opaque_get_bytes(pkt, 1) == expected
+    assert omnibuf.opaque_get_scalar_array(pkt, 3, WIRE_BYTES, "bytes") == [expected]
+
+
+def test_python_311_syntax_compatibility_all_src_files() -> None:
+    """Every .py and .pyi file under src/omnibuf/ must parse under Python 3.11 syntax."""
+    import ast
+    import pathlib
+
+    src_root = pathlib.Path(omnibuf.__file__).resolve().parent
+    files = sorted(list(src_root.rglob("*.py")) + list(src_root.rglob("*.pyi")))
+    assert files
+    for path in files:
+        ast.parse(path.read_text(encoding="utf-8"), filename=str(path), feature_version=(3, 11))
+
+
+def test_package_version_matches_pyproject() -> None:
+    """omnibuf.__version__ must match pyproject.toml project.version."""
+    import pathlib
+    import tomllib
+
+    pyproject = pathlib.Path(__file__).resolve().parents[1] / "pyproject.toml"
+    expected = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"]
+    assert omnibuf.__version__ == expected

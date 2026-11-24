@@ -20,7 +20,6 @@ from ._omnibuf_ext import (
     set_dataclass_resolver_py,
     unmarshal_dataclass_py,
 )
-from .encoder import Encoder
 from .field0 import SchemaMeta, encode_field0_schema_meta
 from .wire import (
     MAX_FIELD_NUMBER,
@@ -948,9 +947,6 @@ def schema_meta_for(target: Any) -> SchemaMeta:
     cls = target if isinstance(target, type) else type(target)
     return _get_struct_codec(cls).get_schema_meta().copy()
 
-
-# Convenience Encoder helper compatibility
-Encoder.marshal_dataclass = staticmethod(marshal)  # type: ignore[attr-defined]
 
 __all__ = [
     "FieldInfo",

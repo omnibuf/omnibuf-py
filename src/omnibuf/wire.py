@@ -1,4 +1,4 @@
-"""Low-level OmniBuf v0.1 Prefix-Varint (TZCNT) primitives, wire constants, and O(1) skipping."""
+"""Low-level OmniBuf v1 DRAFT-1 Prefix-Varint (TZCNT) primitives, wire constants, and O(1) skipping."""
 
 from __future__ import annotations
 
@@ -434,7 +434,7 @@ def read_len_bytes(
 
 
 def is_valid_map_types(key_wt: int, val_wt: int) -> bool:
-    """Checks whether (key_wt, val_wt) are valid OmniBuf v0.1 WireMap header types."""
+    """Checks whether (key_wt, val_wt) are valid OmniBuf v1 DRAFT-1 WireMap header types."""
     return (
         key_wt in VALID_MAP_KEY_TYPES and 0 <= val_wt <= WIRE_EXTENDED and val_wt != WIRE_BOOL_TRUE
     )
