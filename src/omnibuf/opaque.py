@@ -291,7 +291,10 @@ def opaque_get_map(
         for _ in range(count):
             k, p = _read_scalar_elem(body_mv, p, end, key_kind)
             if val_kind == "submsg":
-                assert sub_decode_fn is not None
+                if sub_decode_fn is None:
+                    raise OmniBufDecodeError(
+                        f"omnibuf: missing sub_decode_fn for submsg map field #{field_num}"
+                    )
                 v_mv, p = read_len_slice(body_mv, p, 0, end)
                 out[k] = sub_decode_fn(v_mv, None, 2, False)
             else:

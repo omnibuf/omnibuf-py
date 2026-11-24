@@ -33,20 +33,30 @@ class SchemaMeta:
     fields: dict[int, str] = field(default_factory=dict)
     children: dict[int, SchemaMeta] = field(default_factory=dict)
 
-    def copy(self) -> SchemaMeta:
+    def copy(self, _depth: int = 0) -> SchemaMeta:
+        if _depth > MAX_NESTING_DEPTH:
+            raise OmniBufEncodeError(
+                f"omnibuf: SchemaMeta copy nesting depth {_depth} exceeds {MAX_NESTING_DEPTH}"
+            )
         return SchemaMeta(
             type_name=self.type_name,
             fields=dict(self.fields),
-            children={k: v.copy() for k, v in self.children.items()},
+            children={k: v.copy(_depth + 1) for k, v in self.children.items()},
         )
 
 
-def merge_schema_meta(base: SchemaMeta | None, overlay: SchemaMeta | None) -> SchemaMeta | None:
+def merge_schema_meta(
+    base: SchemaMeta | None, overlay: SchemaMeta | None, _depth: int = 0
+) -> SchemaMeta | None:
     """Merges overlay onto a copy/existing SchemaMeta without mutating overlay."""
+    if _depth > MAX_NESTING_DEPTH:
+        raise OmniBufEncodeError(
+            f"omnibuf: SchemaMeta merge nesting depth {_depth} exceeds {MAX_NESTING_DEPTH}"
+        )
     if overlay is None:
         return base
     if base is None:
-        return overlay.copy()
+        return overlay.copy(_depth)
     if overlay.type_name:
         base.type_name = overlay.type_name
     if overlay.fields:
@@ -54,7 +64,7 @@ def merge_schema_meta(base: SchemaMeta | None, overlay: SchemaMeta | None) -> Sc
     if overlay.children:
         for fnum, child in overlay.children.items():
             existing = base.children.get(fnum)
-            merged = merge_schema_meta(existing, child)
+            merged = merge_schema_meta(existing, child, _depth + 1)
             if merged is not None:
                 base.children[fnum] = merged
     return base
@@ -108,7 +118,8 @@ def encode_field0_schema_meta(meta: SchemaMeta) -> bytes:
     enc = Encoder()
     write_field0_schema_meta(enc, meta)
     out = enc.finish()
-    assert out[0] == FIELD0_TAG
+    if not out or out[0] != FIELD0_TAG:
+        raise OmniBufEncodeError("omnibuf: encoded Field #0 block did not start with FIELD0_TAG")
     return out
 
 

@@ -173,6 +173,8 @@ def decode_zigzag32(u: int) -> int:
 
 def varint_byte_length(v: int) -> int:
     """Returns the Prefix-Varint byte width (1, 2, 4, or 9) for unsigned uint64 v."""
+    if isinstance(v, bool) or not isinstance(v, int):
+        raise OmniBufEncodeError(f"omnibuf: varint expected int, got {type(v).__name__}")
     if v < 0 or v > UINT64_MAX:
         raise OmniBufEncodeError(f"omnibuf: varint value {v} out of uint64 range")
     if v <= MAX_1B_VARINT:
@@ -387,16 +389,18 @@ def read_len_slice(
     end: int | None = None,
 ) -> tuple[memoryview, int]:
     """Reads [ByteLen (Prefix-Varint)][Payload] at data[pos:end], enforcing min_len and bounds."""
-    limit = len(data) if end is None else end
+    mv = data if isinstance(data, memoryview) else memoryview(data)
+    if mv.format != "B" or mv.ndim != 1:
+        mv = mv.cast("B")
+    limit = len(mv) if end is None else end
     if pos >= limit:
         raise OmniBufDecodeError(f"omnibuf: truncated length varint at byte {pos}")
-    byte_len, width = decode_varint(data, pos, limit)
+    byte_len, width = decode_varint(mv, pos, limit)
     if width == 0:
         raise OmniBufDecodeError(f"omnibuf: invalid length varint at byte {pos}")
     pos += width
     if byte_len < min_len or byte_len > limit - pos:
         raise OmniBufDecodeError(f"omnibuf: invalid byte length {byte_len} at byte {pos}")
-    mv = memoryview(data)
     return mv[pos : pos + byte_len], pos + byte_len
 
 

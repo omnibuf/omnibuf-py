@@ -114,7 +114,7 @@ from .wire import (
 try:
     __version__ = importlib.metadata.version("omnibuf")
 except importlib.metadata.PackageNotFoundError:
-    __version__ = "0.1.5"
+    __version__ = "0.1.6"
 
 _M = TypeVar("_M", bound="pbpy.Message[Any]")
 _G = TypeVar("_G", bound="GpbMessage")

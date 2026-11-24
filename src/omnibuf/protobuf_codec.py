@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import operator
 import struct
 import threading
 from dataclasses import dataclass
@@ -152,6 +153,17 @@ _GPB_SCALAR_SPEC: dict[int, tuple[str, int]] = {
 }
 
 
+def _require_proto_int(val: Any, field_name: str) -> int:
+    if isinstance(val, bool):
+        raise OmniBufEncodeError(f"omnibuf: field {field_name} expected int, got bool")
+    try:
+        return operator.index(val)
+    except TypeError as exc:
+        raise OmniBufEncodeError(
+            f"omnibuf: field {field_name} expected int, got {type(val).__name__}"
+        ) from exc
+
+
 def _write_proto_scalar(dst: bytearray, kind: str, val: Any, field_name: str) -> None:
     if kind == "bool":
         if not isinstance(val, bool):
@@ -160,52 +172,36 @@ def _write_proto_scalar(dst: bytearray, kind: str, val: Any, field_name: str) ->
             )
         dst.append(1 if val else 0)
     elif kind == "uint32":
-        if isinstance(val, bool):
-            raise OmniBufEncodeError(f"omnibuf: field {field_name} expected int, got bool")
-        iv = int(val)
+        iv = _require_proto_int(val, field_name)
         if iv < 0 or iv > UINT32_MAX:
             raise OmniBufEncodeError(f"omnibuf: field {field_name} uint32 {iv} out of range")
         append_varint(dst, iv)
     elif kind == "uint64":
-        if isinstance(val, bool):
-            raise OmniBufEncodeError(f"omnibuf: field {field_name} expected int, got bool")
-        iv = int(val)
+        iv = _require_proto_int(val, field_name)
         if iv < 0 or iv > UINT64_MAX:
             raise OmniBufEncodeError(f"omnibuf: field {field_name} uint64 {iv} out of range")
         append_varint(dst, iv)
     elif kind in ("sint32", "enum"):
-        if isinstance(val, bool):
-            raise OmniBufEncodeError(f"omnibuf: field {field_name} expected int, got bool")
-        append_varint(dst, encode_zigzag32(int(val)))
+        append_varint(dst, encode_zigzag32(_require_proto_int(val, field_name)))
     elif kind == "sint64":
-        if isinstance(val, bool):
-            raise OmniBufEncodeError(f"omnibuf: field {field_name} expected int, got bool")
-        append_varint(dst, encode_zigzag(int(val)))
+        append_varint(dst, encode_zigzag(_require_proto_int(val, field_name)))
     elif kind == "fixed32":
-        if isinstance(val, bool):
-            raise OmniBufEncodeError(f"omnibuf: field {field_name} expected int, got bool")
-        iv = int(val)
+        iv = _require_proto_int(val, field_name)
         if iv < 0 or iv > UINT32_MAX:
             raise OmniBufEncodeError(f"omnibuf: field {field_name} fixed32 {iv} out of range")
         dst.extend(_U32_PACK(iv))
     elif kind == "sfixed32":
-        if isinstance(val, bool):
-            raise OmniBufEncodeError(f"omnibuf: field {field_name} expected int, got bool")
-        iv = int(val)
+        iv = _require_proto_int(val, field_name)
         if iv < INT32_MIN or iv > INT32_MAX:
             raise OmniBufEncodeError(f"omnibuf: field {field_name} sfixed32 {iv} out of range")
         dst.extend(_I32_PACK(iv))
     elif kind == "fixed64":
-        if isinstance(val, bool):
-            raise OmniBufEncodeError(f"omnibuf: field {field_name} expected int, got bool")
-        iv = int(val)
+        iv = _require_proto_int(val, field_name)
         if iv < 0 or iv > UINT64_MAX:
             raise OmniBufEncodeError(f"omnibuf: field {field_name} fixed64 {iv} out of range")
         dst.extend(_U64_PACK(iv))
     elif kind == "sfixed64":
-        if isinstance(val, bool):
-            raise OmniBufEncodeError(f"omnibuf: field {field_name} expected int, got bool")
-        iv = int(val)
+        iv = _require_proto_int(val, field_name)
         if iv < INT64_MIN or iv > INT64_MAX:
             raise OmniBufEncodeError(f"omnibuf: field {field_name} sfixed64 {iv} out of range")
         dst.extend(_I64_PACK(iv))
