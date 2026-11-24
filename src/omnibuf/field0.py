@@ -200,7 +200,7 @@ def decode_schema_meta(
                 if merged is not None:
                     meta.children[k64] = merged
         else:
-            pos = validate_value(mv, pos, wt, depth, max_depth, n)
+            pos = validate_value(mv, pos, wt, depth, max_depth, n, check_utf8=True)
 
     return meta
 

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, overload
+import importlib.metadata
+from typing import TYPE_CHECKING, Any, TypeVar, overload
 
 import protobuf as pbpy
 
@@ -110,7 +111,14 @@ from .wire import (
     wire_type_name,
 )
 
-__version__ = "0.1.1"
+try:
+    __version__ = importlib.metadata.version("omnibuf")
+except importlib.metadata.PackageNotFoundError:
+    __version__ = "0.1.5"
+
+_M = TypeVar("_M", bound="pbpy.Message[Any]")
+_G = TypeVar("_G", bound="GpbMessage")
+_T = TypeVar("_T")
 
 
 def marshal(
@@ -148,23 +156,23 @@ def marshal(
 
 
 @overload
-def unmarshal[M: pbpy.Message[Any]](
+def unmarshal(
     packet: Buffer,
-    target: type[M],
+    target: type[_M],
     *,
     max_elements: int | None = None,
     zero_copy_bytes: bool = False,
-) -> M: ...
+) -> _M: ...
 
 
 @overload
-def unmarshal[M: pbpy.Message[Any]](
+def unmarshal(
     packet: Buffer,
-    target: M,
+    target: _M,
     *,
     max_elements: int | None = None,
     zero_copy_bytes: bool = False,
-) -> M: ...
+) -> _M: ...
 
 
 @overload
@@ -178,43 +186,43 @@ def unmarshal(
 
 
 @overload
-def unmarshal[G: GpbMessage](
+def unmarshal(
     packet: Buffer,
-    target: type[G],
+    target: type[_G],
     *,
     max_elements: int | None = None,
     zero_copy_bytes: bool = False,
-) -> G: ...
+) -> _G: ...
 
 
 @overload
-def unmarshal[G: GpbMessage](
+def unmarshal(
     packet: Buffer,
-    target: G,
+    target: _G,
     *,
     max_elements: int | None = None,
     zero_copy_bytes: bool = False,
-) -> G: ...
+) -> _G: ...
 
 
 @overload
-def unmarshal[T](
+def unmarshal(
     packet: Buffer,
-    target: type[T],
+    target: type[_T],
     *,
     max_elements: int | None = None,
     zero_copy_bytes: bool = False,
-) -> T: ...
+) -> _T: ...
 
 
 @overload
-def unmarshal[T](
+def unmarshal(
     packet: Buffer,
-    target: T,
+    target: _T,
     *,
     max_elements: int | None = None,
     zero_copy_bytes: bool = False,
-) -> T: ...
+) -> _T: ...
 
 
 def unmarshal(

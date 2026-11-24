@@ -6,10 +6,11 @@ import math
 import struct
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import TypeAlias
 
 from . import _omnibuf_ext
 
-type Buffer = bytes | bytearray | memoryview
+Buffer: TypeAlias = bytes | bytearray | memoryview
 
 
 class OmniBufError(ValueError):
@@ -823,7 +824,7 @@ def _validate_schema_meta_body(body: memoryview, depth: int, limit_depth: int) -
             if p != len(map_body):
                 raise OmniBufDecodeError("omnibuf: trailing bytes in SchemaMeta.children")
         else:
-            pos = validate_value(body, pos, wt, depth, limit_depth, n)
+            pos = validate_value(body, pos, wt, depth, limit_depth, n, check_utf8=True)
 
 
 def validate_message(

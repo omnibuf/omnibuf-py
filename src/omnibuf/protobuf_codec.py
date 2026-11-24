@@ -5,7 +5,7 @@ from __future__ import annotations
 import struct
 import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, overload
+from typing import TYPE_CHECKING, Any, TypeVar, overload
 
 import protobuf as pbpy
 
@@ -902,14 +902,14 @@ def _decode_gpb_msg(
 
         fd = by_num.get(fnum)
         if fd is None:
-            pos = validate_value(data, pos, wt, depth, MAX_NESTING_DEPTH, n)
+            pos = validate_value(data, pos, wt, depth, MAX_NESTING_DEPTH, n, check_utf8=True)
             continue
 
         already_seen = (fnum in seen) or merge
 
         if _is_gpb_map_field(fd):
             if wt != WIRE_MAP:
-                pos = validate_value(data, pos, wt, depth, MAX_NESTING_DEPTH, n)
+                pos = validate_value(data, pos, wt, depth, MAX_NESTING_DEPTH, n, check_utf8=True)
                 continue
             seen.add(fnum)
             if depth + 1 > MAX_NESTING_DEPTH:
@@ -945,7 +945,7 @@ def _decode_gpb_msg(
                 raise OmniBufDecodeError(f"omnibuf: trailing map bytes on field {fd.name}")
         elif _is_gpb_repeated(fd):
             if wt != WIRE_ARRAY:
-                pos = validate_value(data, pos, wt, depth, MAX_NESTING_DEPTH, n)
+                pos = validate_value(data, pos, wt, depth, MAX_NESTING_DEPTH, n, check_utf8=True)
                 continue
             seen.add(fnum)
             if depth + 1 > MAX_NESTING_DEPTH:
@@ -975,7 +975,7 @@ def _decode_gpb_msg(
                 raise OmniBufDecodeError(f"omnibuf: trailing array bytes on field {fd.name}")
         elif fd.type == _GPB_TYPE_MESSAGE:
             if wt != WIRE_SUB_MSG:
-                pos = validate_value(data, pos, wt, depth, MAX_NESTING_DEPTH, n)
+                pos = validate_value(data, pos, wt, depth, MAX_NESTING_DEPTH, n, check_utf8=True)
                 continue
             seen.add(fnum)
             sub_mv, pos = read_len_slice(data, pos, 0, n)
@@ -984,14 +984,14 @@ def _decode_gpb_msg(
             _decode_gpb_msg(sub_mv, sub_msg, depth + 1, already_seen, budget)
         elif fd.type == _GPB_TYPE_BOOL:
             if wt not in (WIRE_BOOL_FALSE, WIRE_BOOL_TRUE):
-                pos = validate_value(data, pos, wt, depth, MAX_NESTING_DEPTH, n)
+                pos = validate_value(data, pos, wt, depth, MAX_NESTING_DEPTH, n, check_utf8=True)
                 continue
             seen.add(fnum)
             setattr(dst, fd.name, wt == WIRE_BOOL_TRUE)
         else:
             s_kind, exp_wt = _GPB_SCALAR_SPEC[fd.type]
             if wt != exp_wt:
-                pos = validate_value(data, pos, wt, depth, MAX_NESTING_DEPTH, n)
+                pos = validate_value(data, pos, wt, depth, MAX_NESTING_DEPTH, n, check_utf8=True)
                 continue
             seen.add(fnum)
             val, pos = _read_proto_scalar(data, pos, n, s_kind)
@@ -1050,16 +1050,16 @@ def marshal_proto(
     )
 
 
-@overload
-def unmarshal_proto[M: pbpy.Message[Any]](
-    packet: Buffer, target: type[M], *, max_elements: int | None = None
-) -> M: ...
+_M = TypeVar("_M", bound="pbpy.Message[Any]")
+_G = TypeVar("_G", bound="GpbMessage")
 
 
 @overload
-def unmarshal_proto[M: pbpy.Message[Any]](
-    packet: Buffer, target: M, *, max_elements: int | None = None
-) -> M: ...
+def unmarshal_proto(packet: Buffer, target: type[_M], *, max_elements: int | None = None) -> _M: ...
+
+
+@overload
+def unmarshal_proto(packet: Buffer, target: _M, *, max_elements: int | None = None) -> _M: ...
 
 
 @overload
@@ -1069,15 +1069,11 @@ def unmarshal_proto(
 
 
 @overload
-def unmarshal_proto[G: GpbMessage](
-    packet: Buffer, target: type[G], *, max_elements: int | None = None
-) -> G: ...
+def unmarshal_proto(packet: Buffer, target: type[_G], *, max_elements: int | None = None) -> _G: ...
 
 
 @overload
-def unmarshal_proto[G: GpbMessage](
-    packet: Buffer, target: G, *, max_elements: int | None = None
-) -> G: ...
+def unmarshal_proto(packet: Buffer, target: _G, *, max_elements: int | None = None) -> _G: ...
 
 
 def unmarshal_proto(

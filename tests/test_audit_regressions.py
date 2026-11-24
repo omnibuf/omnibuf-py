@@ -827,3 +827,57 @@ def test_audit_r2_f3_large_other_scalar_arrays_check_signals_path() -> None:
     got = omnibuf.unmarshal(raw, _AuditR2ScalarArrays)
     assert got.f64s == msg.f64s
     assert got.bools == msg.bools
+
+
+# ---------------------------------------------------------------------------
+# Python 3.11 syntax compatibility, unknown WireString UTF-8 validation, and __version__
+# ---------------------------------------------------------------------------
+def test_python_311_syntax_compatibility_all_src_files() -> None:
+    """Every .py and .pyi file under src/omnibuf/ must parse under Python 3.11 syntax."""
+    import ast
+    import pathlib
+
+    src_root = pathlib.Path(omnibuf.__file__).resolve().parent
+    files = sorted(list(src_root.rglob("*.py")) + list(src_root.rglob("*.pyi")))
+    assert files
+    for path in files:
+        ast.parse(path.read_text(encoding="utf-8"), filename=str(path), feature_version=(3, 11))
+
+
+def test_unknown_wire_string_invalid_utf8_rejected() -> None:
+    """Skipped/unknown WireString fields with invalid UTF-8 must be rejected consistently."""
+    from omnibuf.protobuf_codec import unmarshal_proto
+
+    bad_str_field = encode_tag(99, omnibuf_wire.WIRE_STRING) + encode_varint(2) + b"\xff\xfe"
+
+    # 1. Decoder.skip_field
+    dec = omnibuf.Decoder(bad_str_field)
+    tag = dec.read_tag()
+    assert tag == (99, omnibuf_wire.WIRE_STRING)
+    with pytest.raises(OmniBufDecodeError):
+        dec.skip_field(tag[0], tag[1])
+
+    # 2. field0.decode_schema_meta (unknown WireString field inside SchemaMeta)
+    with pytest.raises(OmniBufDecodeError):
+        omnibuf.decode_schema_meta(bad_str_field)
+
+    # 3. wire.validate_field0_at / _validate_schema_meta_body
+    f0_pkt = encode_tag(0, WIRE_SUB_MSG) + encode_varint(len(bad_str_field)) + bad_str_field
+    with pytest.raises(OmniBufDecodeError):
+        omnibuf_wire.validate_field0_at(f0_pkt, 1, WIRE_SUB_MSG)
+    with pytest.raises(OmniBufDecodeError):
+        validate_message(f0_pkt, depth=0, limit_depth=16)
+
+    # 4. google.protobuf unknown WireString field in unmarshal_proto
+    with pytest.raises(OmniBufDecodeError):
+        unmarshal_proto(bad_str_field, descriptor_pb2.FileDescriptorProto)
+
+
+def test_package_version_matches_pyproject() -> None:
+    """omnibuf.__version__ must match pyproject.toml project.version."""
+    import pathlib
+    import tomllib
+
+    pyproject = pathlib.Path(__file__).resolve().parents[1] / "pyproject.toml"
+    expected = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"]
+    assert omnibuf.__version__ == expected

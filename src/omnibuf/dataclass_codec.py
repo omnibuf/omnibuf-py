@@ -11,7 +11,7 @@ import types
 import typing
 from collections.abc import Callable
 from dataclasses import MISSING, Field, dataclass
-from typing import Annotated, Any, Literal, Union, dataclass_transform, overload
+from typing import Annotated, Any, Literal, TypeAlias, TypeVar, Union, dataclass_transform, overload
 
 from ._omnibuf_ext import (
     CompiledCodec,
@@ -42,7 +42,7 @@ from .wire import (
     OmniBufEncodeError,
 )
 
-type WireName = Literal[
+WireName: TypeAlias = Literal[
     "uint",
     "uint32",
     "uint64",
@@ -62,6 +62,8 @@ type WireName = Literal[
     "array",
     "map",
 ]
+
+_T = TypeVar("_T")
 
 
 @dataclass(slots=True, frozen=True)
@@ -112,31 +114,31 @@ class FieldInfo:
 
 
 @overload
-def omnibuf_field[T](
+def omnibuf_field(
     field_num: int,
     *,
-    default: T,
+    default: _T,
     name: str | None = None,
     wire: WireName | None = None,
     elem_wire: WireName | None = None,
     key_wire: WireName | None = None,
     val_wire: WireName | None = None,
     omitempty: bool = False,
-) -> T: ...
+) -> _T: ...
 
 
 @overload
-def omnibuf_field[T](
+def omnibuf_field(
     field_num: int,
     *,
-    default_factory: Callable[[], T],
+    default_factory: Callable[[], _T],
     name: str | None = None,
     wire: WireName | None = None,
     elem_wire: WireName | None = None,
     key_wire: WireName | None = None,
     val_wire: WireName | None = None,
     omitempty: bool = False,
-) -> T: ...
+) -> _T: ...
 
 
 @overload
@@ -351,26 +353,26 @@ def _apply_default_if_missing(
 
 @overload
 @dataclass_transform(field_specifiers=(omnibuf_field, dataclasses.field))
-def omnibuf_message[T](cls: type[T], /) -> type[T]: ...
+def omnibuf_message(cls: type[_T], /) -> type[_T]: ...
 
 
 @overload
 @dataclass_transform(field_specifiers=(omnibuf_field, dataclasses.field))
-def omnibuf_message[T](
+def omnibuf_message(
     type_name: str,
     /,
     *,
     slots: bool = True,
-) -> Callable[[type[T]], type[T]]: ...
+) -> Callable[[type[_T]], type[_T]]: ...
 
 
 @overload
 @dataclass_transform(field_specifiers=(omnibuf_field, dataclasses.field))
-def omnibuf_message[T](
+def omnibuf_message(
     *,
     type_name: str | None = None,
     slots: bool = True,
-) -> Callable[[type[T]], type[T]]: ...
+) -> Callable[[type[_T]], type[_T]]: ...
 
 
 def omnibuf_message(

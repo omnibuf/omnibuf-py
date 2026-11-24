@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import struct
 from collections.abc import Callable
-from typing import Any
+from typing import Any, TypeVar
 
 from . import _omnibuf_ext
 from ._omnibuf_ext import OpaqueView
@@ -41,6 +41,8 @@ _U64_UNPACK = struct.Struct("<Q").unpack_from
 _I64_UNPACK = struct.Struct("<q").unpack_from
 _F32_UNPACK = struct.Struct("<f").unpack_from
 _F64_UNPACK = struct.Struct("<d").unpack_from
+
+_T = TypeVar("_T")
 
 opaque_get_uint32 = _omnibuf_ext.opaque_get_uint32_py
 opaque_get_uint64 = _omnibuf_ext.opaque_get_uint64_py
@@ -88,15 +90,15 @@ def opaque_get_submsg_slice(raw: Buffer, field_num: int) -> Buffer | None:
     return _omnibuf_ext.opaque_get_submsg_slice_py(raw, field_num)
 
 
-def opaque_get_submsg[T](
+def opaque_get_submsg(
     raw: Buffer,
     field_num: int,
-    decode_fn: Callable[[Buffer, T | None, int, bool], T],
-) -> T | None:
+    decode_fn: Callable[[Buffer, _T | None, int, bool], _T],
+) -> _T | None:
     """Lazily decodes all occurrences of a singular sub-message field (merging duplicates)."""
     pos = 0
     n = len(raw)
-    result: T | None = None
+    result: _T | None = None
     while pos < n:
         b_start, b_end, pos = next_container_span(raw, pos, field_num, WIRE_SUB_MSG, 0)
         if b_start == -2:
@@ -212,14 +214,14 @@ def opaque_get_scalar_array(
     return out
 
 
-def opaque_get_submsg_array[T](
+def opaque_get_submsg_array(
     raw: Buffer,
     field_num: int,
-    decode_fn: Callable[[Buffer, T | None, int, bool], T],
+    decode_fn: Callable[[Buffer, _T | None, int, bool], _T],
     *,
     max_elements: int = DEFAULT_MAX_ELEMENTS,
-) -> list[T]:
-    out: list[T] = []
+) -> list[_T]:
+    out: list[_T] = []
     pos = 0
     n = len(raw)
     total_elems = 0

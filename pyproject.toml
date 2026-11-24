@@ -55,7 +55,7 @@ dev = [
 ]
 
 [tool.ruff]
-target-version = "py312"
+target-version = "py311"
 line-length = 100
 src = ["src", "tests", "benchmarks"]
 extend-exclude = ["src/omnibuf/gen", "*_pb.py", "*_pb2.py"]

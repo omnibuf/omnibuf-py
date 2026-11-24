@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any, overload
+from typing import Any, Generic, TypeAlias, TypeVar, overload
 
-type Buffer = bytes | bytearray | memoryview
+Buffer: TypeAlias = bytes | bytearray | memoryview
 
-class CompiledCodec[T]:
+_T = TypeVar("_T")
+_O = TypeVar("_O")
+_S = TypeVar("_S")
+
+class CompiledCodec(Generic[_T]):
     def __init__(
         self,
-        cls: type[T],
+        cls: type[_T],
         type_name: str,
         *,
         fast_alloc: bool = True,
@@ -35,21 +39,21 @@ class CompiledCodec[T]:
     def unmarshal(
         self,
         data: Buffer,
-        out: T | None = None,
+        out: _T | None = None,
         *,
         max_elements: int | None = None,
         zero_copy_bytes: bool = False,
-    ) -> T: ...
+    ) -> _T: ...
     def decode_at(
         self,
         data: Buffer,
-        out: T | None = None,
+        out: _T | None = None,
         depth: int = 0,
         merge: bool = False,
         *,
         max_elements: int | None = None,
         zero_copy_bytes: bool = False,
-    ) -> T: ...
+    ) -> _T: ...
 
 class OpaqueView:
     def __init__(self, raw: Buffer) -> None: ...
@@ -149,21 +153,21 @@ class OpaqueView:
         fnum: int,
         siblings: tuple[tuple[int, int], ...] | None = None,
     ) -> memoryview | None: ...
-    def _get_submsg[T](
+    def _get_submsg(
         self,
         fnum: int,
-        sub_codec: CompiledCodec[T],
+        sub_codec: CompiledCodec[_T],
         siblings: tuple[tuple[int, int], ...] | None = None,
         *,
         max_elements: int | None = None,
-    ) -> T | None: ...
-    def _opaque_sub[O](
+    ) -> _T | None: ...
+    def _opaque_sub(
         self,
         fnum: int,
-        opaque_cls: type[O],
+        opaque_cls: type[_O],
         sub_codec: CompiledCodec[Any],
         siblings: tuple[tuple[int, int], ...] | None = None,
-    ) -> O | None: ...
+    ) -> _O | None: ...
     def _get_scalar_array(
         self,
         fnum: int,
@@ -172,13 +176,13 @@ class OpaqueView:
         *,
         max_elements: int | None = None,
     ) -> list[Any]: ...
-    def _get_submsg_array[T](
+    def _get_submsg_array(
         self,
         fnum: int,
-        sub_codec: CompiledCodec[T],
+        sub_codec: CompiledCodec[_T],
         *,
         max_elements: int | None = None,
-    ) -> list[T]: ...
+    ) -> list[_T]: ...
     def _get_map(
         self,
         fnum: int,
@@ -225,7 +229,7 @@ def init_exceptions(
 ) -> None: ...
 def validate_message_py(data: Buffer) -> None: ...
 def has_field0_py(data: Buffer) -> bool: ...
-def read_field0_py[S](data: Buffer, schema_cls: type[S]) -> S | None: ...
+def read_field0_py(data: Buffer, schema_cls: type[_S]) -> _S | None: ...
 def splice_fields_py(
     dst_prefix: Buffer | None,
     src_packet: Buffer,
@@ -248,21 +252,21 @@ def marshal_dataclass_py(
     self_describing: bool = False,
 ) -> bytes: ...
 @overload
-def unmarshal_dataclass_py[T](
+def unmarshal_dataclass_py(
     packet: Buffer,
-    target: type[T],
+    target: type[_T],
     *,
     max_elements: int | None = None,
     zero_copy_bytes: bool = False,
-) -> T: ...
+) -> _T: ...
 @overload
-def unmarshal_dataclass_py[T](
+def unmarshal_dataclass_py(
     packet: Buffer,
-    target: T,
+    target: _T,
     *,
     max_elements: int | None = None,
     zero_copy_bytes: bool = False,
-) -> T: ...
+) -> _T: ...
 def opaque_get_uint32_py(raw: Buffer, field_num: int, default: int = 0) -> int: ...
 def opaque_get_uint64_py(raw: Buffer, field_num: int, default: int = 0) -> int: ...
 def opaque_get_sint32_py(raw: Buffer, field_num: int, default: int = 0) -> int: ...

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import struct
 from collections.abc import Callable
+from typing import TypeVar
 
 from .wire import (
     MAX_CONTAINER_DEPTH,
@@ -41,6 +42,8 @@ _U64_UNPACK = struct.Struct("<Q").unpack_from
 _I64_UNPACK = struct.Struct("<q").unpack_from
 _F32_UNPACK = struct.Struct("<f").unpack_from
 _F64_UNPACK = struct.Struct("<d").unpack_from
+
+_T = TypeVar("_T")
 
 
 class Decoder:
@@ -124,7 +127,13 @@ class Decoder:
             )
         else:
             self._pos = validate_value(
-                self._mv, self._pos, wire_type, self._depth, self._max_depth, self._end
+                self._mv,
+                self._pos,
+                wire_type,
+                self._depth,
+                self._max_depth,
+                self._end,
+                check_utf8=True,
             )
 
     # ------------------------------------------------------------------
@@ -401,11 +410,11 @@ class Decoder:
             out.append(sub.read_float64())
         return out
 
-    def read_submsg_array[T](
+    def read_submsg_array(
         self,
-        decode_fn: Callable[[Decoder], T],
-        dst: list[T] | None = None,
-    ) -> list[T]:
+        decode_fn: Callable[[Decoder], _T],
+        dst: list[_T] | None = None,
+    ) -> list[_T]:
         elem_wt, count, sub = self.read_array_decoder()
         if elem_wt != WIRE_SUB_MSG:
             raise OmniBufDecodeError(f"omnibuf: expected WireArray<WireSubMsg>, got {elem_wt}")

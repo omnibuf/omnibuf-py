@@ -6,6 +6,7 @@ import operator
 import struct
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from typing import TypeVar
 
 from .wire import (
     INT32_MAX,
@@ -57,6 +58,8 @@ _F64_PACK = struct.Struct("<d").pack
 _FRAME_CONTAINER = 0
 _FRAME_ARRAY = 1
 _FRAME_MAP = 2
+
+_T = TypeVar("_T")
 
 
 def _require_bool(val: object, label: str = "bool") -> bool:
@@ -625,11 +628,11 @@ class Encoder:
             self.write_elem_float64(item)
         self.end_array()
 
-    def write_submsg_array[T](
+    def write_submsg_array(
         self,
         field_num: int,
-        items: Sequence[T],
-        encode_fn: Callable[[Encoder, T], None],
+        items: Sequence[_T],
+        encode_fn: Callable[[Encoder, _T], None],
     ) -> None:
         self.begin_array(field_num, WIRE_SUB_MSG, len(items))
         for item in items:
