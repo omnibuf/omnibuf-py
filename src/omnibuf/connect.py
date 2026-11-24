@@ -1,8 +1,4 @@
-"""Detached Connect RPC codec helper for OmniBuf.
-
-Import this module directly (`from omnibuf.connect import ...`). It is not
-imported by `omnibuf.__init__` and has zero runtime dependency on `connect-python`.
-"""
+"""Connect RPC codec helpers for OmniBuf (`connect-python`)."""
 
 from __future__ import annotations
 

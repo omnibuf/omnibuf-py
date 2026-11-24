@@ -1,8 +1,4 @@
-"""Detached gRPC codec helpers for OmniBuf.
-
-Import this module directly (`from omnibuf.grpc import ...`). It is not imported
-by `omnibuf.__init__` and has zero runtime dependency on `grpcio`.
-"""
+"""gRPC codec helpers for OmniBuf (`grpcio`)."""
 
 from __future__ import annotations
 
