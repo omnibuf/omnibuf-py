@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "omnibuf"
-version = "0.1.6"
+version = "0.1.7"
 description = "Explicit-typed, header-hop binary wire codec for Python"
 readme = "README.md"
 license = "Apache-2.0"
@@ -44,6 +44,8 @@ conformance-py = "omnibuf.conformance:main"
 
 [dependency-groups]
 dev = [
+    "connect-python>=0.9.0",
+    "grpcio>=1.85.4",
     "msgpack>=1.1.0",
     "msgspec>=0.19.0",
     "mypy>=1.15.0",
@@ -77,6 +79,8 @@ module = [
     "omnibuf.gen.omnibuf.bench.*",
     "omnibuf.gen.omnibuf.conformance.*",
     "msgpack",
+    "grpc",
+    "grpc.*",
 ]
 ignore_missing_imports = true
 ignore_errors = true

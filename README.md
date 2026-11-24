@@ -30,6 +30,27 @@ raw = omnibuf.marshal(PeerSummary(asn=64512, rssi_dbm=-62, sequence=7), self_des
 restored = omnibuf.unmarshal(raw, PeerSummary)
 ```
 
+## gRPC and Connect
+
+`omnibuf.grpc` and `omnibuf.connect` are separate detached modules with zero runtime dependency on `grpcio` or `connect-python`:
+
+```python
+from omnibuf.grpc import grpc_deserializer, grpc_serializer
+
+# grpcio unary handler or channel call
+serialize = grpc_serializer()
+deserialize = grpc_deserializer(PeerSummary)
+```
+
+```python
+from omnibuf.connect import OmniBufConnectCodec
+
+# connect-python custom codec ("omnibuf" or "x-omnibuf" when self_describing=True)
+codec = OmniBufConnectCodec()
+wire = codec.encode(PeerSummary(asn=64512, rssi_dbm=-62, sequence=7))
+msg = codec.decode(wire, PeerSummary)
+```
+
 ## Implementation Details
 
 - **Rust PyO3 core**: Wire encoding, decoding, and `Field #0` inspection run in a native Rust extension with strict `py.typed` annotations for Python 3.11+.
