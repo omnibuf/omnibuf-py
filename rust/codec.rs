@@ -2058,7 +2058,8 @@ impl CompiledCodec {
     ) -> PyResult<()> {
         if self.is_recursive() {
             let meta = self.build_instance_schema_meta(py, obj_ptr, 1)?;
-            meta.append_field0(dst);
+            meta.append_field0(dst)
+                .map_err(|e| encode_err(py, e.to_string()))?;
         } else {
             dst.extend_from_slice(&inner.field0_wire);
         }
