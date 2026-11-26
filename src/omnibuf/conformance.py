@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import struct
 import sys
-from typing import BinaryIO
+from typing import Any, BinaryIO
+
+import protobuf as pbpy
 
 from . import (
     WIRE_UINT,
@@ -29,7 +31,16 @@ from . import (
     unmarshal,
 )
 from .gen.omnibuf.bench import peer_omnibuf_pb, peer_pb
-from .gen.omnibuf.conformance import conformance_omnibuf_pb, conformance_pb
+from .gen.omnibuf.conformance import (
+    conformance_omnibuf_pb,
+    conformance_pb,
+    editions_2023_omnibuf_pb,
+    editions_2023_pb,
+    editions_2024_omnibuf_pb,
+    editions_2024_pb,
+    editions_2026_omnibuf_pb,
+    editions_2026_pb,
+)
 
 MAX_FRAME_BYTES = 16 * 1024 * 1024
 _FRAME_LEN = struct.Struct("<I")
@@ -238,6 +249,128 @@ def _handle_blind(req: ConformanceFrameRequest) -> ConformanceFrameResponse:
         decode_blind(payload)
     except OmniBufDecodeError as exc:
         resp.parse_error = str(exc)
+    return resp
+
+
+def _opt_f64_eq(a: float | None, b: float | None) -> bool:
+    if a is None or b is None:
+        return a is b
+    return _f64_bits(a) == _f64_bits(b)
+
+
+def _handle_editions_plugin(
+    req: ConformanceFrameRequest,
+    msg_cls: Any,
+    child_cls: Any,
+    opaque_cls: Any,
+    unmarshal_fn: Any,
+) -> ConformanceFrameResponse:
+    resp = ConformanceFrameResponse()
+    payload = req.omnibuf_payload
+    msg = msg_cls(
+        explicit_int=999,
+        explicit_bool=True,
+        explicit_string="stale",
+        explicit_bytes=b"\xff",
+        explicit_double=99.5,
+        status=2,
+        implicit_count=999,
+        implicit_flag=True,
+        child=child_cls(id=999, note="stale"),
+        delimited_child=child_cls(id=999, note="stale"),
+        packed_vals=[999],
+        expanded_vals=[999],
+        scores={"stale": 999},
+        choice_text="stale",
+    )
+    try:
+        unmarshal_fn(payload, msg)
+    except OmniBufDecodeError as exc:
+        resp.parse_error = str(exc)
+        return resp
+
+    try:
+        op = opaque_cls(payload)
+        if (
+            op.has_explicit_int() != (msg.explicit_int is not None)
+            or op.get_explicit_int() != msg.explicit_int
+            or op.has_explicit_bool() != (msg.explicit_bool is not None)
+            or op.get_explicit_bool() != msg.explicit_bool
+            or op.has_explicit_string() != (msg.explicit_string is not None)
+            or op.get_explicit_string() != msg.explicit_string
+            or op.has_explicit_bytes() != (msg.explicit_bytes is not None)
+            or op.get_explicit_bytes() != msg.explicit_bytes
+            or op.has_explicit_double() != (msg.explicit_double is not None)
+            or not _opt_f64_eq(op.get_explicit_double(), msg.explicit_double)
+            or op.has_status() != (msg.status is not None)
+            or op.get_status() != msg.status
+            or op.get_implicit_count() != msg.implicit_count
+            or op.get_implicit_flag() != msg.implicit_flag
+            or op.has_child() != (msg.child is not None)
+            or op.get_child() != msg.child
+            or op.has_delimited_child() != (msg.delimited_child is not None)
+            or op.get_delimited_child() != msg.delimited_child
+            or op.get_packed_vals() != msg.packed_vals
+            or op.get_expanded_vals() != msg.expanded_vals
+            or op.get_scores() != msg.scores
+            or op.which_choice() != msg.which_choice()
+            or op.get_choice_int() != msg.choice_int
+            or op.get_choice_text() != msg.choice_text
+            or op.get_choice_flag() != msg.choice_flag
+            or op.get_choice_child() != msg.choice_child
+        ):
+            resp.parse_error = f"opaque {req.message_type} getter mismatch with decoded struct"
+            return resp
+
+        resp.omnibuf_payload = msg.marshal_omnibuf(
+            deterministic=True,
+            self_describing=req.self_describing,
+        )
+        return resp
+    except OmniBufDecodeError as exc:
+        resp.parse_error = str(exc)
+        return resp
+    except OmniBufEncodeError as exc:
+        resp.serialize_error = str(exc)
+        return resp
+
+
+def _handle_editions_pbpy(
+    req: ConformanceFrameRequest,
+    msg_cls: Any,
+    child_cls: Any,
+    status_cls: Any,
+) -> ConformanceFrameResponse:
+    resp = ConformanceFrameResponse()
+    msg = msg_cls(
+        explicit_int=999,
+        explicit_bool=True,
+        explicit_string="stale",
+        explicit_bytes=b"\xff",
+        explicit_double=99.5,
+        status=status_cls.PAUSED,
+        implicit_count=999,
+        implicit_flag=True,
+        child=child_cls(id=999, note="stale"),
+        delimited_child=child_cls(id=999, note="stale"),
+        packed_vals=[999],
+        expanded_vals=[999],
+        scores={"stale": 999},
+        choice=pbpy.Oneof("choice_text", "stale"),
+    )
+    try:
+        unmarshal(req.omnibuf_payload, msg)
+    except OmniBufDecodeError as exc:
+        resp.parse_error = str(exc)
+        return resp
+    try:
+        resp.omnibuf_payload = marshal(
+            msg,
+            deterministic=True,
+            self_describing=req.self_describing,
+        )
+    except OmniBufEncodeError as exc:
+        resp.serialize_error = str(exc)
     return resp
 
 
@@ -503,7 +636,32 @@ def _handle_plugin_tier(
             resp.serialize_error = str(exc)
             return resp
 
-    resp.skipped = "plugin tier generated for PeerUpdate and TestAllTypes"
+    if msg_type == "omnibuf.conformance.TestEditions2023":
+        return _handle_editions_plugin(
+            req,
+            editions_2023_omnibuf_pb.TestEditions2023,
+            editions_2023_omnibuf_pb.Editions2023Child,
+            editions_2023_omnibuf_pb.OpaqueTestEditions2023,
+            editions_2023_omnibuf_pb.unmarshal_test_editions2023,
+        )
+    if msg_type == "omnibuf.conformance.TestEditions2024":
+        return _handle_editions_plugin(
+            req,
+            editions_2024_omnibuf_pb.TestEditions2024,
+            editions_2024_omnibuf_pb.Editions2024Child,
+            editions_2024_omnibuf_pb.OpaqueTestEditions2024,
+            editions_2024_omnibuf_pb.unmarshal_test_editions2024,
+        )
+    if msg_type == "omnibuf.conformance.TestEditions2026":
+        return _handle_editions_plugin(
+            req,
+            editions_2026_omnibuf_pb.TestEditions2026,
+            editions_2026_omnibuf_pb.Editions2026Child,
+            editions_2026_omnibuf_pb.OpaqueTestEditions2026,
+            editions_2026_omnibuf_pb.unmarshal_test_editions2026,
+        )
+
+    resp.skipped = "plugin tier generated for PeerUpdate, TestAllTypes, and Editions 2023/2024/2026"
     return resp
 
 
@@ -568,7 +726,31 @@ def _handle_protobuf_types_tier(
             resp.serialize_error = str(exc)
         return resp
 
-    resp.skipped = "protobuf types tier exercises PeerUpdate and TestAllTypes"
+    if msg_type == "omnibuf.conformance.TestEditions2023":
+        return _handle_editions_pbpy(
+            req,
+            editions_2023_pb.TestEditions2023,
+            editions_2023_pb.Editions2023Child,
+            editions_2023_pb.Editions2023Status,
+        )
+    if msg_type == "omnibuf.conformance.TestEditions2024":
+        return _handle_editions_pbpy(
+            req,
+            editions_2024_pb.TestEditions2024,
+            editions_2024_pb.Editions2024Child,
+            editions_2024_pb.Editions2024Status,
+        )
+    if msg_type == "omnibuf.conformance.TestEditions2026":
+        return _handle_editions_pbpy(
+            req,
+            editions_2026_pb.TestEditions2026,
+            editions_2026_pb.Editions2026Child,
+            editions_2026_pb.Editions2026Status,
+        )
+
+    resp.skipped = (
+        "protobuf types tier exercises PeerUpdate, TestAllTypes, and Editions 2023/2024/2026"
+    )
     return resp
 
 

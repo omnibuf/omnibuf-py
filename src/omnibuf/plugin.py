@@ -19,6 +19,12 @@ try:
 except ImportError as exc:
     raise ImportError("protoc-gen-omnibuf-py requires protobuf; install omnibuf[protobuf]") from exc
 
+from .editions import (
+    EDITION_2023,
+    EDITION_2026,
+    is_descriptor_options_extendee,
+    resolve_edition_files,
+)
 from .field0 import SchemaMeta, encode_field0_schema_meta
 from .wire import (
     MAX_FIELD_NUMBER,
@@ -558,8 +564,11 @@ def _generate_file(
     reg: _Registry,
     suffix: str,
 ) -> tuple[str, str]:
-    if fdp.extension:
-        raise ValueError(f"omnibuf: Proto2 file extensions are not supported in {fdp.name}")
+    for ext in fdp.extension:
+        if not is_descriptor_options_extendee(ext.extendee):
+            raise ValueError(
+                f"omnibuf: Proto2 file extensions are not supported in {fdp.name} ({ext.name})"
+            )
     is_proto2 = fdp.syntax in ("", "proto2")
     local_msgs = reg.file_messages[fdp.name]
     imported_files: dict[str, str] = {}
@@ -592,7 +601,9 @@ def _generate_file(
 
     for m_spec in local_msgs:
         mdp = m_spec.desc
-        if mdp.extension or mdp.extension_range:
+        if mdp.extension_range or any(
+            not is_descriptor_options_extendee(ext.extendee) for ext in mdp.extension
+        ):
             raise ValueError(f"omnibuf: Proto2 extensions are not supported on {m_spec.full_name}")
         resolved: list[_ResolvedField] = []
         oneof_map: dict[int, _OneofGroup] = {}
@@ -869,7 +880,9 @@ def _generate_file(
 def generate_code(req: plugin_pb2.CodeGeneratorRequest) -> plugin_pb2.CodeGeneratorResponse:
     """Generates Python OmniBuf codecs and Opaque views for a CodeGeneratorRequest."""
     resp = plugin_pb2.CodeGeneratorResponse()
-    resp.supported_features = plugin_pb2.CodeGeneratorResponse.FEATURE_PROTO3_OPTIONAL
+    resp.supported_features = 3  # PROTO3_OPTIONAL | SUPPORTS_EDITIONS
+    resp.minimum_edition = EDITION_2023
+    resp.maximum_edition = EDITION_2026
 
     suffix = "_omnibuf_pb"
     if req.parameter:
@@ -880,9 +893,9 @@ def generate_code(req: plugin_pb2.CodeGeneratorRequest) -> plugin_pb2.CodeGenera
                     suffix = re.sub(r"\.py$", "", v.strip())
 
     try:
-        all_files = list(req.proto_file)
-        reg = _Registry(all_files)
         target_set = set(req.file_to_generate)
+        all_files = resolve_edition_files(list(req.proto_file), target_set or None)
+        reg = _Registry(all_files)
         for fdp in all_files:
             if fdp.name not in target_set:
                 continue

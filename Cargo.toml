@@ -1,6 +1,6 @@
 [package]
 name = "omnibuf-py-ext"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -12,7 +12,7 @@ path = "rust/lib.rs"
 crate-type = ["cdylib"]
 
 [dependencies]
-omnibuf_core = { package = "omnibuf", version = "0.1.8", default-features = false }
+omnibuf_core = { package = "omnibuf", version = "0.1.11", default-features = false }
 pyo3 = { version = "0.30", features = ["extension-module"] }
 ryu = "1.0"
 itoa = "1.0"

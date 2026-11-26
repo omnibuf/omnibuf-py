@@ -14,6 +14,12 @@ if TYPE_CHECKING:
     from google.protobuf.message import Message as GpbMessage
 
 from ._omnibuf_ext import CompiledCodec
+from .editions import (
+    EDITION_2023,
+    SUPPORTED_EDITIONS,
+    is_descriptor_options_extendee,
+    is_zero_typed_default,
+)
 from .field0 import SchemaMeta, encode_field0_schema_meta, merge_schema_meta
 from .wire import (
     DEFAULT_MAX_ELEMENTS,
@@ -348,6 +354,7 @@ class _PbpyFieldPlan:
     val_wt: int = 0
     sub_plan: _PbpyMsgPlan | None = None
     sub_cls: type[Any] | None = None
+    oneof_attr: str | None = None
 
 
 class _PbpyMsgPlan:
@@ -420,6 +427,9 @@ class _PbpyMsgPlan:
             }
             if fp.enum_cls is not None:
                 spec["enum_cls"] = fp.enum_cls
+            if fp.oneof_attr is not None:
+                spec["pbpy_oneof_attr"] = fp.oneof_attr
+                spec["pbpy_oneof_cls"] = pbpy.Oneof
             if fp.kind == "submsg":
                 assert fp.sub_plan is not None
                 spec["sub_codec"] = fp.sub_plan.rust_codec
@@ -448,11 +458,79 @@ _PBPY_BUILDING: dict[str, _PbpyMsgPlan] = {}
 _PBPY_PENDING_FINALIZE: list[_PbpyMsgPlan] = []
 
 
-def _get_pbpy_plan(desc: pbpy.DescMessage) -> _PbpyMsgPlan:
+def _pbpy_proto_utf8_override(proto_obj: Any) -> int | None:
+    opts = getattr(proto_obj, "options", None)
+    if opts is None:
+        return None
+    feats = getattr(opts, "features", None)
+    if feats is None:
+        return None
+    has_field_fn = getattr(feats, "has_field", None)
+    if callable(has_field_fn) and has_field_fn("utf8_validation"):
+        return int(feats.utf8_validation)
+    return None
+
+
+def _pbpy_msg_utf8_validation(desc: pbpy.DescMessage) -> int:
+    utf8 = 2  # FeatureSet.Utf8Validation.VERIFY (default for Editions 2023/2024/2026)
+    file_override = _pbpy_proto_utf8_override(desc.file.proto)
+    if file_override is not None:
+        utf8 = file_override
+    chain: list[pbpy.DescMessage] = []
+    cur: Any = desc
+    while isinstance(cur, pbpy.DescMessage):
+        chain.append(cur)
+        cur = cur.parent
+    for m_desc in reversed(chain):
+        m_override = _pbpy_proto_utf8_override(m_desc.proto)
+        if m_override is not None:
+            utf8 = m_override
+    return utf8
+
+
+def _pbpy_field_utf8_validation(msg_utf8: int, fd: pbpy.DescField) -> int:
+    utf8 = msg_utf8
+    oneof = getattr(fd.value, "oneof", None)
+    if oneof is not None:
+        oo_override = _pbpy_proto_utf8_override(oneof.proto)
+        if oo_override is not None:
+            utf8 = oo_override
+    f_override = _pbpy_proto_utf8_override(fd.proto)
+    if f_override is not None:
+        utf8 = f_override
+    return utf8
+
+
+def _pbpy_find_map_entry_proto(desc: pbpy.DescMessage, fd: pbpy.DescField) -> Any | None:
+    type_name: str = getattr(fd.proto, "type_name", "")
+    for nested in getattr(desc.proto, "nested_type", ()):
+        opts = getattr(nested, "options", None)
+        if (
+            opts is not None
+            and getattr(opts, "map_entry", False)
+            and (type_name == nested.name or type_name.endswith(f".{nested.name}"))
+        ):
+            return nested
+    return None
+
+
+def _pbpy_check_nested_closed_enums(
+    msgs: Any,
+    err_cls: type[Exception],
+) -> None:
+    for nested in msgs:
+        for ed in getattr(nested, "nested_enums", ()):
+            if not ed.open:
+                raise err_cls(f"omnibuf: editions CLOSED enums are not supported ({ed.type_name})")
+        _pbpy_check_nested_closed_enums(getattr(nested, "nested_messages", ()), err_cls)
+
+
+def _get_pbpy_plan(desc: pbpy.DescMessage, *, for_encode: bool = True) -> _PbpyMsgPlan:
     key = desc.type_name
     cached = _PBPY_PLAN_CACHE.get(key)
     if cached is not None:
         return cached
+    err_cls: type[Exception] = OmniBufEncodeError if for_encode else OmniBufDecodeError
     with _PBPY_LOCK:
         cached = _PBPY_PLAN_CACHE.get(key)
         if cached is not None:
@@ -461,10 +539,41 @@ def _get_pbpy_plan(desc: pbpy.DescMessage) -> _PbpyMsgPlan:
         if in_prog is not None:
             return in_prog
 
-        if getattr(desc, "extensions", None):
-            raise OmniBufEncodeError(
-                f"omnibuf: protobuf extensions are not supported on {desc.type_name}"
+        file_desc = desc.file
+        file_proto = file_desc.proto
+        file_edition = int(file_desc.edition)
+        is_editions = (file_proto.syntax == "editions") or (file_edition >= EDITION_2023)
+        if is_editions and file_edition not in SUPPORTED_EDITIONS:
+            raise err_cls(
+                f"omnibuf: unsupported protobuf edition {file_edition} ({file_desc.name})"
             )
+
+        if getattr(desc.proto, "extension_range", None):
+            raise err_cls(f"omnibuf: protobuf extensions are not supported on {desc.type_name}")
+        for ext in getattr(desc, "nested_extensions", ()):
+            if not is_descriptor_options_extendee(ext.proto.extendee):
+                raise err_cls(
+                    f"omnibuf: protobuf extensions are not supported on {desc.type_name} ({ext.name})"
+                )
+        if is_editions:
+            for ext in getattr(file_desc, "extensions", ()):
+                if not is_descriptor_options_extendee(ext.proto.extendee):
+                    raise err_cls(
+                        f"omnibuf: editions file extensions are not supported in {file_desc.name} ({ext.name})"
+                    )
+            for ed in getattr(file_desc, "enums", ()):
+                if not ed.open:
+                    raise err_cls(
+                        f"omnibuf: editions CLOSED enums are not supported ({ed.type_name})"
+                    )
+            for ed in getattr(desc, "nested_enums", ()):
+                if not ed.open:
+                    raise err_cls(
+                        f"omnibuf: editions CLOSED enums are not supported ({ed.type_name})"
+                    )
+            _pbpy_check_nested_closed_enums(getattr(desc, "nested_messages", ()), err_cls)
+
+        msg_utf8 = _pbpy_msg_utf8_validation(desc) if is_editions else 2
 
         is_root = not _PBPY_BUILDING
         plan = _PbpyMsgPlan(desc)
@@ -473,15 +582,41 @@ def _get_pbpy_plan(desc: pbpy.DescMessage) -> _PbpyMsgPlan:
             compiled: list[_PbpyFieldPlan] = []
             for fd in desc.fields:
                 fnum = fd.number
-                has_pres = int(fd.presence) == 1  # SupportedFieldPresence.EXPLICIT == 1
+                presence_int = int(fd.presence)
+                if is_editions and presence_int not in (1, 2):
+                    raise err_cls(
+                        f"omnibuf: editions LEGACY_REQUIRED is not supported ({desc.type_name}.{fd.name})"
+                    )
                 fval = fd.value
-                encoding_val = getattr(fd, "encoding", None)
-                if encoding_val is not None and str(encoding_val).endswith("DELIMITED"):
-                    raise OmniBufEncodeError(
-                        f"omnibuf: Proto2 group / delimited encoding is not supported on {desc.type_name}.{fd.name}"
+                oneof_desc = getattr(fval, "oneof", None)
+                oneof_attr: str | None = oneof_desc.local_name if oneof_desc is not None else None
+                has_pres = (presence_int == 1) or (oneof_attr is not None)
+
+                is_delimited = (int(fd.proto.type) == _GPB_TYPE_GROUP) or bool(
+                    getattr(fval, "delimited_encoding", False)
+                )
+                if is_delimited and not is_editions:
+                    raise err_cls(
+                        f"omnibuf: Proto2 group field {desc.type_name}.{fd.name} is not supported"
                     )
 
+                if is_editions and fd.proto.has_field("default_value"):
+                    def_val = getattr(fval, "default_value", None)
+                    if not is_zero_typed_default(def_val):
+                        raise err_cls(
+                            f"omnibuf: editions custom non-zero default value is not supported "
+                            f"({desc.type_name}.{fd.name} = {def_val!r})"
+                        )
+
                 if isinstance(fval, pbpy.DescFieldValueScalar):
+                    if (
+                        is_editions
+                        and fval.scalar == pbpy.ScalarType.STRING
+                        and _pbpy_field_utf8_validation(msg_utf8, fd) != 2
+                    ):
+                        raise err_cls(
+                            f"omnibuf: editions UTF-8 NONE is not supported ({desc.type_name}.{fd.name})"
+                        )
                     s_kind, s_wt = _PBPY_SCALAR_SPEC[fval.scalar]
                     if s_kind == "bool":
                         fp = _PbpyFieldPlan(
@@ -495,6 +630,7 @@ def _get_pbpy_plan(desc: pbpy.DescMessage) -> _PbpyMsgPlan:
                             tag_bytes=b"",
                             tag_false=encode_tag(fnum, WIRE_BOOL_FALSE),
                             tag_true=encode_tag(fnum, WIRE_BOOL_TRUE),
+                            oneof_attr=oneof_attr,
                         )
                     else:
                         fp = _PbpyFieldPlan(
@@ -506,8 +642,14 @@ def _get_pbpy_plan(desc: pbpy.DescMessage) -> _PbpyMsgPlan:
                             kind=s_kind,
                             wire_type=s_wt,
                             tag_bytes=encode_tag(fnum, s_wt),
+                            oneof_attr=oneof_attr,
                         )
                 elif isinstance(fval, pbpy.DescFieldValueEnum):
+                    if is_editions and not fval.enum.open:
+                        raise err_cls(
+                            f"omnibuf: editions CLOSED enums are not supported "
+                            f"({desc.type_name}.{fd.name} -> {fval.enum.type_name})"
+                        )
                     fp = _PbpyFieldPlan(
                         index=len(compiled),
                         field_num=fnum,
@@ -518,9 +660,10 @@ def _get_pbpy_plan(desc: pbpy.DescMessage) -> _PbpyMsgPlan:
                         wire_type=WIRE_SINT,
                         tag_bytes=encode_tag(fnum, WIRE_SINT),
                         enum_cls=fval.enum.type,
+                        oneof_attr=oneof_attr,
                     )
                 elif isinstance(fval, pbpy.DescFieldValueMessage):
-                    sub_p = _get_pbpy_plan(fval.message)
+                    sub_p = _get_pbpy_plan(fval.message, for_encode=for_encode)
                     fp = _PbpyFieldPlan(
                         index=len(compiled),
                         field_num=fnum,
@@ -532,12 +675,13 @@ def _get_pbpy_plan(desc: pbpy.DescMessage) -> _PbpyMsgPlan:
                         tag_bytes=encode_tag(fnum, WIRE_SUB_MSG),
                         sub_plan=sub_p,
                         sub_cls=fval.message.type,
+                        oneof_attr=oneof_attr,
                     )
                 elif isinstance(fval, pbpy.DescFieldValueList):
                     elem = fval.element
                     tag_b = encode_tag(fnum, WIRE_ARRAY)
                     if isinstance(elem, pbpy.DescMessage):
-                        sub_p = _get_pbpy_plan(elem)
+                        sub_p = _get_pbpy_plan(elem, for_encode=for_encode)
                         fp = _PbpyFieldPlan(
                             index=len(compiled),
                             field_num=fnum,
@@ -553,6 +697,11 @@ def _get_pbpy_plan(desc: pbpy.DescMessage) -> _PbpyMsgPlan:
                             sub_cls=elem.type,
                         )
                     elif isinstance(elem, pbpy.DescEnum):
+                        if is_editions and not elem.open:
+                            raise err_cls(
+                                f"omnibuf: editions CLOSED enums are not supported "
+                                f"({desc.type_name}.{fd.name} -> {elem.type_name})"
+                            )
                         fp = _PbpyFieldPlan(
                             index=len(compiled),
                             field_num=fnum,
@@ -567,6 +716,14 @@ def _get_pbpy_plan(desc: pbpy.DescMessage) -> _PbpyMsgPlan:
                             enum_cls=elem.type,
                         )
                     else:
+                        if (
+                            is_editions
+                            and elem == pbpy.ScalarType.STRING
+                            and _pbpy_field_utf8_validation(msg_utf8, fd) != 2
+                        ):
+                            raise err_cls(
+                                f"omnibuf: editions UTF-8 NONE is not supported ({desc.type_name}.{fd.name})"
+                            )
                         e_kind, e_wt = _PBPY_SCALAR_SPEC[elem]
                         fp = _PbpyFieldPlan(
                             index=len(compiled),
@@ -581,11 +738,41 @@ def _get_pbpy_plan(desc: pbpy.DescMessage) -> _PbpyMsgPlan:
                             elem_wt=e_wt,
                         )
                 elif isinstance(fval, pbpy.DescFieldValueMap):
+                    if is_editions:
+                        map_utf8 = _pbpy_field_utf8_validation(msg_utf8, fd)
+                        entry_proto = _pbpy_find_map_entry_proto(desc, fd)
+                        if entry_proto is not None:
+                            entry_override = _pbpy_proto_utf8_override(entry_proto)
+                            if entry_override is not None:
+                                map_utf8 = entry_override
+                            entry_fields = {ef.number: ef for ef in entry_proto.field}
+                        else:
+                            entry_fields = {}
+                        if fval.key == pbpy.ScalarType.STRING:
+                            k_utf8 = map_utf8
+                            if 1 in entry_fields:
+                                ko = _pbpy_proto_utf8_override(entry_fields[1])
+                                if ko is not None:
+                                    k_utf8 = ko
+                            if k_utf8 != 2:
+                                raise err_cls(
+                                    f"omnibuf: editions UTF-8 NONE is not supported ({desc.type_name}.{fd.name}.key)"
+                                )
+                        if fval.value == pbpy.ScalarType.STRING:
+                            v_utf8 = map_utf8
+                            if 2 in entry_fields:
+                                vo = _pbpy_proto_utf8_override(entry_fields[2])
+                                if vo is not None:
+                                    v_utf8 = vo
+                            if v_utf8 != 2:
+                                raise err_cls(
+                                    f"omnibuf: editions UTF-8 NONE is not supported ({desc.type_name}.{fd.name}.value)"
+                                )
                     k_kind, k_wt = _PBPY_SCALAR_SPEC[fval.key]
                     v_elem = fval.value
                     tag_b = encode_tag(fnum, WIRE_MAP)
                     if isinstance(v_elem, pbpy.DescMessage):
-                        sub_p = _get_pbpy_plan(v_elem)
+                        sub_p = _get_pbpy_plan(v_elem, for_encode=for_encode)
                         fp = _PbpyFieldPlan(
                             index=len(compiled),
                             field_num=fnum,
@@ -603,6 +790,11 @@ def _get_pbpy_plan(desc: pbpy.DescMessage) -> _PbpyMsgPlan:
                             sub_cls=v_elem.type,
                         )
                     elif isinstance(v_elem, pbpy.DescEnum):
+                        if is_editions and not v_elem.open:
+                            raise err_cls(
+                                f"omnibuf: editions CLOSED enums are not supported "
+                                f"({desc.type_name}.{fd.name} -> {v_elem.type_name})"
+                            )
                         fp = _PbpyFieldPlan(
                             index=len(compiled),
                             field_num=fnum,
@@ -635,7 +827,7 @@ def _get_pbpy_plan(desc: pbpy.DescMessage) -> _PbpyMsgPlan:
                             val_wt=v_wt,
                         )
                 else:
-                    raise OmniBufEncodeError(f"omnibuf: unsupported protobuf-py field {fd.name}")
+                    raise err_cls(f"omnibuf: unsupported protobuf-py field {fd.name}")
                 compiled.append(fp)
 
             compiled.sort(key=lambda item: item.field_num)
@@ -666,6 +858,10 @@ def _get_pbpy_plan(desc: pbpy.DescMessage) -> _PbpyMsgPlan:
 # ============================================================================
 
 
+_GPB_CACHE_LOCK = threading.RLock()
+_GPB_VALID_CACHE: dict[Any, bool] = {}
+
+
 def _is_gpb_repeated(fd: Any) -> bool:
     return bool(getattr(fd, "is_repeated", False))
 
@@ -680,15 +876,178 @@ def _is_gpb_map_field(fd: Any) -> bool:
     )
 
 
-def _check_gpb_descriptor_supported(desc: Any, *, for_encode: bool) -> None:
-    err_cls = OmniBufEncodeError if for_encode else OmniBufDecodeError
-    if getattr(desc, "extension_ranges", None) or getattr(desc, "extensions", None):
-        raise err_cls(f"omnibuf: Proto2 extensions are not supported on {desc.full_name}")
+def _is_gpb_message_type(fd: Any, is_editions: bool) -> bool:
+    return bool(fd.type == _GPB_TYPE_MESSAGE or (is_editions and fd.type == _GPB_TYPE_GROUP))
+
+
+def _gpb_file_edition_info(file_desc: Any) -> tuple[bool, int, str]:
+    from google.protobuf import descriptor_pb2
+
+    fdp = descriptor_pb2.FileDescriptorProto()
+    file_desc.CopyToProto(fdp)
+    edition = int(fdp.edition)
+    is_editions = (fdp.syntax == "editions") or (edition >= EDITION_2023)
+    return is_editions, edition, str(fdp.name or getattr(file_desc, "name", ""))
+
+
+def _gpb_field_utf8_validation(fd: Any) -> int:
+    get_features = getattr(fd, "_GetFeatures", None)
+    if callable(get_features):
+        feats = get_features()
+        if feats is not None:
+            return int(feats.utf8_validation)
+    utf8 = 2
+    file_desc = getattr(fd, "file", None)
+    if file_desc is not None and getattr(file_desc, "has_options", False):
+        f_opts = file_desc.GetOptions()
+        if f_opts.HasField("features") and f_opts.features.HasField("utf8_validation"):
+            utf8 = int(f_opts.features.utf8_validation)
+    chain: list[Any] = []
+    cur = getattr(fd, "containing_type", None)
+    while cur is not None:
+        chain.append(cur)
+        cur = getattr(cur, "containing_type", None)
+    for md in reversed(chain):
+        if getattr(md, "has_options", False):
+            m_opts = md.GetOptions()
+            if m_opts.HasField("features") and m_opts.features.HasField("utf8_validation"):
+                utf8 = int(m_opts.features.utf8_validation)
+    oo = getattr(fd, "containing_oneof", None)
+    if oo is not None and getattr(oo, "has_options", False):
+        o_opts = oo.GetOptions()
+        if o_opts.HasField("features") and o_opts.features.HasField("utf8_validation"):
+            utf8 = int(o_opts.features.utf8_validation)
+    if getattr(fd, "has_options", False):
+        fd_opts = fd.GetOptions()
+        if fd_opts.HasField("features") and fd_opts.features.HasField("utf8_validation"):
+            utf8 = int(fd_opts.features.utf8_validation)
+    return utf8
+
+
+def _gpb_check_nested_closed_enums(msgs: Any, err_cls: type[Exception]) -> None:
+    for nested in msgs:
+        for ed in getattr(nested, "enum_types", ()):
+            if getattr(ed, "is_closed", False):
+                raise err_cls(f"omnibuf: editions CLOSED enums are not supported ({ed.full_name})")
+        _gpb_check_nested_closed_enums(getattr(nested, "nested_types", ()), err_cls)
+
+
+def _check_gpb_descriptor_supported(
+    desc: Any,
+    *,
+    for_encode: bool,
+    visiting: set[Any] | None = None,
+    validated: dict[Any, bool] | None = None,
+) -> bool:
+    cached = _GPB_VALID_CACHE.get(desc)
+    if cached is not None:
+        return cached
+    if validated is not None and desc in validated:
+        return validated[desc]
+    if visiting is not None and desc in visiting:
+        return True
+
+    is_root = visiting is None
+    err_cls: type[Exception] = OmniBufEncodeError if for_encode else OmniBufDecodeError
+    is_editions, edition, file_name = _gpb_file_edition_info(desc.file)
+    if is_editions and edition not in SUPPORTED_EDITIONS:
+        raise err_cls(f"omnibuf: unsupported protobuf edition {edition} ({file_name})")
+
+    if getattr(desc, "extension_ranges", None):
+        raise err_cls(f"omnibuf: extensions are not supported on {desc.full_name}")
+    for ext in getattr(desc, "extensions", ()):
+        extendee = getattr(getattr(ext, "containing_type", None), "full_name", "")
+        if not is_descriptor_options_extendee(extendee):
+            raise err_cls(f"omnibuf: extensions are not supported on {desc.full_name} ({ext.name})")
+
+    if is_editions:
+        for ext in getattr(desc.file, "extensions_by_name", {}).values():
+            extendee = getattr(getattr(ext, "containing_type", None), "full_name", "")
+            if not is_descriptor_options_extendee(extendee):
+                raise err_cls(
+                    f"omnibuf: editions file extensions are not supported in {file_name} ({ext.name})"
+                )
+        for ed in getattr(desc.file, "enum_types_by_name", {}).values():
+            if getattr(ed, "is_closed", False):
+                raise err_cls(f"omnibuf: editions CLOSED enums are not supported ({ed.full_name})")
+        for ed in getattr(desc, "enum_types", ()):
+            if getattr(ed, "is_closed", False):
+                raise err_cls(f"omnibuf: editions CLOSED enums are not supported ({ed.full_name})")
+        _gpb_check_nested_closed_enums(getattr(desc, "nested_types", ()), err_cls)
+
+    next_visiting = set(visiting) if visiting is not None else set()
+    next_visiting.add(desc)
+    pending = validated if validated is not None else {}
+
     for fd in desc.fields:
-        if fd.type == _GPB_TYPE_GROUP:
+        if fd.type == _GPB_TYPE_GROUP and not is_editions:
             raise err_cls(
                 f"omnibuf: Proto2 group field {desc.full_name}.{fd.name} is not supported"
             )
+        if is_editions:
+            if bool(getattr(fd, "is_required", False)) or getattr(fd, "label", None) == 2:
+                raise err_cls(
+                    f"omnibuf: editions LEGACY_REQUIRED is not supported ({desc.full_name}.{fd.name})"
+                )
+            if fd.enum_type is not None and getattr(fd.enum_type, "is_closed", False):
+                raise err_cls(
+                    f"omnibuf: editions CLOSED enums are not supported "
+                    f"({desc.full_name}.{fd.name} -> {fd.enum_type.full_name})"
+                )
+            if fd.type == _GPB_TYPE_STRING and _gpb_field_utf8_validation(fd) != 2:
+                raise err_cls(
+                    f"omnibuf: editions UTF-8 NONE is not supported ({desc.full_name}.{fd.name})"
+                )
+            if getattr(fd, "has_default_value", False) and not is_zero_typed_default(
+                fd.default_value
+            ):
+                raise err_cls(
+                    f"omnibuf: editions custom non-zero default value is not supported "
+                    f"({desc.full_name}.{fd.name} = {fd.default_value!r})"
+                )
+            if _is_gpb_map_field(fd):
+                assert fd.message_type is not None
+                k_fd = fd.message_type.fields_by_name["key"]
+                v_fd = fd.message_type.fields_by_name["value"]
+                if k_fd.type == _GPB_TYPE_STRING and _gpb_field_utf8_validation(k_fd) != 2:
+                    raise err_cls(
+                        f"omnibuf: editions UTF-8 NONE is not supported ({desc.full_name}.{fd.name}.key)"
+                    )
+                if v_fd.type == _GPB_TYPE_STRING and _gpb_field_utf8_validation(v_fd) != 2:
+                    raise err_cls(
+                        f"omnibuf: editions UTF-8 NONE is not supported ({desc.full_name}.{fd.name}.value)"
+                    )
+                if v_fd.enum_type is not None and getattr(v_fd.enum_type, "is_closed", False):
+                    raise err_cls(
+                        f"omnibuf: editions CLOSED enums are not supported "
+                        f"({desc.full_name}.{fd.name}.value -> {v_fd.enum_type.full_name})"
+                    )
+                if v_fd.type == _GPB_TYPE_GROUP:
+                    raise err_cls(
+                        f"omnibuf: group map value is not supported ({desc.full_name}.{fd.name})"
+                    )
+                if v_fd.type == _GPB_TYPE_MESSAGE and v_fd.message_type is not None:
+                    _check_gpb_descriptor_supported(
+                        v_fd.message_type,
+                        for_encode=for_encode,
+                        visiting=next_visiting,
+                        validated=pending,
+                    )
+            elif _is_gpb_message_type(fd, True) and fd.message_type is not None:
+                _check_gpb_descriptor_supported(
+                    fd.message_type,
+                    for_encode=for_encode,
+                    visiting=next_visiting,
+                    validated=pending,
+                )
+
+    pending[desc] = is_editions
+    if is_root:
+        with _GPB_CACHE_LOCK:
+            if len(_GPB_VALID_CACHE) + len(pending) >= 1024:
+                _GPB_VALID_CACHE.clear()
+            _GPB_VALID_CACHE.update(pending)
+    return is_editions
 
 
 def _build_gpb_schema_meta(
@@ -701,6 +1060,7 @@ def _build_gpb_schema_meta(
     if schema_depth + 1 > MAX_NESTING_DEPTH:
         return meta
     next_visiting = visiting | {str(desc.full_name)}
+    is_editions = _GPB_VALID_CACHE.get(desc, False)
     for fd in desc.fields:
         fnum = int(fd.number)
         meta.fields[fnum] = str(fd.name)
@@ -728,7 +1088,7 @@ def _build_gpb_schema_meta(
                     meta.children[fnum] = _build_gpb_schema_meta(
                         val_fd.message_type, None, schema_depth + 2, next_visiting
                     )
-        elif fd.type == _GPB_TYPE_MESSAGE and fd.message_type is not None:
+        elif _is_gpb_message_type(fd, is_editions) and fd.message_type is not None:
             if _is_gpb_repeated(fd):
                 if msg is not None:
                     seq = getattr(msg, fd.name)
@@ -767,7 +1127,7 @@ def _encode_gpb_msg(dst: bytearray, msg: Any, deterministic: bool, depth: int = 
     if depth > MAX_NESTING_DEPTH:
         raise OmniBufEncodeError(f"omnibuf: nesting depth {depth} exceeds {MAX_NESTING_DEPTH}")
     desc: Any = msg.DESCRIPTOR
-    _check_gpb_descriptor_supported(desc, for_encode=True)
+    is_editions = _check_gpb_descriptor_supported(desc, for_encode=True)
     for list_fd, _ in msg.ListFields():
         if getattr(list_fd, "is_extension", False):
             raise OmniBufEncodeError(
@@ -817,7 +1177,7 @@ def _encode_gpb_msg(dst: bytearray, msg: Any, deterministic: bool, depth: int = 
                 raise OmniBufEncodeError(
                     f"omnibuf: array nesting depth {depth + 1} exceeds {MAX_NESTING_DEPTH}"
                 )
-            is_msg = fd.type == _GPB_TYPE_MESSAGE
+            is_msg = _is_gpb_message_type(fd, is_editions)
             e_kind, e_wt = ("submsg", WIRE_SUB_MSG) if is_msg else _GPB_SCALAR_SPEC[fd.type]
             dst.extend(encode_tag(fnum, WIRE_ARRAY))
             len_pos = len(dst)
@@ -833,7 +1193,7 @@ def _encode_gpb_msg(dst: bytearray, msg: Any, deterministic: bool, depth: int = 
                 else:
                     _write_proto_scalar(dst, e_kind, item, fd.name)
             backpatch_container_len(dst, len_pos)
-        elif fd.type == _GPB_TYPE_MESSAGE:
+        elif _is_gpb_message_type(fd, is_editions):
             if depth + 1 > MAX_NESTING_DEPTH:
                 raise OmniBufEncodeError(
                     f"omnibuf: nesting depth {depth + 1} exceeds {MAX_NESTING_DEPTH}"
@@ -875,7 +1235,7 @@ def _decode_gpb_msg(
     if budget is None:
         budget = [DEFAULT_MAX_ELEMENTS, DEFAULT_MAX_ELEMENTS]
     desc = dst.DESCRIPTOR
-    _check_gpb_descriptor_supported(desc, for_encode=False)
+    is_editions = _check_gpb_descriptor_supported(desc, for_encode=False)
     if not merge:
         dst.Clear()
 
@@ -948,7 +1308,7 @@ def _decode_gpb_msg(
                 raise OmniBufDecodeError(
                     f"omnibuf: array nesting depth {depth + 1} exceeds {MAX_NESTING_DEPTH}"
                 )
-            is_msg = fd.type == _GPB_TYPE_MESSAGE
+            is_msg = _is_gpb_message_type(fd, is_editions)
             e_kind, exp_e_wt = ("submsg", WIRE_SUB_MSG) if is_msg else _GPB_SCALAR_SPEC[fd.type]
             arr_mv, pos = read_len_slice(data, pos, 2, n)
             elem_wt, count, p, ok = parse_array_header(arr_mv)
@@ -969,10 +1329,15 @@ def _decode_gpb_msg(
                     rep.append(item)
             if p != arr_end:
                 raise OmniBufDecodeError(f"omnibuf: trailing array bytes on field {fd.name}")
-        elif fd.type == _GPB_TYPE_MESSAGE:
+        elif _is_gpb_message_type(fd, is_editions):
             if wt != WIRE_SUB_MSG:
                 pos = validate_value(data, pos, wt, depth, MAX_NESTING_DEPTH, n, check_utf8=True)
                 continue
+            containing_oo = getattr(fd, "containing_oneof", None)
+            if containing_oo is not None:
+                for sib in containing_oo.fields:
+                    if sib.number != fnum:
+                        seen.discard(sib.number)
             seen.add(fnum)
             sub_mv, pos = read_len_slice(data, pos, 0, n)
             sub_msg = getattr(dst, fd.name)
@@ -982,6 +1347,11 @@ def _decode_gpb_msg(
             if wt not in (WIRE_BOOL_FALSE, WIRE_BOOL_TRUE):
                 pos = validate_value(data, pos, wt, depth, MAX_NESTING_DEPTH, n, check_utf8=True)
                 continue
+            containing_oo = getattr(fd, "containing_oneof", None)
+            if containing_oo is not None:
+                for sib in containing_oo.fields:
+                    if sib.number != fnum:
+                        seen.discard(sib.number)
             seen.add(fnum)
             setattr(dst, fd.name, wt == WIRE_BOOL_TRUE)
         else:
@@ -989,6 +1359,11 @@ def _decode_gpb_msg(
             if wt != exp_wt:
                 pos = validate_value(data, pos, wt, depth, MAX_NESTING_DEPTH, n, check_utf8=True)
                 continue
+            containing_oo = getattr(fd, "containing_oneof", None)
+            if containing_oo is not None:
+                for sib in containing_oo.fields:
+                    if sib.number != fnum:
+                        seen.discard(sib.number)
             seen.add(fnum)
             val, pos = _read_proto_scalar(data, pos, n, s_kind)
             setattr(dst, fd.name, val)
@@ -1037,6 +1412,7 @@ def marshal_proto(
     if gpb_cls is not None and isinstance(msg, gpb_cls):
         out = bytearray()
         if self_describing:
+            _check_gpb_descriptor_supported(msg.DESCRIPTOR, for_encode=True)
             meta = _build_gpb_schema_meta(msg.DESCRIPTOR, msg)
             out.extend(encode_field0_schema_meta(meta))
         _encode_gpb_msg(out, msg, deterministic)
@@ -1087,7 +1463,7 @@ def unmarshal_proto(
         if rc is not None:
             return rc.unmarshal(packet, max_elements=max_elements)
         if issubclass(target, pbpy.Message):
-            plan = _get_pbpy_plan(target.desc())
+            plan = _get_pbpy_plan(target.desc(), for_encode=False)
             return plan.rust_codec.unmarshal(packet, max_elements=max_elements)
         gpb_cls = _get_gpb_message_cls()
         if gpb_cls is not None and issubclass(target, gpb_cls):
@@ -1100,10 +1476,10 @@ def unmarshal_proto(
         if rc is not None:
             return rc.unmarshal(packet, target, max_elements=max_elements)
         if isinstance(target, pbpy.DescMessage):
-            plan = _get_pbpy_plan(target)
+            plan = _get_pbpy_plan(target, for_encode=False)
             return plan.rust_codec.unmarshal(packet, max_elements=max_elements)
         if isinstance(target, pbpy.Message):
-            plan = _get_pbpy_plan(target.desc())
+            plan = _get_pbpy_plan(target.desc(), for_encode=False)
             return plan.rust_codec.unmarshal(packet, target, max_elements=max_elements)
         gpb_cls = _get_gpb_message_cls()
         if gpb_cls is not None and isinstance(target, gpb_cls):

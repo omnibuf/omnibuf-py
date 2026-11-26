@@ -888,9 +888,18 @@ struct SlotBinding {
 unsafe impl Send for SlotBinding {}
 unsafe impl Sync for SlotBinding {}
 
+struct PbpyOneofBinding {
+    oneof_attr: Py<PyString>,
+    case_name: Py<PyString>,
+    oneof_cls: Py<PyAny>,
+    field_attr: Py<PyString>,
+    value_attr: Py<PyString>,
+}
+
 enum FieldAccess {
     Slot(SlotBinding),
     Attr(Py<PyString>),
+    PbpyOneof(PbpyOneofBinding),
 }
 
 impl FieldAccess {
@@ -919,6 +928,19 @@ impl FieldAccess {
                 Self::Attr(attr) => {
                     let ptr = ffi::PyObject_GetAttr(obj_ptr, attr.as_ptr());
                     Bound::from_owned_ptr_or_err(py, ptr)
+                }
+                Self::PbpyOneof(oo) => {
+                    let ptr = ffi::PyObject_GetAttr(obj_ptr, oo.oneof_attr.as_ptr());
+                    let wrapper = Bound::from_owned_ptr_or_err(py, ptr)?;
+                    if wrapper.is_none() {
+                        return Ok(py.None().into_bound(py));
+                    }
+                    let active_field = wrapper.getattr(&oo.field_attr)?;
+                    if active_field.eq(oo.case_name.bind(py))? {
+                        wrapper.getattr(&oo.value_attr)
+                    } else {
+                        Ok(py.None().into_bound(py))
+                    }
                 }
             }
         }
@@ -973,6 +995,14 @@ impl FieldAccess {
                     }
                     Ok(Some(Bound::from_owned_ptr(py, ptr)))
                 }
+                Self::PbpyOneof(_) => {
+                    let val = self.get(py, obj_ptr)?;
+                    if val.is_none() {
+                        Ok(None)
+                    } else {
+                        Ok(Some(val))
+                    }
+                }
             }
         }
     }
@@ -1002,6 +1032,11 @@ impl FieldAccess {
             let rc = match self {
                 Self::Slot(sb) => (sb.set_fn)(sb.descr.as_ptr(), obj_ptr, val_ptr),
                 Self::Attr(attr) => ffi::PyObject_SetAttr(obj_ptr, attr.as_ptr(), val_ptr),
+                Self::PbpyOneof(oo) => {
+                    let val_bound = Borrowed::from_ptr(py, val_ptr);
+                    let wrapped = oo.oneof_cls.bind(py).call1((&oo.case_name, val_bound))?;
+                    ffi::PyObject_SetAttr(obj_ptr, oo.oneof_attr.as_ptr(), wrapped.as_ptr())
+                }
             };
             if rc != 0 {
                 Err(PyErr::fetch(py))
@@ -6298,7 +6333,30 @@ impl CompiledCodec {
 
             let attr_intern = PyString::intern(py, &attr).unbind();
 
-            let (access, slot_offset) = if !self.pbpy_mode
+            let pbpy_oneof_attr: Option<String> = match d.get_item("pbpy_oneof_attr")? {
+                Some(v) if !v.is_none() => Some(v.extract()?),
+                _ => None,
+            };
+            let pbpy_oneof_cls: Option<Py<PyAny>> = match d.get_item("pbpy_oneof_cls")? {
+                Some(v) if !v.is_none() => Some(v.unbind()),
+                _ => None,
+            };
+
+            let (access, slot_offset) = if self.pbpy_mode
+                && let (Some(oo_attr), Some(oo_cls)) = (pbpy_oneof_attr, pbpy_oneof_cls)
+            {
+                all_slots = false;
+                (
+                    FieldAccess::PbpyOneof(PbpyOneofBinding {
+                        oneof_attr: PyString::intern(py, &oo_attr).unbind(),
+                        case_name: attr_intern.clone_ref(py),
+                        oneof_cls: oo_cls,
+                        field_attr: PyString::intern(py, "field").unbind(),
+                        value_attr: PyString::intern(py, "value").unbind(),
+                    }),
+                    usize::MAX,
+                )
+            } else if !self.pbpy_mode
                 && let Ok(descr_obj) = cls_dict.get_item(&attr)
             {
                 // SAFETY: GIL is held (`py`); `PyMemberDescr_Type` and `PyType_IsSubtype` checks verify descriptor layout and class ownership before reading the offset.

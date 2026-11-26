@@ -44,7 +44,7 @@ conformance:
     elif command -v conformance-runner >/dev/null 2>&1; then
         RUNNER="conformance-runner"
     elif command -v go >/dev/null 2>&1; then
-        exec go run github.com/omnibuf/omnibuf-go/cmd/conformance-runner@71dad83aadd7dc65401d662521d34cfaeb1011ab uv run python -m omnibuf.conformance
+        exec go run github.com/omnibuf/omnibuf-go/cmd/conformance-runner@v0.2.11 uv run python -m omnibuf.conformance
     else
         echo "conformance-runner binary not found; set CONFORMANCE_RUNNER or install conformance-runner" >&2
         exit 1
